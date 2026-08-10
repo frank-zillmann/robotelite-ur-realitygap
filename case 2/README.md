@@ -55,8 +55,12 @@ python send.py --robot-ip 127.0.0.1 --script scripts/triangle.script --loop 10 -
 python send.py --robot-ip 127.0.0.1 --script scripts/triangle.optimized.script --loop 10 --out optimized.csv
 
 # 5. run the analysis scripts to compare your results
-python analysis.py --csv baseline.csv --joint 0
-python analysis.py --csv optimized.csv --joint 0
+python analysis.py --csv baseline.csv --joint 0 --quantity current
+python analysis.py --csv optimized.csv --joint 0 --quantity current
+
+# 6. inspect the training data and also see what the script implies rebuilt through dynamics.py
+python analysis.py --csv data/test-1.csv --script data/test-1.script --joint 0 --quantity current
+
 # note: you might notice something is off. Is the pipeline not finished?
 ```
 
