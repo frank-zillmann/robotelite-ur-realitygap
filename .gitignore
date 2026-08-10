@@ -23,6 +23,7 @@ tmp
 ai/
 .claude/
 **/.claude/
+CLAUDE.md
 
 # ── docs/: ship the built .pptx + tiers doc, not the builders or its assets ───
 docs/build_deck.py

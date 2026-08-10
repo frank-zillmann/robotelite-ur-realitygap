@@ -33,9 +33,15 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
+import os
 import pickle
 from abc import ABC, abstractmethod
+from datetime import datetime
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -88,6 +94,10 @@ class DistillModel(ABC):
     def load(path: str) -> "DistillModel":
         with open(path, "rb") as f:
             return pickle.load(f)
+
+    def params(self) -> dict:
+        """Return model hyperparameters for logging. Override in subclasses."""
+        return {}
 
 
 class LinearModel(DistillModel):
@@ -198,6 +208,15 @@ class LinearModel(DistillModel):
             return None
         return self.vel_range, self.acc_range
 
+    def params(self) -> dict:
+        return {
+            "type":         "least_squares",
+            "features":     self.FEATURE_NAMES,
+            "coefficients": self.coef.tolist() if self.coef is not None else None,
+            "vel_range":    list(self.vel_range) if self.vel_range else None,
+            "acc_range":    list(self.acc_range) if self.acc_range else None,
+        }
+
 
 def augment(model: DistillModel, csv: str, pre: Preprocess = None):
     """Overwrite a recording's actual_* columns with the model's predictions.
@@ -220,6 +239,203 @@ def augment(model: DistillModel, csv: str, pre: Preprocess = None):
     df.to_csv(csv, index=False)
     print(f"overwrote {model.predicts()} with predictions -> {csv}")
     return df
+
+
+# ---------------------------------------------------------------------------
+# Result logging and visualisation
+# ---------------------------------------------------------------------------
+
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+
+
+def _evaluate_model(model: DistillModel, recordings) -> dict:
+    """Run model.predict on every recording and collect per-channel per-joint arrays.
+
+    Returns:
+        {channel: {joint_idx: {"pred": array, "actual": array, "residuals": array}}}
+    """
+    channels = model.predicts()
+    buckets = {ch: {j: {"pred": [], "actual": []} for j in range(N_JOINTS)}
+               for ch in channels}
+    for rec in recordings:
+        preds = model.predict(rec.df)
+        for ch in channels:
+            actual_block = (getattr(rec, ch) if hasattr(rec, ch)
+                            else get_block(rec.df, ch))
+            pred_block = preds[ch]
+            for j in range(N_JOINTS):
+                buckets[ch][j]["pred"].append(pred_block[:, j])
+                buckets[ch][j]["actual"].append(actual_block[:, j])
+    result = {}
+    for ch in channels:
+        result[ch] = {}
+        for j in range(N_JOINTS):
+            pred   = np.concatenate(buckets[ch][j]["pred"])
+            actual = np.concatenate(buckets[ch][j]["actual"])
+            result[ch][j] = {"pred": pred, "actual": actual, "residuals": pred - actual}
+    return result
+
+
+def _compute_metrics(eval_data: dict) -> dict:
+    """Compute overall and per-joint RMSE / R² from _evaluate_model output."""
+    metrics = {}
+    for ch, joints in eval_data.items():
+        all_res = np.concatenate([joints[j]["residuals"] for j in range(N_JOINTS)])
+        all_act = np.concatenate([joints[j]["actual"]    for j in range(N_JOINTS)])
+        ss_res  = float(np.sum(all_res ** 2))
+        ss_tot  = float(np.sum((all_act - all_act.mean()) ** 2))
+        per_joint = []
+        for j in range(N_JOINTS):
+            res_j = joints[j]["residuals"]
+            act_j = joints[j]["actual"]
+            ss_j  = float(np.sum(res_j ** 2))
+            tot_j = float(np.sum((act_j - act_j.mean()) ** 2))
+            per_joint.append({
+                "joint": JOINT_NAMES[j],
+                "rmse":  float(np.sqrt(np.mean(res_j ** 2))),
+                "r2":    float(1 - ss_j / tot_j) if tot_j else 0.0,
+            })
+        metrics[ch] = {
+            "overall": {
+                "rmse": float(np.sqrt(np.mean(all_res ** 2))),
+                "r2":   float(1 - ss_res / ss_tot) if ss_tot else 0.0,
+            },
+            "per_joint": per_joint,
+        }
+    return metrics
+
+
+def _plot_residuals(eval_data: dict, metrics: dict, channels: list, run_dir: str):
+    for ch in channels:
+        ch_short = ch.replace("actual_", "")
+        all_res  = np.concatenate([eval_data[ch][j]["residuals"] for j in range(N_JOINTS)])
+        ovr      = metrics[ch]["overall"]
+        fig, ax  = plt.subplots(figsize=(8, 5))
+        ax.hist(all_res, bins=60, edgecolor="black", alpha=0.7, color="steelblue")
+        ax.axvline(0, color="red", linestyle="--", linewidth=1.2, label="zero error")
+        ax.set_xlabel(f"Residual ({ch_short})")
+        ax.set_ylabel("Count")
+        ax.set_title(
+            f"Residuals — {ch}\n"
+            f"RMSE={ovr['rmse']:.4f}  R²={ovr['r2']:.4f}  "
+            f"mean={float(np.mean(all_res)):.4f}  std={float(np.std(all_res)):.4f}"
+        )
+        ax.legend()
+        fig.tight_layout()
+        path = os.path.join(run_dir, f"residuals_{ch}.png")
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"[results] plot -> {path}")
+
+
+def _plot_per_joint_rmse(metrics: dict, channels: list, run_dir: str):
+    for ch in channels:
+        ch_short   = ch.replace("actual_", "")
+        ovr        = metrics[ch]["overall"]
+        joint_rmse = [metrics[ch]["per_joint"][j]["rmse"] for j in range(N_JOINTS)]
+        fig, ax    = plt.subplots(figsize=(9, 5))
+        bars = ax.bar(JOINT_NAMES, joint_rmse, color="steelblue", edgecolor="black")
+        ax.axhline(ovr["rmse"], color="red", linestyle="--", linewidth=1.2,
+                   label=f"Overall RMSE={ovr['rmse']:.4f}")
+        for bar, val in zip(bars, joint_rmse):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1e-4,
+                    f"{val:.4f}", ha="center", va="bottom", fontsize=8)
+        ax.set_xlabel("Joint")
+        ax.set_ylabel(f"RMSE ({ch_short})")
+        ax.set_title(f"Per-joint RMSE — {ch}")
+        ax.tick_params(axis="x", rotation=20)
+        ax.legend()
+        fig.tight_layout()
+        path = os.path.join(run_dir, f"per_joint_rmse_{ch}.png")
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"[results] plot -> {path}")
+
+
+def _update_summary(model: DistillModel, held_out_metrics: dict,
+                    results_dir: str, dt_str: str):
+    """Append a row to runs_summary.csv and regenerate the comparison plot."""
+    summary_path = os.path.join(results_dir, "runs_summary.csv")
+    row = {"datetime": dt_str, "model_class": type(model).__name__}
+    for ch, m in held_out_metrics.items():
+        row[f"{ch}_rmse"] = m["rmse"]
+        row[f"{ch}_r2"]   = m["r2"]
+
+    summary_df = (pd.concat([pd.read_csv(summary_path), pd.DataFrame([row])],
+                             ignore_index=True)
+                  if os.path.exists(summary_path) else pd.DataFrame([row]))
+    summary_df.to_csv(summary_path, index=False)
+    print(f"[results] summary -> {summary_path}")
+
+    # comparison plot: RMSE and R² per run for each channel
+    channels  = model.predicts()
+    n_ch      = len(channels)
+    x         = list(range(len(summary_df)))
+    labels    = summary_df["datetime"].tolist()
+    fig, axes = plt.subplots(2, n_ch, figsize=(max(6, 4 * len(x)), 8 * n_ch // n_ch),
+                             squeeze=False)
+    for col, ch in enumerate(channels):
+        for row_idx, (metric, color, ylabel) in enumerate(
+            [("rmse", "steelblue", "RMSE"), ("r2", "darkorange", "R²")]
+        ):
+            col_name = f"{ch}_{metric}"
+            ax = axes[row_idx][col]
+            if col_name in summary_df.columns:
+                ax.plot(x, summary_df[col_name], marker="o", color=color)
+                ax.set_xticks(x)
+                ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=7)
+            ax.set_ylabel(ylabel)
+            ax.set_title(f"{ch} — held-out {ylabel} over runs")
+            ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    path = os.path.join(results_dir, "comparison_plot.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"[results] comparison -> {path}")
+
+
+def log_run(model: DistillModel, recordings, holdout_fraction: float,
+            held_out_metrics: dict, results_dir: str = None, dt_str: str = None):
+    """Log a training run: save log.json, residual plot, per-joint RMSE plot,
+    update runs_summary.csv and regenerate the comparison plot.
+
+    Args:
+        model:             fitted DistillModel.
+        recordings:        list of Recording objects used for training (all data).
+        holdout_fraction:  fraction that was held out during training evaluation.
+        held_out_metrics:  {channel: {"rmse": float, "r2": float, "n_rows": int}}
+                           computed on the held-out split before final refit.
+        results_dir:       override for RESULTS_DIR.
+        dt_str:            override for the run timestamp (default: now).
+    """
+    results_dir = results_dir or RESULTS_DIR
+    dt_str      = dt_str or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir     = os.path.join(results_dir, dt_str)
+    os.makedirs(run_dir, exist_ok=True)
+
+    eval_data    = _evaluate_model(model, recordings)
+    full_metrics = _compute_metrics(eval_data)
+
+    log = {
+        "datetime":          dt_str,
+        "model_class":       type(model).__name__,
+        "params":            model.params(),
+        "training": {
+            "n_recordings":    len(recordings),
+            "holdout_fraction": holdout_fraction,
+        },
+        "held_out_metrics":  held_out_metrics,
+        "full_data_metrics": full_metrics,
+    }
+    log_path = os.path.join(run_dir, "log.json")
+    with open(log_path, "w") as f:
+        json.dump(log, f, indent=2)
+    print(f"[results] log  -> {log_path}")
+
+    _plot_residuals(eval_data, full_metrics, model.predicts(), run_dir)
+    _plot_per_joint_rmse(full_metrics, model.predicts(), run_dir)
+    _update_summary(model, held_out_metrics, results_dir, dt_str)
+    print(f"[results] run complete -> {run_dir}")
 
 
 def main():
@@ -263,6 +479,12 @@ def main():
     model.fit(recordings)
     model.save(args.out)
     print(f"saved {args.out}")
+
+    # Log this run: save results/<datetime>/{log.json, plots} and update summary.
+    held_out_metrics = {
+        "actual_current": {"rmse": rmse, "r2": ss, "n_rows": int(is_test.sum())}
+    }
+    log_run(model, recordings, args.holdout, held_out_metrics)
 
 
 if __name__ == "__main__":
