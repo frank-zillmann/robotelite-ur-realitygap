@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
+from datetime import datetime
 
 import numpy as np
 from stable_baselines3 import PPO
@@ -29,6 +31,8 @@ from preprocess import default_preprocess
 from train_distillation_model import DistillModel
 from train_rla import GapEnv, PathEnv, build_dataset, speed_profile
 from utils import get_param, load_script, set_param
+
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
 
 # --- params mode -------------------------------------------------------------
@@ -67,13 +71,14 @@ def report(env: GapEnv, moves, vel: float, acc: float, label: str) -> np.ndarray
     return res
 
 
-def run_params(args, model, metric, rec, pre):
+def run_params(args, model, metric, rec, pre) -> dict:
     """Optimize the script's vel/acc and write the optimized script."""
     text = load_script(args.script)
     env = GapEnv(model, metric, rec, pre=pre)
     moves = script_moves(env)
 
-    base = report(env, moves, get_param(text, "vel"), get_param(text, "acc"), "baseline (from script)")
+    base_vel, base_acc = get_param(text, "vel"), get_param(text, "acc")
+    base = report(env, moves, base_vel, base_acc, "baseline (from script)")
     vel, acc = search_agent(env, moves, args.agent)
     opt = report(env, moves, vel, acc, "optimized")
     _compare(base, opt)
@@ -82,6 +87,18 @@ def run_params(args, model, metric, rec, pre):
     with open(out, "w") as f:
         f.write(set_param(set_param(text, "vel", vel), "acc", acc))
     print(f"wrote {out}\n  run it: python send.py --script {out} --out optimized.csv")
+
+    return {
+        "baseline":    {"vel": float(base_vel), "acc": float(base_acc),
+                        "score": float(base[:, 0].mean()),
+                        "cycle_time": float(base[:, 1].mean())},
+        "optimized":   {"vel": float(vel), "acc": float(acc),
+                        "score": float(opt[:, 0].mean()),
+                        "cycle_time": float(opt[:, 1].mean())},
+        "improvement": {"score_pct":      float(_gain(base[:, 0], opt[:, 0])),
+                        "cycle_time_pct": float(_gain(base[:, 1], opt[:, 1]))},
+        "output":      out,
+    }
 
 
 # --- path mode ---------------------------------------------------------------
@@ -120,7 +137,7 @@ def build_full_path(rec, moves, plans):
     return rows
 
 
-def run_path(args, model, metric, rec, pre):
+def run_path(args, model, metric, rec, pre) -> dict:
     """Re-time each move and write the path CSV."""
     env = PathEnv(model, metric, rec, pre=pre)
     moves = script_moves(env)
@@ -140,6 +157,36 @@ def run_path(args, model, metric, rec, pre):
         w.writerows([f"{v:.6f}" for v in row] for row in rows)
     print(f"wrote {out}\n  run it: python send.py --path {out} --out optimized.csv")
 
+    return {
+        "baseline":    {"score": float(base[:, 0].mean()),
+                        "cycle_time": float(base[:, 1].mean())},
+        "optimized":   {"score": float(opt[:, 0].mean()),
+                        "cycle_time": float(opt[:, 1].mean())},
+        "improvement": {"score_pct":      float(_gain(base[:, 0], opt[:, 0])),
+                        "cycle_time_pct": float(_gain(base[:, 1], opt[:, 1]))},
+        "output":      out,
+    }
+
+
+def log_run_result(args, metrics: dict, sim_csv: str, results_dir: str, dt_str: str):
+    """Save log.json for this run.py invocation to results/<datetime>_run_<mode>/."""
+    run_dir  = os.path.join(results_dir, f"{dt_str}_run_{args.mode}")
+    os.makedirs(run_dir, exist_ok=True)
+    log = {
+        "datetime":      dt_str,
+        "type":          "run",
+        "mode":          args.mode,
+        "script":        args.script,
+        "distill_model": args.model,
+        "agent":         args.agent,
+        "sim_csv":       sim_csv,
+        "results":       metrics,
+    }
+    log_path = os.path.join(run_dir, "log.json")
+    with open(log_path, "w") as f:
+        json.dump(log, f, indent=2)
+    print(f"[results] log -> {log_path}")
+
 
 def main():
     ap = argparse.ArgumentParser(description="Optimize a URScript motion against the model.")
@@ -157,13 +204,19 @@ def main():
     args = ap.parse_args()
     args.agent = args.agent or f"models/agent_{args.mode}.zip"
 
+    # Create the run directory early so the sim_to_real CSV lands inside it.
+    dt_str  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = os.path.join(RESULTS_DIR, f"{dt_str}_run_{args.mode}")
+    os.makedirs(run_dir, exist_ok=True)
+
     model = DistillModel.load(args.model)
     metric = CurrentGapMetric()
     pre = default_preprocess()
-    # Dataset written to the root, named after the script (e.g. triangle.sim_to_real.csv).
-    out = re.sub(r"\.script$", ".sim_to_real.csv", os.path.basename(args.script))
-    rec = build_dataset(model, metric, [args.script], args.robot_ip, args.loop, pre, out)
-    (run_params if args.mode == "params" else run_path)(args, model, metric, rec, pre)
+    sim_csv = os.path.join(run_dir,
+                           re.sub(r"\.script$", ".sim_to_real.csv", os.path.basename(args.script)))
+    rec = build_dataset(model, metric, [args.script], args.robot_ip, args.loop, pre, sim_csv)
+    metrics = (run_params if args.mode == "params" else run_path)(args, model, metric, rec, pre)
+    log_run_result(args, metrics, sim_csv, RESULTS_DIR, dt_str)
 
 
 if __name__ == "__main__":
