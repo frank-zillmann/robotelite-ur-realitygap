@@ -1,0 +1,10 @@
+{
+  "datetime": "2026-08-10_21-12-05",
+  "script": "scripts/triangle.script",
+  "path": null,
+  "loop": 10,
+  "hz": 125.0,
+  "n_samples": 6398,
+  "stop_reason": "program finished",
+  "out": "/home/apostolos-ubuntu-pc/Documents/robotelite-ur-realitygap/case 2/results/2026-08-10_21-12-05_triangle.csv"
+}
