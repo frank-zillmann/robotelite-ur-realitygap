@@ -30,12 +30,19 @@ Requires `gymnasium` and `stable-baselines3` (see requirements.txt).
 from __future__ import annotations
 
 import argparse
+import json
+import os
+from datetime import datetime
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
 
 from analysis import Recording
 from common import segments
@@ -48,6 +55,8 @@ from utils import ACC_COL, N_JOINTS, SCRIPT_COL, VEL_COL, get_block, set_block
 
 # Training-data file (sim targets + predicted actuals + score label).
 SIM_TO_REAL = "sim_to_real.csv"
+
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
 # Action bounds in the URScript units (deg/s, deg/s^2). A movej speed above the
 # joint limit (~180 deg/s = pi rad/s) clamps, so the useful range stays below it.
@@ -329,12 +338,142 @@ class PathEnv(_MoveEnv):
         return max_score, cycle, self.objective(max_score, cycle)
 
 
-def train_ppo(env, steps: int, out: str):
-    """Train a PPO agent on an env and save it."""
+class _TrainCallback(BaseCallback):
+    """Records per-episode reward, score, and cycle_time during PPO training."""
+
+    def __init__(self):
+        super().__init__(verbose=0)
+        self.records: list[dict] = []
+
+    def _on_step(self) -> bool:
+        dones   = self.locals.get("dones",   [])
+        rewards = self.locals.get("rewards", [])
+        infos   = self.locals.get("infos",   [])
+        for done, reward, info in zip(dones, rewards, infos):
+            if done:
+                self.records.append({
+                    "timestep":   int(self.num_timesteps),
+                    "reward":     float(reward),
+                    "score":      float(info.get("score",      float("nan"))),
+                    "cycle_time": float(info.get("cycle_time", float("nan"))),
+                })
+        return True
+
+
+def _rolling_mean(x: list, w: int) -> list:
+    return [float(np.mean(x[max(0, i - w): i + 1])) for i in range(len(x))]
+
+
+def log_training_run(mode: str, scripts: list, steps: int, agent_path: str,
+                     callback: _TrainCallback, results_dir: str, dt_str: str):
+    """Save log.json, training_curve.png, and update runs_summary_rla.csv."""
+    run_dir = os.path.join(results_dir, f"{dt_str}_rla_{mode}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    records = callback.records
+    if not records:
+        print("[results] no training records — skipping")
+        return
+
+    timesteps   = [r["timestep"]   for r in records]
+    rewards     = [r["reward"]     for r in records]
+    scores      = [r["score"]      for r in records]
+    cycle_times = [r["cycle_time"] for r in records]
+
+    tail = max(1, len(scores) // 10)
+    best_score  = float(np.nanmin(scores))
+    final_score = float(np.nanmean(scores[-tail:]))
+    best_cycle  = float(np.nanmin(cycle_times))
+
+    # ---- log.json ------------------------------------------------------------
+    log = {
+        "datetime":   dt_str,
+        "type":       "train_rla",
+        "mode":       mode,
+        "scripts":    scripts,
+        "steps":      steps,
+        "agent_path": agent_path,
+        "summary": {
+            "n_episodes":       len(records),
+            "best_score":       best_score,
+            "final_score_mean": final_score,
+            "best_cycle_time":  best_cycle,
+        },
+    }
+    log_path = os.path.join(run_dir, "log.json")
+    with open(log_path, "w") as f:
+        json.dump(log, f, indent=2)
+    print(f"[results] log  -> {log_path}")
+
+    # ---- training_curve.png --------------------------------------------------
+    w = max(1, len(scores) // 20)
+    sm_score  = _rolling_mean(scores,      w)
+    sm_reward = _rolling_mean(rewards,     w)
+    sm_cycle  = _rolling_mean(cycle_times, w)
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+
+    axes[0].plot(timesteps, scores,    alpha=0.15, color="steelblue",  linewidth=0.6)
+    axes[0].plot(timesteps, sm_score,  color="steelblue",  linewidth=1.6,
+                 label=f"rolling mean (w={w})")
+    axes[0].axhline(best_score, color="green", linestyle="--", linewidth=1.0,
+                    label=f"best = {best_score:.4f}")
+    axes[0].set_ylabel("Score")
+    axes[0].set_title(f"Training Curve — {mode} mode | {steps} steps | "
+                      f"{len(records)} episodes")
+    axes[0].legend(fontsize=8)
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(timesteps, cycle_times, alpha=0.15, color="darkorange", linewidth=0.6)
+    axes[1].plot(timesteps, sm_cycle,    color="darkorange", linewidth=1.6,
+                 label=f"rolling mean (w={w})")
+    axes[1].axhline(best_cycle, color="green", linestyle="--", linewidth=1.0,
+                    label=f"best = {best_cycle:.3f} s")
+    axes[1].set_ylabel("Cycle time (s)")
+    axes[1].legend(fontsize=8)
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].plot(timesteps, rewards,    alpha=0.15, color="purple", linewidth=0.6)
+    axes[2].plot(timesteps, sm_reward,  color="purple", linewidth=1.6,
+                 label=f"rolling mean (w={w})")
+    axes[2].set_ylabel("Reward (−objective)")
+    axes[2].set_xlabel("Timestep")
+    axes[2].legend(fontsize=8)
+    axes[2].grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    plot_path = os.path.join(run_dir, "training_curve.png")
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    print(f"[results] plot -> {plot_path}")
+
+    # ---- runs_summary_rla.csv ------------------------------------------------
+    summary_path = os.path.join(results_dir, "runs_summary_rla.csv")
+    row = {
+        "datetime":         dt_str,
+        "mode":             mode,
+        "steps":            steps,
+        "n_episodes":       len(records),
+        "best_score":       best_score,
+        "final_score_mean": final_score,
+        "best_cycle_time":  best_cycle,
+        "scripts":          ";".join(scripts),
+    }
+    summary_df = (pd.concat([pd.read_csv(summary_path), pd.DataFrame([row])],
+                             ignore_index=True)
+                  if os.path.exists(summary_path) else pd.DataFrame([row]))
+    summary_df.to_csv(summary_path, index=False)
+    print(f"[results] summary -> {summary_path}")
+    print(f"[results] run complete -> {run_dir}")
+
+
+def train_ppo(env, steps: int, out: str) -> tuple:
+    """Train a PPO agent on an env, save it, and return (agent, callback)."""
+    cb    = _TrainCallback()
     agent = PPO("MlpPolicy", env, verbose=0)
-    agent.learn(total_timesteps=steps)
+    agent.learn(total_timesteps=steps, callback=cb)
     agent.save(out)
-    return agent
+    return agent, cb
 
 
 def build_dataset(model, metric, scripts, robot_ip, loop, pre=None, out=SIM_TO_REAL):
@@ -371,17 +510,26 @@ def main():
     args = ap.parse_args()
     out = args.out or f"models/agent_{args.mode}.zip"
 
+    # Create the run directory now so sim_to_real.csv lands inside it rather
+    # than at the case 2 root.
+    dt_str  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = os.path.join(RESULTS_DIR, f"{dt_str}_rla_{args.mode}")
+    os.makedirs(run_dir, exist_ok=True)
+
     model = DistillModel.load(args.model)
     metric = CurrentGapMetric()
     pre = default_preprocess()
-    rec = build_dataset(model, metric, args.scripts, args.robot_ip, args.loop, pre)
+    sim_csv = os.path.join(run_dir, "sim_to_real.csv")
+    rec = build_dataset(model, metric, args.scripts, args.robot_ip, args.loop, pre, sim_csv)
     dyn = default_dynamics(rec)
     Env = GapEnv if args.mode == "params" else PathEnv
     env = Env(model, metric, rec, dyn=dyn, pre=pre)
 
     print(f"mode: {args.mode}   training on {len(env.targets)} segments")
-    train_ppo(env, args.steps, out)
+    _, cb = train_ppo(env, args.steps, out)
     print(f"trained PPO ({args.mode}) for {args.steps} steps, saved {out}")
+
+    log_training_run(args.mode, args.scripts, args.steps, out, cb, RESULTS_DIR, dt_str)
 
 
 if __name__ == "__main__":

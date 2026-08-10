@@ -1,0 +1,18 @@
+{
+  "datetime": "2026-08-10_20-14-29",
+  "type": "train_rla",
+  "mode": "params",
+  "scripts": [
+    "scripts/shoulder_swing.script",
+    "scripts/vertical_swing.script",
+    "scripts/horizontal_swing.script"
+  ],
+  "steps": 20000,
+  "agent_path": "models/agent_params.zip",
+  "summary": {
+    "n_episodes": 20480,
+    "best_score": 0.8771091308298393,
+    "final_score_mean": 2.233762206081746,
+    "best_cycle_time": 0.5686290000003638
+  }
+}
