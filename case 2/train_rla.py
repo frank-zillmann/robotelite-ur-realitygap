@@ -365,7 +365,8 @@ def _rolling_mean(x: list, w: int) -> list:
 
 
 def log_training_run(mode: str, scripts: list, steps: int, agent_path: str,
-                     callback: _TrainCallback, results_dir: str, dt_str: str):
+                     callback: _TrainCallback, results_dir: str, dt_str: str,
+                     agent_versioned: str = None):
     """Save log.json, training_curve.png, and update runs_summary_rla.csv."""
     run_dir = os.path.join(results_dir, f"{dt_str}_rla_{mode}")
     os.makedirs(run_dir, exist_ok=True)
@@ -387,12 +388,13 @@ def log_training_run(mode: str, scripts: list, steps: int, agent_path: str,
 
     # ---- log.json ------------------------------------------------------------
     log = {
-        "datetime":   dt_str,
-        "type":       "train_rla",
-        "mode":       mode,
-        "scripts":    scripts,
-        "steps":      steps,
-        "agent_path": agent_path,
+        "datetime":          dt_str,
+        "type":              "train_rla",
+        "mode":              mode,
+        "scripts":           scripts,
+        "steps":             steps,
+        "agent_path_latest": agent_path,
+        "agent_path":        agent_versioned or agent_path,
         "summary": {
             "n_episodes":       len(records),
             "best_score":       best_score,
@@ -467,12 +469,18 @@ def log_training_run(mode: str, scripts: list, steps: int, agent_path: str,
     print(f"[results] run complete -> {run_dir}")
 
 
-def train_ppo(env, steps: int, out: str) -> tuple:
-    """Train a PPO agent on an env, save it, and return (agent, callback)."""
+def train_ppo(env, steps: int, out: str, versioned_out: str = None) -> tuple:
+    """Train a PPO agent on an env, save it, and return (agent, callback).
+
+    ``out`` is the standard "latest" path (e.g. models/agent_params.zip).
+    ``versioned_out`` is an optional second save path for the timestamped copy.
+    """
     cb    = _TrainCallback()
     agent = PPO("MlpPolicy", env, verbose=0)
     agent.learn(total_timesteps=steps, callback=cb)
     agent.save(out)
+    if versioned_out:
+        agent.save(versioned_out)
     return agent, cb
 
 
@@ -525,11 +533,15 @@ def main():
     Env = GapEnv if args.mode == "params" else PathEnv
     env = Env(model, metric, rec, dyn=dyn, pre=pre)
 
+    agent_versioned = os.path.join(run_dir, f"agent_{args.mode}.zip")
     print(f"mode: {args.mode}   training on {len(env.targets)} segments")
-    _, cb = train_ppo(env, args.steps, out)
-    print(f"trained PPO ({args.mode}) for {args.steps} steps, saved {out}")
+    _, cb = train_ppo(env, args.steps, out, versioned_out=agent_versioned)
+    print(f"trained PPO ({args.mode}) for {args.steps} steps")
+    print(f"  latest   -> {out}")
+    print(f"  versioned -> {agent_versioned}")
 
-    log_training_run(args.mode, args.scripts, args.steps, out, cb, RESULTS_DIR, dt_str)
+    log_training_run(args.mode, args.scripts, args.steps, out, cb, RESULTS_DIR, dt_str,
+                     agent_versioned=agent_versioned)
 
 
 if __name__ == "__main__":

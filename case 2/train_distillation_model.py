@@ -432,6 +432,10 @@ def log_run(model: DistillModel, recordings, holdout_fraction: float,
         json.dump(log, f, indent=2)
     print(f"[results] log  -> {log_path}")
 
+    model_path = os.path.join(run_dir, "distill.pkl")
+    model.save(model_path)           # versioned copy alongside its log and plots
+    print(f"[results] model -> {model_path}")
+
     _plot_residuals(eval_data, full_metrics, model.predicts(), run_dir)
     _plot_per_joint_rmse(full_metrics, model.predicts(), run_dir)
     _update_summary(model, held_out_metrics, results_dir, dt_str)
@@ -477,14 +481,15 @@ def main():
 
     # Refit on everything and save.
     model.fit(recordings)
-    model.save(args.out)
+    dt_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    model.save(args.out)             # models/distill.pkl — "latest" for pipeline defaults
     print(f"saved {args.out}")
 
-    # Log this run: save results/<datetime>/{log.json, plots} and update summary.
+    # Log this run: save results/<datetime>/{log.json, model, plots} and update summary.
     held_out_metrics = {
         "actual_current": {"rmse": rmse, "r2": ss, "n_rows": int(is_test.sum())}
     }
-    log_run(model, recordings, args.holdout, held_out_metrics)
+    log_run(model, recordings, args.holdout, held_out_metrics, dt_str=dt_str)
 
 
 if __name__ == "__main__":
