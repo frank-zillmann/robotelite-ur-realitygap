@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Case 2 — Reality Gap Pipeline</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--surface:#161b22;--surface2:#21262d;--border:#30363d;
+  --text:#e6edf3;--muted:#8b949e;
+  --c1:#2563eb;--c2:#9333ea;--c3:#d97706;--c4:#16a34a;--c5:#0891b2;--c6:#dc2626;
+}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:15px;line-height:1.6}
+.page{max-width:1080px;margin:0 auto;padding:0 1.5rem 4rem}
+h1{font-size:2rem;font-weight:700;padding:2.5rem 0 .4rem;
+   background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.subtitle{color:var(--muted);margin-bottom:2.5rem;font-size:1rem}
+h2{font-size:1.15rem;font-weight:600;margin:2.5rem 0 1rem;display:flex;align-items:center;gap:.75rem;color:var(--text)}
+h2::after{content:'';flex:1;height:1px;background:var(--border)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.25rem;margin-bottom:.75rem}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+.three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem}
+@media(max-width:700px){.two,.three{grid-template-columns:1fr}}
+pre,code{font-family:'JetBrains Mono',Consolas,monospace}
+pre{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:1rem;overflow-x:auto;font-size:.78rem;line-height:1.7}
+code{font-size:.82rem;background:var(--surface2);border:1px solid var(--border);border-radius:3px;padding:.1em .4em}
+.svg-box{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1rem;overflow-x:auto}
+.tag{display:inline-block;font-size:.7rem;padding:.1em .5em;border-radius:3px;font-weight:600;margin-left:.25rem;vertical-align:middle}
+.io-label{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;margin:.75rem 0 .3rem}
+.io-item{font-size:.82rem;padding:.15rem 0;display:flex;align-items:flex-start;gap:.4rem}
+.io-item::before{content:'→';color:var(--muted);flex-shrink:0;margin-top:.05rem}
+.tree{font-family:'JetBrains Mono',Consolas,monospace;font-size:.8rem;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.25rem 1.5rem;line-height:2}
+.td{color:#79c0ff;font-weight:600}.tf{color:#e6edf3}.tc{color:var(--muted)}
+.note{background:rgba(147,51,234,.08);border-left:3px solid #9333ea;border-radius:0 6px 6px 0;padding:.75rem 1rem;font-size:.88rem;margin:.75rem 0}
+table{width:100%;border-collapse:collapse;font-size:.85rem}
+th{text-align:left;padding:.6rem .9rem;border-bottom:2px solid var(--border);color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.07em}
+td{padding:.55rem .9rem;border-bottom:1px solid var(--border);vertical-align:top}
+tr:last-child td{border-bottom:none}
+</style>
+</head>
+<body>
+<div class="page">
+
+<h1>Case 2: Reality Gap Pipeline</h1>
+<p class="subtitle">Robotics Summer School 2026 — Bridging the sim-to-real gap with distillation + RL</p>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>1 — The Problem: Reality Gap</h2>
+
+<div class="two">
+  <div class="card" style="border-top:3px solid var(--c1)">
+    <div style="font-weight:600;color:#60a5fa;margin-bottom:.6rem">URSim (Simulator)</div>
+    <svg id="svg-sim" viewBox="0 0 300 110" style="width:100%;display:block"></svg>
+    <p style="font-size:.82rem;color:var(--muted);margin-top:.6rem">The simulator tracks commanded currents perfectly. Gap&nbsp;≈&nbsp;0 A — not representative of hardware.</p>
+  </div>
+  <div class="card" style="border-top:3px solid var(--c6)">
+    <div style="font-weight:600;color:#f87171;margin-bottom:.6rem">Real UR10e</div>
+    <svg id="svg-real" viewBox="0 0 300 110" style="width:100%;display:block"></svg>
+    <p style="font-size:.82rem;color:var(--muted);margin-top:.6rem">Real hardware has lag, inertia, friction, ringing. <strong>actual_current ≠ target_current</strong> — this difference is the reality gap.</p>
+  </div>
+</div>
+
+<div class="note">
+  <strong style="color:#c084fc">What we do:</strong> Train a <code>LinearModel</code> on real recordings to <em>predict</em> the gap from commanded values (distillation). Then use RL to find motion parameters that minimise the predicted gap without needing the real robot at every step.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>2 — Pipeline Overview</h2>
+
+<div class="svg-box">
+  <svg id="svg-pipeline" viewBox="0 0 1040 190" style="width:100%;display:block;min-width:680px"></svg>
+</div>
+
+<div style="display:flex;flex-wrap:wrap;gap:.75rem;margin-top:.75rem;font-size:.8rem;color:var(--muted)">
+  <span><span style="display:inline-block;width:10px;height:10px;background:var(--c1);border-radius:2px;vertical-align:middle;margin-right:4px"></span>Logger</span>
+  <span><span style="display:inline-block;width:10px;height:10px;background:var(--c2);border-radius:2px;vertical-align:middle;margin-right:4px"></span>Distillation model</span>
+  <span><span style="display:inline-block;width:10px;height:10px;background:var(--c3);border-radius:2px;vertical-align:middle;margin-right:4px"></span>RL training</span>
+  <span><span style="display:inline-block;width:10px;height:10px;background:var(--c4);border-radius:2px;vertical-align:middle;margin-right:4px"></span>Optimisation</span>
+  <span><span style="display:inline-block;width:10px;height:10px;background:var(--c5);border-radius:2px;vertical-align:middle;margin-right:4px"></span>Robot execution</span>
+  <span><span style="display:inline-block;width:10px;height:10px;background:var(--c6);border-radius:2px;vertical-align:middle;margin-right:4px"></span>Analysis</span>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>3 — Script Details</h2>
+
+<div class="two">
+
+<!-- record.py -->
+<div class="card" style="border-top:3px solid var(--c1)">
+  <div style="font-weight:700;color:#60a5fa;font-family:monospace;margin-bottom:.5rem">① record.py</div>
+  <p style="font-size:.85rem;margin-bottom:.75rem">Passive RTDE stream logger. <strong>Never moves the robot.</strong> A script must already be playing. Records target/actual joint positions, velocities, currents, and any float registers you map (e.g. vel, acc) to a CSV.</p>
+  <div class="io-label">Inputs</div>
+  <div class="io-item"><code>--robot-ip</code> controller address</div>
+  <div class="io-item"><code>--float-register 1 vel 2 acc</code> register-to-name map</div>
+  <div class="io-label">Output</div>
+  <div class="io-item"><code>data/test-N.csv</code> raw RTDE recording</div>
+  <pre><code>python record.py \
+  --robot-ip 127.0.0.1 \
+  --out data/test-1.csv \
+  --float-register 1 vel 2 acc</code></pre>
+</div>
+
+<!-- train_distillation_model.py -->
+<div class="card" style="border-top:3px solid var(--c2)">
+  <div style="font-weight:700;color:#c084fc;font-family:monospace;margin-bottom:.5rem">② train_distillation_model.py</div>
+  <p style="font-size:.85rem;margin-bottom:.75rem">Trains a <code>LinearModel</code> via least-squares on features <code>[target_current, qd, qdd, pos, vel, acc, joint_onehot]</code> → <code>actual_current</code>. Evaluates on a held-out split, then refits on all data.</p>
+  <div class="io-label">Inputs</div>
+  <div class="io-item"><code>data/test-*.csv</code> real robot recordings</div>
+  <div class="io-label">Outputs</div>
+  <div class="io-item"><code>models/distill.pkl</code> <span class="tag" style="background:#1f3a6e;color:#93c5fd">latest</span></div>
+  <div class="io-item"><code>results/&lt;dt&gt;/distill.pkl</code> <span class="tag" style="background:#3d1f8e;color:#d8b4fe">versioned</span></div>
+  <div class="io-item"><code>results/&lt;dt&gt;/log.json</code> — features, RMSE, R²</div>
+  <div class="io-item"><code>results/&lt;dt&gt;/residuals.png</code> + <code>per_joint_rmse.png</code></div>
+  <div class="io-item"><code>results/runs_summary.csv</code> — cross-run comparison</div>
+  <pre><code>python train_distillation_model.py \
+  --csvs data/test-4.csv data/test-5.csv \
+  --out models/distill.pkl</code></pre>
+</div>
+
+<!-- train_rla.py -->
+<div class="card" style="border-top:3px solid var(--c3)">
+  <div style="font-weight:700;color:#fbbf24;font-family:monospace;margin-bottom:.5rem">③ train_rla.py</div>
+  <p style="font-size:.85rem;margin-bottom:.75rem">Runs training scripts on URSim, augments <code>actual_current</code> with the distill model, then trains a <strong>PPO contextual bandit</strong> to minimise current gap + cycle time. Triangle is <em>held out</em> as the test script.</p>
+  <div class="io-label">Inputs</div>
+  <div class="io-item"><code>models/distill.pkl</code></div>
+  <div class="io-item"><code>scripts/*.script</code> (training motions — not triangle)</div>
+  <div class="io-label">Outputs</div>
+  <div class="io-item"><code>models/agent_params.zip</code> <span class="tag" style="background:#1f3a6e;color:#93c5fd">latest</span></div>
+  <div class="io-item"><code>results/&lt;dt&gt;_rla_params/agent_params.zip</code> <span class="tag" style="background:#3d1f8e;color:#d8b4fe">versioned</span></div>
+  <div class="io-item"><code>results/&lt;dt&gt;_rla_params/sim_to_real.csv</code></div>
+  <div class="io-item"><code>results/&lt;dt&gt;_rla_params/training_curve.png</code></div>
+  <pre><code>python train_rla.py \
+  --mode params \
+  --model models/distill.pkl \
+  --robot-ip 127.0.0.1 \
+  --scripts scripts/shoulder_swing.script \
+            scripts/vertical_swing.script \
+  --loop 5 --steps 20000</code></pre>
+</div>
+
+<!-- run.py -->
+<div class="card" style="border-top:3px solid var(--c4)">
+  <div style="font-weight:700;color:#4ade80;font-family:monospace;margin-bottom:.5rem">④ run.py</div>
+  <p style="font-size:.85rem;margin-bottom:.75rem">Runs the held-out script on URSim, loads the trained agent, queries it for better motion parameters, scores the predicted improvement, and writes the optimised script or path file.</p>
+  <div class="io-label">Inputs</div>
+  <div class="io-item"><code>scripts/triangle.script</code></div>
+  <div class="io-item"><code>models/distill.pkl</code> + <code>models/agent_params.zip</code></div>
+  <div class="io-label">Outputs</div>
+  <div class="io-item"><code>scripts/triangle.optimized.script</code> (params mode)</div>
+  <div class="io-item"><code>scripts/triangle.path</code> (path mode)</div>
+  <div class="io-item"><code>results/&lt;dt&gt;_run_params/log.json</code> — baseline vs optimised</div>
+  <pre><code>python run.py \
+  --mode params \
+  --script scripts/triangle.script \
+  --model models/distill.pkl \
+  --robot-ip 127.0.0.1</code></pre>
+</div>
+
+<!-- send.py -->
+<div class="card" style="border-top:3px solid var(--c5)">
+  <div style="font-weight:700;color:#22d3ee;font-family:monospace;margin-bottom:.5rem">⑤ send.py</div>
+  <p style="font-size:.85rem;margin-bottom:.75rem">Sends a URScript (or servoj path) to the robot and records RTDE at 125 Hz. Output is <strong>auto-named with datetime</strong> when <code>--out</code> is omitted — nothing is ever silently overwritten. A JSON sidecar is always saved next to the CSV.</p>
+  <div class="io-label">Inputs</div>
+  <div class="io-item"><code>scripts/triangle.script</code> or <code>.optimized.script</code></div>
+  <div class="io-label">Outputs</div>
+  <div class="io-item"><code>results/&lt;dt&gt;_triangle.csv</code></div>
+  <div class="io-item"><code>results/&lt;dt&gt;_triangle.csv.json</code> — script, loop, n_samples</div>
+  <pre><code># baseline recording
+python send.py \
+  --script scripts/triangle.script \
+  --loop 10
+
+# optimised recording
+python send.py \
+  --script scripts/triangle.optimized.script \
+  --loop 10</code></pre>
+</div>
+
+<!-- analysis.py -->
+<div class="card" style="border-top:3px solid var(--c6)">
+  <div style="font-weight:700;color:#f87171;font-family:monospace;margin-bottom:.5rem">⑥ analysis.py</div>
+  <p style="font-size:.85rem;margin-bottom:.75rem">Reads any recording CSV. Prints a per-joint table (range of motion, current gap RMS/max, position error) and saves two plots. Use on both baseline and optimised recordings to validate improvement.</p>
+  <div class="io-label">Inputs</div>
+  <div class="io-item"><code>results/&lt;dt&gt;_triangle.csv</code> any recording</div>
+  <div class="io-label">Outputs</div>
+  <div class="io-item"><code>results/&lt;dt&gt;_analysis_&lt;name&gt;/log.json</code></div>
+  <div class="io-item"><code>results/.../current_shoulder.png</code> — target vs actual</div>
+  <div class="io-item"><code>results/.../all_joints_overview.png</code> — 3-panel bar chart</div>
+  <pre><code>python analysis.py \
+  --csv results/&lt;dt&gt;_triangle.csv \
+  --joint 1  # 0=base 1=shoulder … 5=wrist3</code></pre>
+</div>
+
+</div><!-- .two -->
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>4 — The Two Modes</h2>
+
+<div class="two">
+  <div class="card" style="border-top:3px solid var(--c3)">
+    <div style="font-weight:700;color:#fbbf24;margin-bottom:.6rem">params mode (GapEnv)</div>
+    <svg id="svg-params" viewBox="0 0 300 200" style="width:100%;display:block"></svg>
+    <p style="font-size:.82rem;color:var(--muted);margin-top:.6rem">Agent picks a single global <code>vel</code> and <code>acc</code> for all moves. The existing script is rewritten with new values → <code>.optimized.script</code>. Simpler, recommended to start.</p>
+  </div>
+  <div class="card" style="border-top:3px solid var(--c4)">
+    <div style="font-weight:700;color:#4ade80;margin-bottom:.6rem">path mode (PathEnv)</div>
+    <svg id="svg-path" viewBox="0 0 300 200" style="width:100%;display:block"></svg>
+    <p style="font-size:.82rem;color:var(--muted);margin-top:.6rem">Agent picks a speed profile shape (<code>accel_frac</code>, <code>decel_frac</code>, <code>dt</code> per move). Output is a dense <code>servoj</code> setpoint file → <code>.path</code>. More flexible but needs <code>send.py --path</code>.</p>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>5 — RL Environment: Contextual Bandit</h2>
+
+<div class="card">
+  <p style="font-size:.88rem;margin-bottom:1rem">A key design decision: every episode is <strong>a single move</strong> and <code>terminated=True</code> always. This means the PPO agent never needs to reason about multi-step consequences — it's essentially a learned lookup from <em>move features → optimal parameters</em>. This is called a <strong>contextual bandit</strong>.</p>
+  <svg id="svg-bandit" viewBox="0 0 900 140" style="width:100%;display:block;min-width:600px"></svg>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>6 — File Dependencies</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Script</th>
+      <th>Reads</th>
+      <th>Writes (key files)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code style="color:#60a5fa">record.py</code></td>
+      <td>robot RTDE stream</td>
+      <td><code>data/test-N.csv</code></td>
+    </tr>
+    <tr>
+      <td><code style="color:#c084fc">train_distillation_model.py</code></td>
+      <td><code>data/test-*.csv</code></td>
+      <td><code>models/distill.pkl</code>, <code>results/&lt;dt&gt;/</code></td>
+    </tr>
+    <tr>
+      <td><code style="color:#fbbf24">train_rla.py</code></td>
+      <td><code>models/distill.pkl</code>, <code>scripts/*.script</code></td>
+      <td><code>models/agent_params.zip</code>, <code>results/&lt;dt&gt;_rla_*/</code></td>
+    </tr>
+    <tr>
+      <td><code style="color:#4ade80">run.py</code></td>
+      <td><code>models/distill.pkl</code>, <code>models/agent_params.zip</code>, <code>scripts/triangle.script</code></td>
+      <td><code>scripts/triangle.optimized.script</code>, <code>results/&lt;dt&gt;_run_*/</code></td>
+    </tr>
+    <tr>
+      <td><code style="color:#22d3ee">send.py</code></td>
+      <td><code>scripts/triangle*.script</code></td>
+      <td><code>results/&lt;dt&gt;_triangle.csv</code> + <code>.json</code></td>
+    </tr>
+    <tr>
+      <td><code style="color:#f87171">analysis.py</code></td>
+      <td><code>results/&lt;dt&gt;_triangle.csv</code></td>
+      <td><code>results/&lt;dt&gt;_analysis_*/log.json</code> + <code>*.png</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>7 — Results Folder Structure</h2>
+
+<div class="tree">
+<span class="td">results/</span>
+├── <span class="td">&lt;datetime&gt;/</span>                              <span class="tc">← distillation run</span>
+│   ├── <span class="tf">distill.pkl</span>                           <span class="tc">versioned model copy</span>
+│   ├── <span class="tf">log.json</span>                              <span class="tc">features, RMSE, R²</span>
+│   ├── <span class="tf">residuals_actual_current.png</span>
+│   └── <span class="tf">per_joint_rmse_actual_current.png</span>
+│
+├── <span class="td">&lt;datetime&gt;_rla_params/</span>                <span class="tc">← RL training run</span>
+│   ├── <span class="tf">agent_params.zip</span>                      <span class="tc">versioned agent</span>
+│   ├── <span class="tf">sim_to_real.csv</span>                       <span class="tc">training dataset</span>
+│   ├── <span class="tf">log.json</span>
+│   └── <span class="tf">training_curve.png</span>
+│
+├── <span class="td">&lt;datetime&gt;_run_params/</span>                <span class="tc">← run.py optimisation</span>
+│   ├── <span class="tf">triangle.sim_to_real.csv</span>
+│   └── <span class="tf">log.json</span>                              <span class="tc">baseline vs optimised metrics</span>
+│
+├── <span class="tf">&lt;datetime&gt;_triangle.csv</span>               <span class="tc">← send.py recording</span>
+├── <span class="tf">&lt;datetime&gt;_triangle.csv.json</span>          <span class="tc">  metadata sidecar</span>
+├── <span class="tf">&lt;datetime&gt;_triangle.optimized.csv</span>     <span class="tc">← optimised script recording</span>
+│
+├── <span class="td">&lt;datetime&gt;_analysis_triangle/</span>        <span class="tc">← analysis.py run</span>
+│   ├── <span class="tf">log.json</span>
+│   ├── <span class="tf">current_shoulder.png</span>                  <span class="tc">joint-specific plot</span>
+│   └── <span class="tf">all_joints_overview.png</span>               <span class="tc">all 6 joints bar chart</span>
+│
+├── <span class="tf">runs_summary.csv</span>                      <span class="tc">← distillation cross-run table</span>
+├── <span class="tf">runs_summary_rla.csv</span>                  <span class="tc">← RL cross-run table</span>
+└── <span class="tf">comparison_plot.png</span>                   <span class="tc">← RMSE / R² trend over runs</span>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>8 — Full Pipeline Commands</h2>
+
+<div class="card">
+<pre style="margin:0"><code style="color:#e6edf3"># ── 0. Start simulator ─────────────────────────────────────────────────────
+cd "../simulation environment" && docker compose up -d
+# Open http://localhost → power on → release brakes → Remote Control mode
+
+cd "case 2"
+
+# ── 1. (optional) Record real robot runs ────────────────────────────────────
+python record.py --robot-ip &lt;real_ip&gt; --out data/test-N.csv \
+  --float-register 1 vel 2 acc
+
+# ── 2. Train distillation model ─────────────────────────────────────────────
+python train_distillation_model.py \
+  --csvs data/test-4.csv data/test-5.csv data/test-6.csv \
+  --out models/distill.pkl
+
+# ── 3. Train RL agent (leave triangle out) ───────────────────────────────────
+python train_rla.py --mode params --model models/distill.pkl \
+  --robot-ip 127.0.0.1 --loop 5 --steps 20000 \
+  --scripts scripts/shoulder_swing.script scripts/vertical_swing.script \
+            scripts/horizontal_swing.script
+
+# ── 4. Optimise the held-out triangle script ─────────────────────────────────
+python run.py --mode params --script scripts/triangle.script \
+  --model models/distill.pkl --robot-ip 127.0.0.1
+
+# ── 5. Record both versions on the robot ─────────────────────────────────────
+python send.py --script scripts/triangle.script --loop 10
+python send.py --script scripts/triangle.optimized.script --loop 10
+
+# ── 6. Compare ───────────────────────────────────────────────────────────────
+python analysis.py --csv results/&lt;dt&gt;_triangle.csv --joint 1
+python analysis.py --csv results/&lt;dt&gt;_triangle.optimized.csv --joint 1</code></pre>
+</div>
+
+<div class="note" style="margin-top:1rem">
+  <strong style="color:#c084fc">URSim note:</strong> On the simulator <code>actual_current == target_current</code> always, so analysis shows 0 gap. This is expected — the gap only appears on real hardware. The distillation model <em>predicts</em> what the gap would be, letting RL train without needing the real robot at every step.
+</div>
+
+</div><!-- .page -->
+
+<script>
+// ── Helpers ──────────────────────────────────────────────────────────────────
+const NS = 'http://www.w3.org/2000/svg';
+function el(tag, attrs, parent) {
+  const e = document.createElementNS(NS, tag);
+  Object.entries(attrs).forEach(([k,v]) => e.setAttribute(k,v));
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function text(content, attrs, parent) {
+  const t = el('text', attrs, parent);
+  t.textContent = content;
+  return t;
+}
+function pts(arr) { return arr.map(p => p.join(',')).join(' '); }
+
+// ── Reality gap charts ────────────────────────────────────────────────────────
+function sineWave(x0, y0, w, amp, period, n, phase=0, noise=0) {
+  const p = [];
+  for (let i=0; i<=n; i++) {
+    const t = i/n;
+    const x = x0 + t*w;
+    const y = y0 - amp*Math.sin(2*Math.PI*(t*(w/period)) + phase)
+                + (Math.random()-.5)*noise;
+    p.push([+x.toFixed(1), +y.toFixed(1)]);
+  }
+  return pts(p);
+}
+
+function drawWaveChart(svgId, showGap) {
+  const svg = document.getElementById(svgId);
+  const W=300, H=110, x0=20, y0=60, cw=260, amp=28, per=80, n=80;
+
+  // Grid
+  [20,60,100].forEach(y => el('line',{x1:x0,y1:y,x2:x0+cw,y2:y,
+    stroke:'#30363d','stroke-width':.5,
+    'stroke-dasharray': y===60?'none':'3,3'}, svg));
+
+  // Labels
+  text('target',{x:x0+cw+4,y:35,fill:'#3b82f6','font-size':7},svg);
+  text('actual',{x:x0+cw+4,y:50,fill:showGap?'#ef4444':'#22c55e','font-size':7},svg);
+
+  const tgtPts = sineWave(x0, y0, cw, amp, per, n);
+
+  if (showGap) {
+    // Filled gap area
+    const actPts2 = sineWave(x0, y0, cw, amp*1.15, per, n, 0.45, 3);
+    const tArr = tgtPts.split(' ').map(p=>p.split(',').map(Number));
+    const aArr = actPts2.split(' ').map(p=>p.split(',').map(Number));
+    const fillD = `M${tArr[0].join(',')} ` +
+      tArr.map(p=>`L${p.join(',')}`).join(' ') +
+      aArr.slice().reverse().map(p=>`L${p.join(',')}`).join(' ') + ' Z';
+    el('path',{d:fillD,fill:'#ef4444','fill-opacity':.12},svg);
+    el('polyline',{points:actPts2,fill:'none',stroke:'#ef4444','stroke-width':1.5},svg);
+    el('polyline',{points:tgtPts,fill:'none',stroke:'#3b82f6','stroke-width':2},svg);
+    // Gap brace
+    text('gap',{x:x0+cw/2,y:103,fill:'#ef4444','font-size':8,'text-anchor':'middle'},svg);
+  } else {
+    el('polyline',{points:tgtPts,fill:'none',stroke:'#3b82f6','stroke-width':2},svg);
+    // Actual overlaps exactly
+    el('polyline',{points:tgtPts,fill:'none',stroke:'#22c55e','stroke-width':1.5,
+      'stroke-dasharray':'5,3'},svg);
+    text('gap ≈ 0',{x:x0+cw/2,y:103,fill:'#22c55e','font-size':8,'text-anchor':'middle'},svg);
+  }
+  el('polyline',{points:tgtPts,fill:'none',stroke:'#3b82f6','stroke-width':2},svg);
+}
+
+drawWaveChart('svg-sim', false);
+drawWaveChart('svg-real', true);
+
+// ── Pipeline flowchart ────────────────────────────────────────────────────────
+(function() {
+  const svg = document.getElementById('svg-pipeline');
+  const steps = [
+    {name:'record.py',     short:'Log RTDE data',       color:'#2563eb', out:'data/test-N.csv'},
+    {name:'train_distill', short:'Learn the gap',        color:'#9333ea', out:'models/distill.pkl'},
+    {name:'train_rla.py',  short:'Train PPO agent',      color:'#d97706', out:'models/agent.zip'},
+    {name:'run.py',        short:'Optimise script',      color:'#16a34a', out:'triangle.optimized\n.script'},
+    {name:'send.py',       short:'Execute on robot',     color:'#0891b2', out:'results/<dt>.csv'},
+    {name:'analysis.py',   short:'Compare results',      color:'#dc2626', out:'plots + log.json'},
+  ];
+  const bw=140, bh=60, gap=32, by=60, W=1040;
+  const totalW = steps.length*bw + (steps.length-1)*gap;
+  let x = (W-totalW)/2;
+
+  el('defs',{},svg).innerHTML =
+    `<marker id="pa" markerWidth="7" markerHeight="7" refX="5" refY="3.5" orient="auto">
+       <path d="M0,0 L7,3.5 L0,7 Z" fill="#8b949e"/>
+     </marker>`;
+
+  steps.forEach((s,i) => {
+    const cx = x + bw/2;
+    // Number badge
+    el('circle',{cx,cy:by-16,r:11,fill:s.color},svg);
+    text(i+1,{x:cx,y:by-11,'text-anchor':'middle',fill:'#fff','font-size':9,'font-weight':700},svg);
+    // Box
+    el('rect',{x,y:by,width:bw,height:bh,rx:6,
+      fill:s.color+'22',stroke:s.color,'stroke-width':1.5},svg);
+    // Script name
+    text(s.name,{x:cx,y:by+22,'text-anchor':'middle',fill:s.color,
+      'font-size':9,'font-weight':700,'font-family':'monospace'},svg);
+    // Description
+    text(s.short,{x:cx,y:by+40,'text-anchor':'middle',fill:'#8b949e','font-size':8},svg);
+    // Output label (may have \n)
+    s.out.split('\n').forEach((line,li) =>
+      text(line,{x:cx,y:by+bh+16+li*11,'text-anchor':'middle',
+        fill:'#8b949e','font-size':7,'font-family':'monospace'},svg));
+    // Arrow
+    if (i < steps.length-1) {
+      const ax = x+bw+2, ay = by+bh/2;
+      el('line',{x1:ax,y1:ay,x2:ax+gap-4,y2:ay,
+        stroke:'#8b949e','stroke-width':1.5,'marker-end':'url(#pa)'},svg);
+    }
+    x += bw+gap;
+  });
+})();
+
+// ── Mode diagrams ─────────────────────────────────────────────────────────────
+function drawModeBox(svgId, color, actions, note) {
+  const svg = document.getElementById(svgId);
+  const W=300, H=200;
+
+  el('defs',{},svg).innerHTML =
+    `<marker id="ma${svgId}" markerWidth="7" markerHeight="7" refX="5" refY="3.5" orient="auto">
+       <path d="M0,0 L7,3.5 L0,7 Z" fill="#555"/>
+     </marker>`;
+
+  const boxes = [
+    {label:'Observation',  sub:['target_q, Δq','cycle_time, score'],    x:10,  y:20,  w:120, h:50, c:'#30363d'},
+    {label:'PPO Policy',   sub:['agent.zip'],                            x:90,  y:110, w:120, h:50, c:color},
+    {label:'Action',       sub:actions,                                  x:170, y:20,  w:120, h:50, c:'#30363d'},
+  ];
+  boxes.forEach(b => {
+    el('rect',{x:b.x,y:b.y,width:b.w,height:b.h,rx:5,
+      fill:b.c+'22',stroke:b.c,'stroke-width':1.5},svg);
+    text(b.label,{x:b.x+b.w/2,y:b.y+15,'text-anchor':'middle',
+      fill:b.c==='#30363d'?'#e6edf3':color,'font-size':8,'font-weight':700},svg);
+    b.sub.forEach((s,i) => text(s,{x:b.x+b.w/2,y:b.y+27+i*11,'text-anchor':'middle',
+      fill:'#8b949e','font-size':7},svg));
+  });
+
+  // Arrows: obs→policy, policy→action
+  const marker = `url(#ma${svgId})`;
+  el('path',{d:'M70,50 Q70,110 90,135',fill:'none',stroke:'#555',
+    'stroke-width':1.5,'marker-end':marker},svg);
+  el('path',{d:'M210,135 Q230,90 230,70',fill:'none',stroke:'#555',
+    'stroke-width':1.5,'marker-end':marker},svg);
+
+  // Reward
+  text('reward = −(score + λ·cycle_time)',{x:150,y:178,'text-anchor':'middle',
+    fill:'#ef4444','font-size':7.5},svg);
+  text('terminated = True always (one move = one episode)',{x:150,y:192,
+    'text-anchor':'middle',fill:'#8b949e','font-size':7},svg);
+}
+
+drawModeBox('svg-params','#d97706',['vel (°/s)','acc (°/s²)']);
+drawModeBox('svg-path',  '#16a34a',['accel_frac','decel_frac, dt']);
+
+// ── Contextual bandit diagram ─────────────────────────────────────────────────
+(function() {
+  const svg = document.getElementById('svg-bandit');
+  el('defs',{},svg).innerHTML =
+    `<marker id="ba" markerWidth="7" markerHeight="7" refX="5" refY="3.5" orient="auto">
+       <path d="M0,0 L7,3.5 L0,7 Z" fill="#8b949e"/>
+     </marker>`;
+
+  const stages = [
+    {label:'Move geometry',   sub:['target_q, Δq','duration'],           color:'#3b82f6', x:20},
+    {label:'PPO Observation', sub:['+ cycle_time','+ current score'],     color:'#9333ea', x:210},
+    {label:'Policy → Action', sub:['vel+acc (params)','or accel+dt (path)'],color:'#d97706',x:400},
+    {label:'Execute on sim',  sub:['run movej','augment current'],        color:'#0891b2', x:590},
+    {label:'Score + Reward',  sub:['gap_rms + λ·t','terminated=True'],    color:'#dc2626', x:780},
+  ];
+  const bw=160, bh=68, by=36;
+  stages.forEach((s,i) => {
+    const cx = s.x+bw/2;
+    el('rect',{x:s.x,y:by,width:bw,height:bh,rx:5,
+      fill:s.color+'22',stroke:s.color,'stroke-width':1.5},svg);
+    text(s.label,{x:cx,y:by+16,'text-anchor':'middle',
+      fill:s.color,'font-size':8,'font-weight':700},svg);
+    s.sub.forEach((sub,si) => text(sub,{x:cx,y:by+30+si*13,'text-anchor':'middle',
+      fill:'#8b949e','font-size':7.5},svg));
+    if (i<stages.length-1) {
+      el('line',{x1:s.x+bw+2,y1:by+bh/2,x2:s.x+bw+22,y2:by+bh/2,
+        stroke:'#8b949e','stroke-width':1.5,'marker-end':'url(#ba)'},svg);
+    }
+  });
+  // Loop-back arrow under
+  el('path',{d:`M ${780+160} ${by+bh} Q ${900} 130 ${500} 130 Q ${100} 130 ${20} ${by+bh}`,
+    fill:'none',stroke:'#555','stroke-width':1,'stroke-dasharray':'4,3',
+    'marker-end':'url(#ba)'},svg);
+  text('next episode (next move)',{x:450,y:128,'text-anchor':'middle',
+    fill:'#555','font-size':7.5},svg);
+})();
+</script>
+</body>
+</html>
