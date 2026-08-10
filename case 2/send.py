@@ -30,12 +30,16 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 import socket
+from datetime import datetime
 
 from record import build_recipe, open_stream, parse_registers, record_stream
 from utils import load_script
+
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
 SCRIPT_PORT = 30002       # UR secondary client interface: accepts URScript programs
 RUNTIME_PLAYING = 2       # RTDE runtime_state while a program is running
@@ -228,8 +232,8 @@ def main():
                     help="servoj path CSV to stream instead of --script")
     ap.add_argument("--dt", type=float, default=0.008,
                     help="servoj time per row for --path (s, default 0.008)")
-    ap.add_argument("--out", default="run.csv",
-                    help="output CSV path (default: run.csv in the current folder)")
+    ap.add_argument("--out", default=None,
+                    help="output CSV path (default: results/<datetime>_<script>.csv)")
     ap.add_argument("--hz", type=float, default=125.0, help="sample rate (default 125)")
     ap.add_argument("--float-register", nargs="+", metavar="IDX NAME",
                     default=["1", "vel", "2", "acc"],
@@ -240,6 +244,14 @@ def main():
                     help="repeat N times then stop (default: run once)")
     args = ap.parse_args()
 
+    # Auto-generate a timestamped output path when --out is not given.
+    dt_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if args.out is None:
+        src  = args.path if args.path else args.script
+        base = os.path.splitext(os.path.basename(src))[0]
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        args.out = os.path.join(RESULTS_DIR, f"{dt_str}_{base}.csv")
+
     if args.path:                            # stream a servoj path
         n, stop = record_path(args.robot_ip, args.path, args.out, args.dt,
                               args.hz, args.loop, args.port)
@@ -247,6 +259,22 @@ def main():
         n, stop = record_run(args.robot_ip, args.script, args.out, args.hz,
                              args.float_register, args.loop, args.port)
     print(f"\nwrote {n} samples to {args.out}" + (f"  ({stop})" if stop else ""))
+
+    # Save a metadata sidecar so the recording is self-documenting.
+    meta = {
+        "datetime":    dt_str,
+        "script":      args.script if not args.path else None,
+        "path":        args.path   if args.path     else None,
+        "loop":        args.loop,
+        "hz":          args.hz,
+        "n_samples":   n,
+        "stop_reason": stop,
+        "out":         args.out,
+    }
+    meta_path = args.out + ".json"
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"meta  -> {meta_path}")
 
 
 if __name__ == "__main__":
