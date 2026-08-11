@@ -340,6 +340,241 @@ python analysis.py --csv results/&lt;dt&gt;_triangle.optimized.csv --joint 1</co
   <strong style="color:#c084fc">URSim note:</strong> On the simulator <code>actual_current == target_current</code> always, so analysis shows 0 gap. This is expected — the gap only appears on real hardware. The distillation model <em>predicts</em> what the gap would be, letting RL train without needing the real robot at every step.
 </div>
 
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>9 — CSV File Schemas</h2>
+
+<!-- Recording CSV -->
+<div class="card" style="margin-bottom:1rem">
+  <div style="font-weight:700;color:#60a5fa;margin-bottom:.75rem">
+    Recording CSV &nbsp;<span style="font-weight:400;color:var(--muted);font-size:.85rem">— produced by <code>record.py</code> and <code>send.py</code></span>
+  </div>
+  <p style="font-size:.85rem;margin-bottom:.9rem">Every row is one RTDE sample (default 125 Hz, so ~8 ms between rows). Each joint has its own numbered column, 0 = base through 5 = wrist3.</p>
+  <table>
+    <thead><tr><th>Column(s)</th><th>Unit</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td><code>timestamp</code></td><td>s</td><td>Seconds elapsed since the recording started</td></tr>
+      <tr><td><code>target_q0 … target_q5</code></td><td>rad</td><td>Joint positions the controller is commanding (the setpoint)</td></tr>
+      <tr><td><code>actual_q0 … actual_q5</code></td><td>rad</td><td>Joint positions the encoder actually reads. On URSim this equals <code>target_q</code>.</td></tr>
+      <tr><td><code>target_qd0 … target_qd5</code></td><td>rad/s</td><td>Commanded joint velocities</td></tr>
+      <tr><td><code>target_current0 … target_current5</code></td><td>A</td><td>Current the controller asks the motor driver to produce (from its internal model)</td></tr>
+      <tr><td><code>actual_current0 … actual_current5</code></td><td>A</td><td>Current the motor driver reports drawing. <strong>On real hardware this differs from target — that difference is the reality gap.</strong> On URSim it equals <code>target_current</code>.</td></tr>
+      <tr><td><code>vel</code></td><td>raw</td><td>The <code>vel</code> argument passed to <code>movej(…, a, v, …)</code> in the script, logged via float register 1. Raw URScript units (~100 = moderate speed).</td></tr>
+      <tr><td><code>acc</code></td><td>raw</td><td>The <code>acc</code> argument passed to <code>movej</code>, logged via float register 2.</td></tr>
+      <tr><td><code>script_line_counter</code></td><td>int</td><td>Which URScript line is executing. Changes at every waypoint. Used by <code>common.segments()</code> to split the recording into individual moves.</td></tr>
+      <tr><td><code>output_double_register_3</code></td><td>0/1</td><td>Done-flag set by the script wrapper. 1 = program finished. Internal — ignore in analysis.</td></tr>
+    </tbody>
+  </table>
+  <div class="note" style="margin-top:.9rem">
+    <strong>tip:</strong> Load with <code>from analysis import Recording; rec = Recording("results/…csv")</code>. Use <code>rec.target_current</code>, <code>rec.actual_current</code> (both shape <code>(n, 6)</code>) and <code>rec.current_gap(joint)</code> = actual − target for one joint.
+  </div>
+</div>
+
+<!-- sim_to_real.csv -->
+<div class="card" style="margin-bottom:1rem">
+  <div style="font-weight:700;color:#fbbf24;margin-bottom:.75rem">
+    sim_to_real.csv &nbsp;<span style="font-weight:400;color:var(--muted);font-size:.85rem">— produced by <code>train_rla.py</code> and <code>run.py</code></span>
+  </div>
+  <p style="font-size:.85rem;margin-bottom:.9rem">Same schema as the recording CSV, but <code>actual_current0–5</code> has been <em>overwritten</em> by the distillation model's predictions. This is what makes RL training possible without a real robot: the simulator runs the motion, and the distill model fills in what the real currents <em>would</em> have been.</p>
+  <table>
+    <thead><tr><th>Extra column(s)</th><th>What they add</th></tr></thead>
+    <tbody>
+      <tr><td><code>score</code> (one row per segment)</td><td>CurrentGapMetric score for that move — Σ|actual_current − target_current|</td></tr>
+      <tr><td><code>source_script</code></td><td>Which training script this row came from (when multiple scripts are pooled)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- runs_summary.csv -->
+<div class="card" style="margin-bottom:1rem">
+  <div style="font-weight:700;color:#c084fc;margin-bottom:.75rem">
+    results/runs_summary.csv &nbsp;<span style="font-weight:400;color:var(--muted);font-size:.85rem">— one row appended per <code>train_distillation_model.py</code> run</span>
+  </div>
+  <table>
+    <thead><tr><th>Column</th><th>What it means</th></tr></thead>
+    <tbody>
+      <tr><td><code>datetime</code></td><td>When this training run happened</td></tr>
+      <tr><td><code>model_class</code></td><td>Class name, e.g. <code>LinearModel</code></td></tr>
+      <tr><td><code>n_recordings</code></td><td>How many CSV files were used for training</td></tr>
+      <tr><td><code>holdout_fraction</code></td><td>Fraction held out for evaluation (default 0.2)</td></tr>
+      <tr><td><code>rmse_actual_current</code></td><td>Root-mean-square prediction error on the held-out set, in Amperes. <strong>Lower is better.</strong></td></tr>
+      <tr><td><code>r2_actual_current</code></td><td>R² on held-out set (0–1). <strong>Closer to 1 is better.</strong> Measures what fraction of the variance in actual_current the model explains.</td></tr>
+      <tr><td><code>n_rows_holdout</code></td><td>Number of samples in the held-out set</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- runs_summary_rla.csv -->
+<div class="card" style="margin-bottom:1rem">
+  <div style="font-weight:700;color:#fbbf24;margin-bottom:.75rem">
+    results/runs_summary_rla.csv &nbsp;<span style="font-weight:400;color:var(--muted);font-size:.85rem">— one row appended per <code>train_rla.py</code> run</span>
+  </div>
+  <table>
+    <thead><tr><th>Column</th><th>What it means</th></tr></thead>
+    <tbody>
+      <tr><td><code>datetime</code></td><td>When this training run happened</td></tr>
+      <tr><td><code>mode</code></td><td><code>params</code> or <code>path</code></td></tr>
+      <tr><td><code>scripts</code></td><td>Training scripts used (comma-separated)</td></tr>
+      <tr><td><code>steps</code></td><td>PPO timesteps trained for</td></tr>
+      <tr><td><code>best_score</code></td><td>Lowest (best) episode score seen during training. This is what the versioned agent was saved at. <strong>Lower is better.</strong></td></tr>
+      <tr><td><code>final_score</code></td><td>Mean episode score in the last few episodes. If much higher than <code>best_score</code>, the policy diverged near the end — use the versioned agent rather than the latest.</td></tr>
+      <tr><td><code>cycle_time</code></td><td>Mean cycle time (seconds) at the end of training</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- analysis log.json -->
+<div class="card" style="margin-bottom:1rem">
+  <div style="font-weight:700;color:#f87171;margin-bottom:.75rem">
+    results/&lt;dt&gt;_analysis_&lt;name&gt;/log.json &nbsp;<span style="font-weight:400;color:var(--muted);font-size:.85rem">— produced by <code>analysis.py</code></span>
+  </div>
+  <table>
+    <thead><tr><th>Field</th><th>Unit</th><th>What it means</th></tr></thead>
+    <tbody>
+      <tr><td><code>n_rows</code></td><td>—</td><td>Total samples in the recording</td></tr>
+      <tr><td><code>dt_ms</code></td><td>ms</td><td>Median time between samples (should be ~8 ms at 125 Hz)</td></tr>
+      <tr><td><code>per_joint[j].moved_rad</code></td><td>rad</td><td>Range of motion for joint j (max − min position). Context: a joint with moved_rad ≈ 0 is barely moving, so its gap numbers are less meaningful.</td></tr>
+      <tr><td><code>per_joint[j].gap_rms_A</code></td><td>A</td><td>RMS of (actual_current − target_current) for joint j across the whole run. <strong>Lower is better.</strong></td></tr>
+      <tr><td><code>per_joint[j].gap_max_A</code></td><td>A</td><td>Worst-case absolute gap. A high max with a low RMS means the robot has brief spikes/ringing but is otherwise well-controlled.</td></tr>
+      <tr><td><code>per_joint[j].pos_err_mrad</code></td><td>mrad</td><td>RMS of (actual_q − target_q): how far the robot deviates from the commanded position. Lower = tighter tracking.</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- run log.json -->
+<div class="card">
+  <div style="font-weight:700;color:#4ade80;margin-bottom:.75rem">
+    results/&lt;dt&gt;_run_&lt;mode&gt;/log.json &nbsp;<span style="font-weight:400;color:var(--muted);font-size:.85rem">— produced by <code>run.py</code></span>
+  </div>
+  <table>
+    <thead><tr><th>Field</th><th>What it means</th></tr></thead>
+    <tbody>
+      <tr><td><code>results.baseline.score</code></td><td>Mean CurrentGapMetric score across moves using the original vel/acc from the script</td></tr>
+      <tr><td><code>results.baseline.cycle_time</code></td><td>Mean time (s) to complete one move, at the original speed</td></tr>
+      <tr><td><code>results.optimized.score</code></td><td>Predicted score using the agent's vel/acc. <strong>Should be lower than baseline.</strong></td></tr>
+      <tr><td><code>results.optimized.cycle_time</code></td><td>Predicted cycle time at the new speed</td></tr>
+      <tr><td><code>results.improvement.score_pct</code></td><td>Percent reduction in score (positive = improvement). e.g. 25.0 means predicted gap drops by 25%.</td></tr>
+      <tr><td><code>results.improvement.cycle_time_pct</code></td><td>Percent reduction in cycle time</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>10 — How to Interpret and Compare Results</h2>
+
+<!-- Distillation model -->
+<div class="card" style="border-top:3px solid var(--c2);margin-bottom:1rem">
+  <div style="font-weight:700;color:#c084fc;margin-bottom:.75rem">Distillation model quality</div>
+
+  <div class="three" style="margin-bottom:1rem">
+    <div style="background:var(--surface2);border-radius:6px;padding:.9rem">
+      <div style="font-size:.75rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:.4rem">RMSE (held-out)</div>
+      <div style="display:flex;flex-direction:column;gap:.3rem;font-size:.82rem">
+        <span><span style="color:#22c55e;font-weight:700">&lt; 0.3 A</span> — excellent</span>
+        <span><span style="color:#fbbf24;font-weight:700">0.3 – 0.8 A</span> — usable</span>
+        <span><span style="color:#ef4444;font-weight:700">&gt; 1.5 A</span> — too noisy, collect more data</span>
+      </div>
+    </div>
+    <div style="background:var(--surface2);border-radius:6px;padding:.9rem">
+      <div style="font-size:.75rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:.4rem">R² (held-out)</div>
+      <div style="display:flex;flex-direction:column;gap:.3rem;font-size:.82rem">
+        <span><span style="color:#22c55e;font-weight:700">&gt; 0.90</span> — excellent</span>
+        <span><span style="color:#fbbf24;font-weight:700">0.70 – 0.90</span> — acceptable</span>
+        <span><span style="color:#ef4444;font-weight:700">&lt; 0.50</span> — weak, need more or better data</span>
+      </div>
+    </div>
+    <div style="background:var(--surface2);border-radius:6px;padding:.9rem">
+      <div style="font-size:.75rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:.4rem">residuals_*.png</div>
+      <div style="font-size:.82rem;color:var(--muted)">Errors should be centered around <strong style="color:var(--text)">0</strong> and roughly bell-shaped. A skewed distribution means systematic bias — the model consistently over- or under-predicts.</div>
+    </div>
+  </div>
+
+  <p style="font-size:.85rem;margin-bottom:.6rem"><strong>per_joint_rmse_*.png</strong> — shoulder (1) and elbow (2) typically have higher RMSE because they carry more load and experience greater gravity-induced current swings. Wrist joints (3–5) are usually easier to predict. If one joint is dramatically worse, check that you have recordings with that joint moving significantly.</p>
+  <p style="font-size:.85rem;margin-bottom:.6rem"><strong>Improving the model:</strong> add more training CSVs (more variety of motions), check that <code>vel</code> / <code>acc</code> registers were logged (they are important features), and try different scripts to cover a wider range of joint configurations.</p>
+  <p style="font-size:.85rem"><strong>runs_summary.csv comparison:</strong> sort by <code>rmse_actual_current</code> ascending. Adding recordings should monotonically improve RMSE; if a new run is worse, the new CSV might have recording artefacts (robot not warmed up, e-stop during recording, etc.).</p>
+</div>
+
+<!-- RL agent -->
+<div class="card" style="border-top:3px solid var(--c3);margin-bottom:1rem">
+  <div style="font-weight:700;color:#fbbf24;margin-bottom:.75rem">RL agent quality</div>
+
+  <p style="font-size:.85rem;margin-bottom:.75rem"><strong>training_curve.png</strong> has three panels — read them together:</p>
+  <table style="margin-bottom:.9rem">
+    <thead><tr><th>Panel</th><th>What to look for</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Score over timesteps</strong></td>
+        <td>Should trend <strong>downward</strong>. A flat line means the agent isn't learning (try more steps or check the distill model quality). A U-shape (goes down then up) means it diverged — use the versioned model saved at the best point, not <code>models/agent_params.zip</code>.</td>
+      </tr>
+      <tr>
+        <td><strong>Cycle time over timesteps</strong></td>
+        <td>Should decrease or stabilise. If it keeps decreasing while score stays flat, the agent is optimising for speed only — the λ weight in the reward may need adjusting.</td>
+      </tr>
+      <tr>
+        <td><strong>Reward over timesteps</strong></td>
+        <td>Should trend <strong>upward</strong> (reward = −score). Rolling mean smooths noise. If reward never rises, the reward signal is too weak to learn from.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p style="font-size:.85rem;margin-bottom:.6rem"><strong>runs_summary_rla.csv comparison:</strong> sort by <code>best_score</code> ascending. Compare runs with different step counts or training scripts. A large gap between <code>best_score</code> and <code>final_score</code> tells you training was unstable — prefer the versioned checkpoint.</p>
+  <p style="font-size:.85rem"><strong>Key limitation:</strong> the agent learns from <em>predicted</em> gaps (distill model on URSim), not real hardware. If the distill model is poor, the agent will optimise for phantom improvements. This is why model quality comes first.</p>
+</div>
+
+<!-- Analysis / comparing recordings -->
+<div class="card" style="border-top:3px solid var(--c6);margin-bottom:1rem">
+  <div style="font-weight:700;color:#f87171;margin-bottom:.75rem">Comparing baseline vs optimised recordings</div>
+
+  <p style="font-size:.85rem;margin-bottom:.75rem">After running <code>send.py</code> for both scripts and <code>analysis.py</code> on each, compare the <code>all_joints_overview.png</code> bar charts side by side, or compare <code>log.json</code> values directly.</p>
+
+  <table style="margin-bottom:.9rem">
+    <thead><tr><th>Metric</th><th>Baseline vs Optimised</th><th>If optimised is worse</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>gap_rms_A</code></td>
+        <td>Should <strong>decrease</strong>. This is the primary success criterion — the robot's actual current is closer to commanded.</td>
+        <td>The distill model may not generalise to the triangle script. Try training on more scripts or improving model RMSE first.</td>
+      </tr>
+      <tr>
+        <td><code>gap_max_A</code></td>
+        <td>Should decrease, especially at waypoints (start/stop of moves).</td>
+        <td>High max with low RMS = occasional transients. Ringing during deceleration is common at high acc values.</td>
+      </tr>
+      <tr>
+        <td><code>pos_err_mrad</code></td>
+        <td>Should decrease or stay similar. Path mode typically improves this more than params mode.</td>
+        <td>An increase means the optimised parameters cause the controller to miss the target more. Consider reducing acc.</td>
+      </tr>
+      <tr>
+        <td>Cycle time</td>
+        <td>The optimised script may run faster (fewer seconds per loop). Compare total recording duration / loop count.</td>
+        <td>A much faster script with worse gap = agent over-optimised for speed. Expected if λ is too high.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p style="font-size:.85rem;margin-bottom:.6rem"><strong>Cross-checking with run.py predictions:</strong> <code>run.py</code> prints <code>improvement.score_pct</code> — the <em>predicted</em> improvement. After running on hardware, compare this to the actual change in <code>gap_rms_A</code> from <code>analysis.py</code>. If they match, the distill model generalises well. If the real improvement is much smaller (or negative), there is a sim-to-real gap in the distill model itself.</p>
+
+  <div class="note">
+    <strong style="color:#c084fc">On URSim:</strong> <code>gap_rms_A</code> will always read 0 because the simulator is perfect. To get predicted (non-zero) gap values from a URSim recording, call <code>augment(model, "results/…csv")</code> first — this overwrites <code>actual_current</code> columns with the distill model's predictions. Only then will analysis show meaningful numbers.
+  </div>
+</div>
+
+<!-- Quick interpretation checklist -->
+<div class="card" style="border-top:3px solid var(--c4)">
+  <div style="font-weight:700;color:#4ade80;margin-bottom:.75rem">Quick checklist — is my pipeline working?</div>
+  <table>
+    <thead><tr><th>Check</th><th>Expected</th></tr></thead>
+    <tbody>
+      <tr><td>Distill model RMSE on held-out set</td><td>&lt; 0.5 A and R² &gt; 0.8 before training RL</td></tr>
+      <tr><td>RL training curve (score panel)</td><td>Downward trend; best_score &lt; initial score</td></tr>
+      <tr><td>run.py predicted improvement</td><td>Positive score_pct (gap decreases)</td></tr>
+      <tr><td>Real robot: analysis gap_rms_A (optimised vs baseline)</td><td>Lower for optimised across most joints</td></tr>
+      <tr><td>Real robot: pos_err_mrad</td><td>Similar or lower for optimised</td></tr>
+      <tr><td>Predicted vs actual improvement</td><td>Within ~50% of each other = model generalises</td></tr>
+    </tbody>
+  </table>
+</div>
+
 </div><!-- .page -->
 
 <script>
