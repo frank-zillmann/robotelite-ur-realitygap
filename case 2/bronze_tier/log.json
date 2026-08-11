@@ -1,0 +1,295 @@
+{
+  "n_files": 7,
+  "n_segments": 2497,
+  "n_segments_moved": 2497,
+  "sweep_type_by_file": {
+    "test-1": "combo",
+    "test-2": "acc_sweep",
+    "test-3": "vel_sweep",
+    "test-4": "acc_sweep",
+    "test-5": "vel_sweep",
+    "test-6": "combo",
+    "test-7": "combo"
+  },
+  "worst_overshoot": [
+    {
+      "file": "test-4",
+      "joint_name": "shoulder",
+      "vel": 100.0,
+      "acc": 49.0,
+      "direction": 1,
+      "dist_rad": 3.012318,
+      "peak_overshoot_mrad": 5.880999999999998
+    },
+    {
+      "file": "test-5",
+      "joint_name": "shoulder",
+      "vel": 66.0,
+      "acc": 100.0,
+      "direction": 1,
+      "dist_rad": 3.01232,
+      "peak_overshoot_mrad": 5.851999999999996
+    },
+    {
+      "file": "test-5",
+      "joint_name": "shoulder",
+      "vel": 55.0,
+      "acc": 100.0,
+      "direction": 1,
+      "dist_rad": 3.012336,
+      "peak_overshoot_mrad": 5.825000000000011
+    },
+    {
+      "file": "test-4",
+      "joint_name": "shoulder",
+      "vel": 100.0,
+      "acc": 74.0,
+      "direction": 1,
+      "dist_rad": 3.01233,
+      "peak_overshoot_mrad": 5.819999999999991
+    },
+    {
+      "file": "test-4",
+      "joint_name": "shoulder",
+      "vel": 100.0,
+      "acc": 27.0,
+      "direction": 1,
+      "dist_rad": 3.0123510000000002,
+      "peak_overshoot_mrad": 5.810000000000009
+    }
+  ],
+  "best_overshoot": [
+    {
+      "file": "test-6",
+      "joint_name": "wrist1",
+      "vel": 842.0,
+      "acc": 818.0,
+      "direction": 1,
+      "dist_rad": 4.323443,
+      "peak_overshoot_mrad": 0.3600000000005821
+    },
+    {
+      "file": "test-6",
+      "joint_name": "wrist1",
+      "vel": 234.0,
+      "acc": 364.0,
+      "direction": 1,
+      "dist_rad": 4.323442,
+      "peak_overshoot_mrad": 0.3719999999995949
+    },
+    {
+      "file": "test-7",
+      "joint_name": "wrist1",
+      "vel": 189.0,
+      "acc": 514.0,
+      "direction": 1,
+      "dist_rad": 4.323443,
+      "peak_overshoot_mrad": 0.3799999999998249
+    },
+    {
+      "file": "test-6",
+      "joint_name": "wrist1",
+      "vel": 263.0,
+      "acc": 976.0,
+      "direction": 1,
+      "dist_rad": 4.323442,
+      "peak_overshoot_mrad": 0.38899999999930657
+    },
+    {
+      "file": "test-7",
+      "joint_name": "wrist1",
+      "vel": 363.0,
+      "acc": 815.0,
+      "direction": 1,
+      "dist_rad": 3.332456,
+      "peak_overshoot_mrad": 0.3900000000003345
+    }
+  ],
+  "worst_rms_pos_err": [
+    {
+      "file": "test-3",
+      "joint_name": "shoulder",
+      "vel": 44.0,
+      "acc": 100.0,
+      "direction": -1,
+      "dist_rad": 3.0125249999999997,
+      "rms_pos_err_mrad": 2.2893047383203116
+    },
+    {
+      "file": "test-3",
+      "joint_name": "shoulder",
+      "vel": 21.0,
+      "acc": 100.0,
+      "direction": -1,
+      "dist_rad": 3.0125249999999997,
+      "rms_pos_err_mrad": 2.271545673058691
+    },
+    {
+      "file": "test-3",
+      "joint_name": "shoulder",
+      "vel": 71.0,
+      "acc": 100.0,
+      "direction": -1,
+      "dist_rad": 3.0124709999999997,
+      "rms_pos_err_mrad": 2.2681899457956236
+    },
+    {
+      "file": "test-3",
+      "joint_name": "shoulder",
+      "vel": 91.0,
+      "acc": 100.0,
+      "direction": -1,
+      "dist_rad": 3.0123490000000004,
+      "rms_pos_err_mrad": 2.264414779813795
+    },
+    {
+      "file": "test-3",
+      "joint_name": "shoulder",
+      "vel": 68.0,
+      "acc": 100.0,
+      "direction": -1,
+      "dist_rad": 3.012597,
+      "rms_pos_err_mrad": 2.2627577463791724
+    }
+  ],
+  "best_rms_pos_err": [
+    {
+      "file": "test-6",
+      "joint_name": "elbow",
+      "vel": 602.0,
+      "acc": 264.0,
+      "direction": -1,
+      "dist_rad": 0.05979599999999996,
+      "rms_pos_err_mrad": 0.05849015772087334
+    },
+    {
+      "file": "test-1",
+      "joint_name": "shoulder",
+      "vel": 20.0,
+      "acc": 20.0,
+      "direction": 1,
+      "dist_rad": 3.012444,
+      "rms_pos_err_mrad": 0.3943727304960377
+    },
+    {
+      "file": "test-4",
+      "joint_name": "shoulder",
+      "vel": 100.0,
+      "acc": 11.0,
+      "direction": 1,
+      "dist_rad": 3.0124020000000002,
+      "rms_pos_err_mrad": 0.49664583225102177
+    },
+    {
+      "file": "test-2",
+      "joint_name": "shoulder",
+      "vel": 100.0,
+      "acc": 11.0,
+      "direction": 1,
+      "dist_rad": 3.012594,
+      "rms_pos_err_mrad": 0.5335763694246529
+    },
+    {
+      "file": "test-7",
+      "joint_name": "elbow",
+      "vel": 18.0,
+      "acc": 251.0,
+      "direction": 1,
+      "dist_rad": 2.521527,
+      "rms_pos_err_mrad": 0.6494658043538062
+    }
+  ],
+  "direction_effect": [
+    {
+      "joint": "base",
+      "direction": "-",
+      "n": 183,
+      "mean_overshoot_mrad": 1.0212513661202094,
+      "mean_rms_pos_err_mrad": 0.7456022143674305
+    },
+    {
+      "joint": "elbow",
+      "direction": "+",
+      "n": 273,
+      "mean_overshoot_mrad": 1.4736117216117288,
+      "mean_rms_pos_err_mrad": 0.8492203613179821
+    },
+    {
+      "joint": "elbow",
+      "direction": "-",
+      "n": 182,
+      "mean_overshoot_mrad": 0.7977472527472614,
+      "mean_rms_pos_err_mrad": 0.7321677355932559
+    },
+    {
+      "joint": "shoulder",
+      "direction": "+",
+      "n": 884,
+      "mean_overshoot_mrad": 5.489572398190045,
+      "mean_rms_pos_err_mrad": 1.1337316247631262
+    },
+    {
+      "joint": "shoulder",
+      "direction": "-",
+      "n": 794,
+      "mean_overshoot_mrad": 1.6238816120906905,
+      "mean_rms_pos_err_mrad": 1.7033748442016836
+    },
+    {
+      "joint": "wrist1",
+      "direction": "+",
+      "n": 181,
+      "mean_overshoot_mrad": 0.4668121546961751,
+      "mean_rms_pos_err_mrad": 1.2275912751703717
+    }
+  ],
+  "duration_range_by_file": {
+    "test-1": {
+      "joint": "shoulder",
+      "n_samples_min": 168,
+      "n_samples_max": 381,
+      "ratio": 2.27
+    },
+    "test-2": {
+      "joint": "shoulder",
+      "n_samples_min": 380,
+      "n_samples_max": 381,
+      "ratio": 1.0
+    },
+    "test-3": {
+      "joint": "shoulder",
+      "n_samples_min": 380,
+      "n_samples_max": 381,
+      "ratio": 1.0
+    },
+    "test-4": {
+      "joint": "shoulder",
+      "n_samples_min": 282,
+      "n_samples_max": 381,
+      "ratio": 1.35
+    },
+    "test-5": {
+      "joint": "shoulder",
+      "n_samples_min": 380,
+      "n_samples_max": 381,
+      "ratio": 1.0
+    },
+    "test-6": {
+      "joint": "elbow",
+      "n_samples_min": 28,
+      "n_samples_max": 254,
+      "ratio": 9.07
+    },
+    "test-7": {
+      "joint": "elbow",
+      "n_samples_min": 117,
+      "n_samples_max": 254,
+      "ratio": 2.17
+    }
+  },
+  "note": "correlations below are computed within each (joint, direction) group in the single-parameter sweep files, then averaged -- pooling every file/joint/direction into one Pearson r mixed different speed regimes and flipped the sign. duration_range_by_file uses the motion-only window (i1-i0); it shows the swept vel/acc register (20-100 for vel, 11-100 for acc) barely changes how long the dominant joint's move actually takes (ratio ~1.0-1.35) -- so over this range the controller is not simply running a trapezoidal profile capped at the commanded vel/acc the way dynamics.py's model assumes; something else (a lower default speed limit, a blend/safety cap) is binding instead. Worth flagging for the Dynamics swap point.",
+  "corr_vel_overshoot": -0.26962303471320237,
+  "corr_acc_overshoot": -0.33209487245979186,
+  "corr_vel_rms": 0.10088277086731144,
+  "corr_acc_rms": 0.029432804219524676
+}
