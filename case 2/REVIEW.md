@@ -38,6 +38,7 @@ either of these two position-based vibration metrics. See §5.
 |---|---|---|
 | `utils.py` | `N_JOINTS`, column-name constants, `UR10e` (pure-numpy DH kinematics/dynamics: FK, Jacobian, gravity, mass matrix, Coriolis), URScript `vel`/`acc` read/replace helpers | `UR10e.coriolis()` exists but `UR10eDynamics` doesn't call it (see `dynamics.py`) |
 | `analysis.py` | `Recording` — the CSV loader every other file depends on (wraps a run as numpy arrays: `target_q`, `actual_q`, `target_current`, `actual_current`, `vel_cmd`/`acc_cmd`, `scl`, `script`). CLI: `--csv --joint` prints per-joint stats and plots target vs actual current | The right tool to look at **real** `data/test-*.csv` gap; not useful on URSim-only recordings |
+| `plot_target_actual.py` | Standalone quick-look plotter, added this session. Generalizes `analysis.py`'s current-only plot to *any* `target_<value><i>`/`actual_<value><i>` column pair in a recording CSV — `q`, `qd`, `current`, `TCP_pose`, `TCP_speed` — for one chosen component. No stats/log.json, just target-vs-actual and the gap, for eyeballing a channel `analysis.py` doesn't cover. See usage below and §5 (Bronze). | Reads the CSV directly via `utils.get_block`/`joint_cols`, doesn't go through `Recording` — works on any of the six `target_*`/`actual_*` channel pairs, not just the three `Recording` loads |
 | `common.py` | `segments()` — splits a recording into per-`movej` `Segment`s using `script_control_line` to find move boundaries; shared by distillation and RL so both cut the same way | Confirmed: 30 segments from our 3 training scripts × 5 loops × 2 poses |
 | `record.py` | Passive RTDE logger (raw socket protocol, port 30004). Never moves the robot | Also supplies `record_stream`, reused by `send.py` |
 | `send.py` | Pushes a URScript or `servoj` path to port 30002, records via `record.py`. Auto-stops on a done-flag register. Needs Remote Control **and** the robot powered on — silently sits at a ~5s timeout otherwise (`_done_check`'s "program never started" reason, which `train_rla.py`'s `collect_moves` doesn't print, so it just looks like `0 segments pooled`) | This is what we hit twice this session — robot state, not code |
@@ -206,6 +207,30 @@ validation strategy in §5 (Diamond).
 - `test-2` (acc sweep, vel fixed) and `test-3` (vel sweep, acc fixed) are the
   cleanest single-variable views — plot gap RMS/max vs the swept parameter,
   per joint.
+- For channels `analysis.py` doesn't plot — `q`, `qd`, `TCP_pose`,
+  `TCP_speed` — use `plot_target_actual.py` (run with the `urenv` conda env,
+  which has pandas/matplotlib; base conda does not):
+
+  ```bash
+  # target vs actual current, shoulder joint (same channel analysis.py plots)
+  python plot_target_actual.py --csv data/test-3.csv --value current --joint 1
+
+  # position tracking error, base joint — useful once the metric/model work
+  # below also predicts actual_q, not just actual_current
+  python plot_target_actual.py --csv data/test-3.csv --value q --joint 0
+
+  # TCP-space pose gap, z axis (component index 0..5 = x,y,z,rx,ry,rz)
+  python plot_target_actual.py --csv data/test-3.csv --value TCP_pose --joint 2
+
+  # save instead of opening a window, e.g. for a headless run
+  python plot_target_actual.py --csv data/test-2.csv --value qd --joint 3 \
+      --save wrist1_qd_gap.png --no-show
+  ```
+
+  Top subplot: target vs actual. Bottom: actual − target (the gap). `--joint`
+  is the component index 0..5 — a joint for `q`/`qd`/`current`, or
+  x/y/z/rx/ry/rz for the two `TCP_*` channels. No results/ output is written
+  (unlike `analysis.py`) — this is a quick-look tool, not a pipeline step.
 - Decide and justify what `EvaluationMetric` should measure (the README
   frames this as a Bronze task) — this is where the peak-overshoot/RMS work
   above gets motivated and written up.
