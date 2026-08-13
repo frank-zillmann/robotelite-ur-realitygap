@@ -488,6 +488,274 @@ command). Cite the file path alongside any number you present, the same way
 this document does — it's the difference between a number a reviewer can
 check and one they have to take on faith.
 
+## 9. The full pipeline, command by command
+
+A practitioner's runbook: the six scripts in run order, the exact command,
+what each one does on *every* invocation (including the side effects that
+don't show up in the printed output), the files it leaves behind and how to
+read them, and — the part `COMMANDS.md` doesn't cover — what to actually
+check to tell whether a new run gave you a *better* distill model or RL
+agent, not just *a different* one. See `COMMANDS.md` for the flag reference;
+this section is about interpreting results, not syntax.
+
+Two things apply to every stage below and are easy to miss:
+
+- **"latest" paths are silently overwritten.** `models/distill.pkl` and
+  `models/agent_<mode>.zip` get replaced by whatever you last trained —
+  there's no confirmation and no diff. The versioned copy in
+  `results/<datetime>/` (or `results/<datetime>_rla_<mode>/`) is the only
+  record of what an older model actually was. If you want to compare two
+  models deliberately, point `run.py --model`/`--agent` at the versioned
+  paths, not the latest ones.
+- **Provenance is manual.** `train_rla.py`'s `log.json` (`train_rla.py:390-404`)
+  records `mode`, `scripts`, `steps`, and the agent's own paths — it does
+  *not* record which `distill.pkl` (`args.model`) it trained against. Two
+  agents trained on different distill models will look identical in
+  `runs_summary_rla.csv` even though their scores aren't comparable (§9.3).
+  Write the distill model path down yourself (file name, commit message,
+  whatever) until this is fixed — it's the same gap already flagged for
+  `send.py` recordings in §6's Gold tier, one step earlier in the chain.
+
+### 9.1 `record.py` — capture real data
+
+```bash
+python record.py --robot-ip 127.0.0.1 --out data/test-7.csv \
+    --float-register 1 vel 2 acc
+```
+
+Passively logs the RTDE state stream while a separately-sent script runs;
+never moves the robot itself. Every run appends nothing anywhere — it just
+writes the one CSV at `--out`.
+
+**File:** `data/test-N.csv` — one row per RTDE sample, `target_*`/`actual_*`
+columns per joint (`q`, `qd`, `current`, …) plus whatever `--float-register`
+named (`vel`, `acc` — read by the distillation pipeline, §2's file table).
+
+**What to check before trusting it downstream:** open it in
+`analysis.py --csv data/test-7.csv --no-plot` and confirm `n_rows` and
+`dt_ms` look sane for the recording length, and that `vel`/`actual_current`
+aren't all zero (URSim source, or the robot wasn't actually RUNNING —
+§5's Remote Control finding). This CSV silently becomes training data for
+step 9.2, so a bad recording here corrupts the distill model with no error
+anywhere else in the pipeline.
+
+### 9.2 `train_distillation_model.py` — fit the reality-gap model
+
+```bash
+python train_distillation_model.py \
+    --csvs data/test-*.csv --out models/distill.pkl
+```
+
+Every run: builds one design matrix from *all* `--csvs`, fits a fresh
+`LinearModel` from scratch (nothing is fine-tuned incrementally — adding a
+CSV means refitting on everything), evaluates it on a deterministic
+held-out row split (`train_distillation_model.py:471-472`, every
+`1/holdout`-th row), overwrites `models/distill.pkl`, and appends one row to
+`results/runs_summary.csv`.
+
+**Files, and how to read them:**
+- `results/<datetime>/log.json` — `held_out_metrics.actual_current.{rmse,r2}`
+  is the number that matters: RMSE in amps (lower is better), R² in [0,1]
+  (closer to 1 is better, i.e. more of the real current variance the model
+  explains). `full_data_metrics` is fit quality on everything including
+  training rows — always better than `held_out_metrics`, not a fair
+  comparison number, useful only to sanity-check the fit didn't collapse.
+  `params` is the fitted `LinearModel` coefficients (`coef` per feature).
+- `per_joint_rmse_actual_current.png` — bar per joint; check no single joint
+  (usually wrist2/wrist3, lighter links, less current signal — see §5) is
+  dragging the overall RMSE up so much that the "average" number hides a
+  joint the model can't predict at all.
+- `residuals_actual_current.png` — should look centered on zero with no
+  obvious structure (a slope or curve here means the linear model is
+  missing a term, not just noisy).
+- `results/runs_summary.csv` / `results/comparison_plot.png` — one row/point
+  per training run ever done; this is the only place you can see the trend
+  across runs rather than one run's number in isolation.
+
+**Is this distill model better than the last one?**
+1. Compare `held_out_metrics.actual_current.rmse`/`r2` against the *previous
+   row* in `runs_summary.csv`, not just against the number in your head —
+   RMSE down and R² up is the win condition.
+2. **Discount this number by the known validation gap**: the split above is
+   row-level (every Nth *row*), not run-level, so adjacent rows from the
+   same run sit on both sides of the split and leak timing/geometry
+   correlation into "held-out" — the reported R² is optimistic (§8 flags
+   this explicitly: don't present the current `runs_summary.csv` numbers to
+   the company as-is). A model that looks better on this split may not
+   actually generalize better to a genuinely new run; the real test is
+   §8's run-level held-out check (predict a CSV that had zero rows in
+   training).
+3. Look at `per_joint_rmse` before declaring victory — an improved overall
+   RMSE that comes from getting the already-good joints slightly better
+   while a bad joint stays bad isn't the same as a genuinely better model.
+4. More training CSVs isn't automatically better: it's more data but also a
+   wider range of speeds/geometries for one linear fit to cover, which can
+   raise held-out error even as the model becomes more broadly usable. Read
+   the trend in `comparison_plot.png`, don't judge one run against the
+   immediately preceding one.
+
+### 9.3 `train_rla.py` — train the RL agent
+
+```bash
+python train_rla.py --mode params --model models/distill.pkl \
+    --robot-ip 127.0.0.1 \
+    --scripts scripts/shoulder_swing.script scripts/vertical_swing.script scripts/horizontal_swing.script \
+    --loop 5 --steps 20000
+```
+
+Every run: runs `--scripts` on URSim once to get target geometry
+(`collect_moves`), builds `sim_to_real.csv` by scoring every candidate
+through the `--model` you pointed it at (§4 step 2 — this is where the
+distill model enters), trains a fresh PPO policy from random initialization
+for `--steps` timesteps (not resumed from any previous agent — every run is
+a cold start), overwrites `models/agent_<mode>.zip`, and appends a row to
+`results/runs_summary_rla.csv`.
+
+**Files, and how to read them:**
+- `results/<dt>_rla_<mode>/log.json` — `summary.best_score` (lowest score
+  seen during training — score is the current-gap metric, §4, lower is
+  better) and `summary.final_score_mean` (mean score over the last 10% of
+  episodes — the policy's *converged* performance, more representative than
+  `best_score`, which can be one lucky episode). `summary.best_cycle_time`
+  is the fastest move found, reported separately because score and cycle
+  time trade off against each other (§4's `OBJECTIVE`) — a lower score with
+  a much longer cycle time isn't a free win.
+- `training_curve.png` — three stacked plots (score, cycle time, reward)
+  vs. timestep, each with a light per-episode scatter and a rolling mean.
+  **What to look for:** the rolling-mean score curve should flatten out
+  before training ends — if it's still trending down at the last timestep,
+  `--steps` was too low and `final_score_mean` understates what the agent
+  could reach. A curve that's noisy/flat from the start with no downward
+  trend at all means the agent isn't learning (check the `--model` you
+  passed is actually fit, not a stale/default one).
+- `sim_to_real.csv` in the same folder — the exact synthetic dataset PPO
+  trained on; useful to re-inspect what geometries/speeds it was actually
+  exposed to if an agent behaves oddly on a script outside that mix.
+- `results/runs_summary_rla.csv` — one row per training run: `mode`,
+  `steps`, `best_score`, `final_score_mean`, `best_cycle_time`, `scripts`.
+
+**Is this RL agent better than the last one?**
+1. Compare `final_score_mean` (not `best_score`, which cherry-picks) across
+   rows of `runs_summary_rla.csv` — but **only between rows trained against
+   the same `distill.pkl`**. Since that path isn't logged (this section's
+   intro), cross-check by date/your own notes before comparing two rows;
+   a lower score against a different (e.g. newly refit, §9.2) distill model
+   isn't evidence of a better policy, it's evidence of a different reward
+   function.
+2. Same caveat for `--scripts` and `--loop`: an agent trained on more/other
+   scripts sees a different move distribution, so its `final_score_mean`
+   isn't directly comparable to one trained on fewer. Compare agents that
+   were trained on the same script set when judging "did more `--steps`
+   help."
+3. Check `best_cycle_time` moved in a direction you'd accept — an agent
+   that drove score down by making every move much slower "solved" the
+   metric, not the actual problem (§4's `CYCLE_WEIGHT` is what's supposed
+   to prevent this; verify it did).
+4. This is still all against the distill model's opinion, not reality —
+   treat "better agent" here as "better at the offline objective," and only
+   promote it to "better in fact" after 9.4 + 9.5 + `analysis.py` agree
+   (§8).
+
+### 9.4 `run.py` — evaluate the agent on the held-out script
+
+```bash
+python run.py --mode params --script scripts/triangle.script \
+    --model models/distill.pkl --robot-ip 127.0.0.1
+```
+
+Every run: runs `triangle.script` (never in `train_rla.py`'s `--scripts`,
+so it's the one held-out test of generalization) on URSim once, scores the
+script's own `vel`/`acc` as the baseline and the trained agent's choice as
+`optimized` — both through the *same* `--model`, so the delta between them
+is internally consistent even before hardware confirms the absolute numbers
+(§8) — then writes `scripts/triangle.optimized.script`.
+
+**Files, and how to read them:**
+- Terminal + `log.json`'s `results.improvement.{score_pct,cycle_time_pct}` —
+  positive = the agent's choice scores/cycles lower than the script's
+  original numbers, *predicted*. This is the number from §5's `acc=469.74`
+  finding: a big percentage here can mean genuine improvement or the agent
+  exploiting a region the distill model was never trained on (§8's
+  trust-region check) — treat a large gain with suspicion, not celebration.
+- `log.json`'s `results.optimized.{vel,acc}` (params mode) — **check these
+  against the real data's coverage before trusting the score above.**
+  `train_rla.py`'s `VEL_BOUNDS`/`ACC_BOUNDS` (`train_rla.py:63-64`) bound
+  what the agent could *pick*, but that's much wider than what `data/test-*.csv`
+  ever actually swept — if `optimized.acc` is near the search bound rather
+  than near the real data's range, the predicted score is extrapolation
+  (§5, §8's trust-region check).
+- `log.json`'s `distill_model`/`agent` fields — this is the one place in the
+  pipeline that *does* record which model/agent produced a result; useful
+  as the provenance record §9.3 doesn't give you.
+- `scripts/triangle.optimized.script` — hand this to 9.5, don't edit it by
+  hand.
+
+**Is this a better result than a previous `run.py` call?** Only comparable
+if `--model` (and, less directly, `--agent`) are the same between the two
+calls — otherwise you're comparing predictions from two different reward
+functions again (same caveat as 9.3). The number that actually matters is
+whether 9.5 + `analysis.py` confirm the prediction on hardware, not whether
+this predicted percentage is bigger than last time's.
+
+### 9.5 `send.py` — put it on the robot (or URSim) and record
+
+```bash
+python send.py --script scripts/triangle.optimized.script --loop 10 \
+    --out results/triangle_optimized.csv
+```
+
+The only step that puts real motion on hardware (or URSim). Every run:
+loops the script/path `--loop` times, records every RTDE sample, and writes
+a `.json` sidecar next to the CSV.
+
+**File — sidecar `.json`:** `n_samples`, `stop_reason` (`"program finished"`
+on a clean run; `"program stopped (aborted? check URSim Log Messages)"`,
+`"program never started (is the robot in Remote Control mode?)"`,
+`"Ctrl-C"`, or a connection-error string otherwise —
+`send.py:151-176`/`record.py:215-218` — treat anything but `"program
+finished"` as a run that didn't finish cleanly and exclude it from score
+comparisons), `loop`, `hz`. Check `stop_reason` before trusting the CSV at
+all — a truncated recording will still "work" in `analysis.py` but its
+stats won't mean what you think.
+
+**Reminder from §3/§4:** on URSim (`127.0.0.1`), `actual_*` columns come
+back zero (perfect simulator) — baseline and optimized will look identical
+here. Either point `--robot-ip` at real hardware, or use the
+`augment()`-based workaround in `COMMANDS.md`'s last section to overlay the
+distill model's *predicted* gap for a sanity check that's still not a
+measurement.
+
+### 9.6 `analysis.py` / `plot_target_actual.py` — read the recording
+
+```bash
+python analysis.py --csv results/triangle_baseline.csv --joint 1
+python analysis.py --csv results/triangle_optimized.csv --joint 1
+```
+
+Every run: computes per-joint stats over the whole recording and saves
+plots — read-only, doesn't touch models or write anything but this one
+`results/<dt>_analysis_<name>/` folder.
+
+**File:** `log.json`'s `per_joint` list — `gap_rms_A`/`gap_max_A` (current
+tracking error, lower is better) and `pos_err_mrad` (position error, only
+meaningful in path mode). `all_joints_overview.png` gives all six joints at
+a glance; `current_<joint>.png` is the one requested joint's target-vs-
+actual trace over time.
+
+**This is the step that actually answers "is the agent better," not 9.4:**
+run it on the baseline and optimized `send.py` recordings (real hardware,
+not URSim — see 9.5's reminder) and compare:
+- `gap_rms_A`/`gap_max_A` down on the optimized run → real improvement.
+- The *measured* percentage change here vs. `run.py`'s *predicted*
+  `improvement.score_pct` (9.4) — close agreement means the distill model
+  is trustworthy for this region; a large mismatch means it isn't, and no
+  amount of retraining the agent (9.3) will fix that until the distill
+  model (9.2) is retrained on data covering the region in question.
+- For a targeted joint/channel comparison beyond `analysis.py`'s
+  `current`-only plot, use `plot_target_actual.py --csv ... --value <q|qd|
+  current|TCP_pose|TCP_speed> --joint <0-5|x|y|z|rx|ry|rz>` (CLAUDE.md
+  change log, 2026-08-12).
+
 ## Appendix: UR robot programming basics for this project
 
 Background to read the rest of this doc and the code without stumbling — not
