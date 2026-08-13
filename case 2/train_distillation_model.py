@@ -9,25 +9,28 @@ the metric and the RL agent can run without hardware.
 
     fit(recordings)  -> learn from recorded real runs
     predicts()       -> which actual_* channels this model fills in
-    predict(df)      -> for a commanded-trajectory DataFrame, the predicted
-                        actual channels, as {channel: (n, N_JOINTS) array}
+    predict(df)      -> for a commanded-trajectory DataFrame, (mean, std) of the
+                        actual channels as {channel: (n, N_JOINTS)}; std is None
+                        if the model has no notion of spread
 
 The channels a model fills must be the ones the metric reads (see metrics.py).
-``LinearModel`` below predicts ``actual_current``.
+``CNNModel``, the one implementation here, is a causal temporal CNN that predicts
+the gap over a whole move.
 
-    from train_distillation_model import LinearModel, augment
+    from train_distillation_model import CNNModel, augment
     from analysis import Recording
-    m = LinearModel().fit([Recording("data/test-4.csv"), Recording("data/test-6.csv")])
+    m = CNNModel().fit([Recording("data/test-4.csv"), Recording("data/test-6.csv")])
     m.predicts()                          # ['actual_current']
     m.save("models/distill.pkl")
     augment(m, "sim_to_real.csv")         # overwrite actual_current with predictions
 
-Run as a script to train on the recorded runs, print held-out error, and save:
+Run as a script to train on every run in ``data/``, print the error on the moves
+held out by ``common.loaders``, and save.
 
-    python train_distillation_model.py --csvs data/test-*.csv --out models/distill.pkl
+    python train_distillation_model.py --out models/distill.pkl
 
 train_rla.py and run.py depend only on the interface, so a custom subclass of
-DistillModel (or LinearModel) can replace the baseline via its pickle.
+DistillModel can replace this one via its pickle.
 """
 from __future__ import annotations
 
@@ -38,10 +41,12 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 import pandas as pd
+import torch
+from torch import nn
 
+from common import RESIDUAL, N_FEAT, blocks, features, loaders, moves, standardize
 from preprocess import Identity, Preprocess, default_preprocess
-from utils import (JOINT_NAMES, N_JOINTS, VEL_COL, ACC_COL, frame_dt,
-                   get_block, set_block)
+from utils import JOINT_NAMES, N_JOINTS, get_block, set_block
 
 
 class DistillModel(ABC):
@@ -64,12 +69,14 @@ class DistillModel(ABC):
         """
 
     @abstractmethod
-    def predict(self, df) -> dict:
-        """Predicted actual channels for a commanded-trajectory DataFrame.
+    def predict(self, df) -> tuple[dict, dict | None]:
+        """``(mean, std)`` for a commanded-trajectory DataFrame.
 
         ``df`` carries ``t``, ``target_q*``, ``target_qd*`` and the commanded
-        ``vel``/``acc``. Return ``{base: (n, N_JOINTS) array}`` for every base in
-        ``predicts()``. The caller overwrites those columns with the result.
+        ``vel``/``acc``. ``mean`` is ``{base: (n, N_JOINTS)}`` for every base in
+        ``predicts()``; the caller overwrites those columns with it. ``std`` is
+        the same shape, or ``None`` if the model has no notion of spread. A
+        risk-averse objective can score ``mean + k * std``.
         """
 
     def bounds(self):
@@ -90,113 +97,155 @@ class DistillModel(ABC):
             return pickle.load(f)
 
 
-class LinearModel(DistillModel):
-    """Least-squares linear baseline that predicts the actual current.
+LOGVAR = (-9.0, 4.0)       # clamp keeping the Gaussian NLL well conditioned
 
-    One linear model per row: for each joint the actual current is
-    ``w . [target_current, qd, qdd, pos, vel, acc, joint one-hot]``, where
-    ``target_current`` is the commanded current the joint is tracking, ``qd`` is
-    the commanded velocity (from ``target_qd``), ``qdd`` its time derivative,
-    ``pos`` the commanded angle, and ``vel``/``acc`` the raw movej numbers the
-    script commanded. Fit against the measured ``actual_current`` of the real
-    runs.
 
-    The one-hot joint block gives each joint its own intercept with shared
-    slopes; there is no separate bias term (it would be collinear with the
-    one-hot). Being linear and smooth in its inputs, it cannot reproduce the ring
-    after a stop (README "Why the optimizer stalls").
+class _Block(nn.Module):
+    """Residual block reaching ``dilation * (kernel-1)`` rows further back."""
 
-    Extension points:
+    def __init__(self, ch, dilation, kernel):
+        super().__init__()
+        self.pad = dilation * (kernel - 1)
+        self.conv = nn.Conv1d(ch, ch, kernel, dilation=dilation)
+        self.mix = nn.Conv1d(ch, ch, 1)
+        self.gain = nn.Parameter(torch.full((ch, 1), 0.1))   # start near identity
 
-    - Fit per joint or add joint-interaction terms; shared slopes leak one
-      joint's behaviour onto another.
-    - Normalize the features: ``pos`` (radians) and ``vel``/``acc`` (raw movej
-      numbers up to ~1000) are on very different scales.
-    - Add physics from ``utils.UR10e`` (gravity torque, mass matrix, Coriolis).
-    - Use a non-linear regressor (MLP, trees) that can capture the ring.
+    def forward(self, x):
+        # Left-pad only, so the output has the input's length and row t sees no
+        # row after t. No norm layer: Batch/Group/LayerNorm pool over time, which
+        # would make a prediction depend on the whole frame instead of a fixed
+        # window, so training crops and inference frames would disagree.
+        y = self.conv(nn.functional.pad(x, (self.pad, 0)))
+        return x + self.gain * self.mix(nn.functional.gelu(y))
 
-    Override ``_row_features`` to change the inputs, or ``predicts``/``predict``
-    to model a different channel.
+
+class CNNModel(DistillModel):
+    """Causal dilated CNN over the commanded trajectory, six joints at once.
+
+    The gap is dynamic, not per-row: after each stop the joint rings down for
+    0.3-0.5 s, friction flips with ``sign(qd)``, and the bias drifts with pose.
+    So row ``t`` is predicted from the last ``1 + (kernel-1)*sum(dilations)`` rows
+    (127 by default, ~1.0 s at 128 Hz), which dilations cover in 6 layers instead
+    of 63. Joints and quantities are all channels, so the net can mix across them.
+
+    ``targets`` picks the channels, each learned as a residual on its commanded
+    twin (``RESIDUAL``); switch ``metrics.py`` to match. ``members > 1`` makes it
+    a deep ensemble; either way ``predict`` returns a spread.
     """
 
-    FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "vel", "acc"] + \
-        [f"is_{n}" for n in JOINT_NAMES]
-
-    def __init__(self):
-        self.coef = None                     # (12,) per-row weights
-        self.vel_range = None                # (lo, hi) commanded vel seen in training
-        self.acc_range = None                # (lo, hi) commanded acc seen in training
+    def __init__(self, targets=("actual_current",), hidden: int = 48,
+                 dilations=(1, 2, 4, 8, 16, 32), kernel: int = 3, members: int = 1,
+                 epochs: int = 25, batch: int = 16, lr: float = 3e-3,
+                 seed: int = 0, verbose: bool = True):
+        self.targets = tuple(targets)
+        self.epochs, self.batch = epochs, batch
+        self.lr, self.seed, self.verbose = lr, seed, verbose
+        self.pad = (kernel - 1) * sum(dilations)      # warm-up rows per sequence
+        self.n_out = len(self.targets) * N_JOINTS
+        self.train_dt = self.stats = None
+        self.vel_range = self.acc_range = self.val_idx = None
+        self.nets = []
+        for m in range(members):
+            torch.manual_seed(seed + m)
+            # 1x1 embed -> dilated residual blocks -> 1x1 head of (mean, log_var).
+            net = nn.Sequential(nn.Conv1d(N_FEAT, hidden, 1),
+                                *[_Block(hidden, d, kernel) for d in dilations],
+                                nn.Conv1d(hidden, 2 * self.n_out, 1))
+            # A zeroed head starts every output at 0: mean = the average gap and
+            # log_var = 0 (unit variance in standardised space). That is the best
+            # constant predictor and keeps the first NLL steps well conditioned.
+            nn.init.zeros_(net[-1].weight)
+            nn.init.zeros_(net[-1].bias)
+            self.nets.append(net)
 
     def predicts(self) -> list[str]:
-        return ["actual_current"]
+        return list(self.targets)
 
-    # --- features -------------------------------------------------------------
-
-    def _row_features(self, joint: int, tgt_i, pos, qd, qdd, vel, acc) -> np.ndarray:
-        """Feature rows for one joint over a whole trajectory, shape ``(n, 12)``.
-
-        Every argument except ``joint`` is a length-``n`` array. ``tgt_i`` is the
-        commanded ``target_current`` for this joint. Override to feed the model
-        more inputs (gravity torque, mass, neighbouring joints); keep it a
-        function of the commanded trajectory so it also applies to candidates.
-        """
-        tgt_i, pos = np.asarray(tgt_i), np.asarray(pos)
-        qd, qdd = np.asarray(qd), np.asarray(qdd)
-        vel, acc = np.asarray(vel), np.asarray(acc)
-        onehot = np.zeros((len(pos), N_JOINTS))
-        onehot[:, joint] = 1.0
-        return np.column_stack([tgt_i, qd, qdd, pos, vel, acc, onehot])
+    def bounds(self):
+        return None if self.vel_range is None else (self.vel_range, self.acc_range)
 
     # --- fit ------------------------------------------------------------------
 
-    def _design(self, recordings) -> tuple[np.ndarray, np.ndarray]:
-        """Stack (features, measured actual_current) over every joint of every run.
+    def _loss(self, net, xb, yb, mask, nll: bool):
+        """Squared error, or Gaussian NLL once the mean is sane, over the real rows."""
+        out = net(xb)[..., self.pad:]                 # drop the warm-up columns
+        mu, lv = out[:, :self.n_out], out[:, self.n_out:].clamp(*LOGVAR)
+        per = ((yb - mu) ** 2 if not nll
+               else 0.5 * (lv + (yb - mu) ** 2 * torch.exp(-lv)))
+        return (per * mask[:, None]).sum() / (mask.sum() * self.n_out)
 
-        Shared by ``fit`` and the script's held-out error report, so both build
-        the feature matrix the same way.
-        """
-        X, y = [], []
-        for rec in recordings:
-            if rec.vel_cmd is None or rec.acc_cmd is None:
-                raise ValueError(f"{rec.path} has no vel/acc registers; record "
-                                 "with `--float-register 1 vel 2 acc`")
-            qdd = np.gradient(rec.target_qd, rec.dt, axis=0)     # commanded accel
-            for j in range(N_JOINTS):
-                X.append(self._row_features(j, rec.target_current[:, j], rec.target_q[:, j],
-                                            rec.target_qd[:, j], qdd[:, j],
-                                            rec.vel_cmd, rec.acc_cmd))
-                y.append(rec.actual_current[:, j])
-        return np.vstack(X), np.concatenate(y)
+    def fit(self, recordings) -> "CNNModel":
+        """Train every member on the training moves of the recorded runs."""
+        train, val = loaders(recordings, self.targets, self.pad, self.batch,
+                             seed=self.seed)
+        ds = train.dataset.dataset            # the MoveDataset behind the Subset
+        self.stats, self.train_dt = ds.stats, ds.dt
+        self.vel_range, self.acc_range = ds.vel_range, ds.acc_range
+        self.val_idx = list(val.dataset.indices)   # into common.moves(recordings)
+        if self.verbose:
+            print(f"{len(train.dataset)} train / {len(val.dataset)} val moves, "
+                  f"receptive field {self.pad + 1} rows "
+                  f"({(self.pad + 1) * self.train_dt:.2f} s)")
 
-    def fit(self, recordings) -> "LinearModel":
-        """Fit the row model on every row of every joint of every real run."""
-        X, y = self._design(recordings)
-        self.coef, *_ = np.linalg.lstsq(X, y, rcond=None)
-        # Feature columns 4 and 5 are vel and acc: their spans are the bounds.
-        self.vel_range = (float(X[:, 4].min()), float(X[:, 4].max()))
-        self.acc_range = (float(X[:, 5].min()), float(X[:, 5].max()))
+        for m, net in enumerate(self.nets):
+            # Members differ only by their random init and the order they draw
+            # moves in; that is enough disagreement for a deep ensemble.
+            opt = torch.optim.AdamW(net.parameters(), lr=self.lr, weight_decay=1e-4)
+            sched = torch.optim.lr_scheduler.OneCycleLR(
+                opt, self.lr, self.epochs * len(train), pct_start=0.2)
+            for ep in range(self.epochs):
+                net.train()
+                total = 0.0
+                for xb, yb, mask in train:
+                    loss = self._loss(net, xb, yb, mask, ep >= self.epochs // 3)
+                    opt.zero_grad(set_to_none=True)
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+                    opt.step()
+                    sched.step()
+                    total += float(loss.detach())
+                if self.verbose and ep % 5 == 4:
+                    net.eval()
+                    with torch.inference_mode():
+                        v = np.mean([float(self._loss(net, *b, ep >= self.epochs // 3))
+                                     for b in val])
+                    print(f"  member {m + 1}  epoch {ep + 1:3d}/{self.epochs}  "
+                          f"loss {total / len(train):+.4f}  val {v:+.4f}")
+            net.eval()
         return self
 
     # --- predict --------------------------------------------------------------
 
-    def predict(self, df) -> dict:
-        dt = frame_dt(df)
-        ti = get_block(df, "target_current")
-        q = get_block(df, "target_q")
-        qd = get_block(df, "target_qd")
-        qdd = np.gradient(qd, dt, axis=0)
-        vel = df[VEL_COL].to_numpy(dtype=float)
-        acc = df[ACC_COL].to_numpy(dtype=float)
-        out = np.zeros_like(q)
-        for j in range(N_JOINTS):
-            out[:, j] = self._row_features(j, ti[:, j], q[:, j], qd[:, j],
-                                           qdd[:, j], vel, acc) @ self.coef
-        return {"actual_current": out}
-
-    def bounds(self):
-        if self.coef is None:
-            return None
-        return self.vel_range, self.acc_range
+    def predict(self, df):
+        if self.stats is None:
+            raise RuntimeError("not fitted: call fit() or load a pickle")
+        _, _, my, sy = self.stats
+        regrid = lambda z, src, dst: np.column_stack([np.interp(dst, src, c) for c in z.T])
+        out = []
+        for sl in blocks(df):                 # never filter across a script seam
+            sub = df.iloc[sl]
+            x, dt = features(sub, self.pad)
+            # A learned temporal filter only holds at the rate it was trained on,
+            # and path mode asks for 4-20 ms servoj steps against 7.8 ms
+            # recordings, so resample onto the training grid and back.
+            t, grid = np.arange(len(sub)) * dt, None
+            if len(sub) > 1 and abs(dt - self.train_dt) > 0.01 * self.train_dt:
+                grid = np.arange(0.0, t[-1] + self.train_dt / 2, self.train_dt)
+                x = np.vstack([x[:self.pad], regrid(x[self.pad:], t, grid)])
+            with torch.inference_mode():
+                xb = torch.from_numpy(standardize(x, self.stats).T[None]).float()
+                o = np.stack([n(xb)[0, :, self.pad:].T.numpy() for n in self.nets])
+            mu, var = o[..., :self.n_out], np.exp(o[..., self.n_out:].clip(*LOGVAR))
+            # Ensemble mixture: mean of variances (aleatoric) + variance of means.
+            mean, std = mu.mean(0), np.sqrt(var.mean(0) + mu.var(0))
+            if grid is not None:
+                mean, std = regrid(mean, grid, t), regrid(std, grid, t)
+            out.append((mean * sy + my, std * sy))
+        gap, spread = (np.vstack(v) for v in zip(*out))
+        cols = lambda k: slice(k * N_JOINTS, (k + 1) * N_JOINTS)
+        return ({b: gap[:, cols(k)] + get_block(df, RESIDUAL[b])
+                 for k, b in enumerate(self.targets)},
+                {b: spread[:, cols(k)] for k, b in enumerate(self.targets)})
 
 
 def augment(model: DistillModel, csv: str, pre: Preprocess = None):
@@ -213,7 +262,7 @@ def augment(model: DistillModel, csv: str, pre: Preprocess = None):
     """
     pre = pre or Identity()
     df = pre.transform_distill(pd.read_csv(csv))
-    preds = model.predict(df)
+    preds, _ = model.predict(df)
     for base in model.predicts():
         set_block(df, base, preds[base])
     df = pre.revert_distill(df)
@@ -224,43 +273,42 @@ def augment(model: DistillModel, csv: str, pre: Preprocess = None):
 
 def main():
     ap = argparse.ArgumentParser(description="Train the distillation model.")
-    ap.add_argument("--csvs", nargs="+", default=sorted(glob.glob("data/test-*.csv")),
-                    help="recorded runs to train on")
     ap.add_argument("--out", default="models/distill.pkl", help="pickle path")
-    ap.add_argument("--holdout", type=float, default=0.2,
-                    help="fraction of rows held out for the error report")
     args = ap.parse_args()
 
     # Import under the real module name (not "__main__") so the saved pickle
     # loads cleanly in train_rla.py and run.py.
-    from train_distillation_model import LinearModel
+    from train_distillation_model import CNNModel
     from analysis import Recording
 
-    # Preprocess the training data the same way the model will see it later.
+    # Every run, preprocessed the way the model will see it later.
     pre = default_preprocess()
-    recordings = [Recording(r.path, df=pre.transform_distill(r.df))
-                  for r in (Recording(p) for p in args.csvs)]
-    model = LinearModel()
+    recordings = [Recording(p, df=pre.transform_distill(pd.read_csv(p)))
+                  for p in sorted(glob.glob("data/test-*.csv"))]
+    model = CNNModel().fit(recordings)
 
-    # Build the row matrix once (same features as fit) to estimate held-out
-    # error: predict the measured actual_current on held-out rows.
-    X, y = model._design(recordings)
-    print(f"{len(y)} rows from {len(recordings)} runs")
+    # Score the held-out moves, predicting each exactly as the RL env would. The
+    # gap actual-target is what is scored: an R2 against raw actual_q would read
+    # 0.9999 for a model that only echoes target_q and says nothing.
+    got = {b: [] for b in model.predicts()}
+    want = {b: [] for b in model.predicts()}
+    all_moves = moves(recordings)
+    for rec, seg in (all_moves[i] for i in model.val_idx):
+        sub = rec.df.iloc[seg.i0:seg.i2]
+        pred, _ = model.predict(sub)
+        for base in got:
+            ref = get_block(sub, RESIDUAL[base])
+            got[base].append(np.asarray(pred[base], dtype=float) - ref)
+            want[base].append(get_block(sub, base) - ref)
+    for base in got:
+        y = np.vstack(want[base])
+        mse, var = ((np.vstack(got[base]) - y) ** 2).mean(0), np.maximum(y.var(0), 1e-12)
+        print(f"  held-out {base} gap ({len(y)} rows)")
+        for j, name in enumerate(JOINT_NAMES):
+            print(f"    {name:10s} RMSE {np.sqrt(mse[j]):9.4f}   R2 {1 - mse[j]/var[j]:7.4f}")
+        print(f"    {'mean':10s} RMSE {np.sqrt(mse).mean():9.4f}   "
+              f"R2 {(1 - mse / var).mean():7.4f}")
 
-    # Deterministic split (no RNG): every 1/holdout-th row is a test row.
-    step = max(int(round(1 / args.holdout)), 2)
-    is_test = np.arange(len(y)) % step == 0
-    coef, *_ = np.linalg.lstsq(X[~is_test], y[~is_test], rcond=None)
-    err = X[is_test] @ coef - y[is_test]
-    rmse = float(np.sqrt(np.mean(err ** 2)))
-    ss = float(1 - np.sum(err ** 2) / np.sum((y[is_test] - y[is_test].mean()) ** 2))
-    print(f"held-out ({is_test.sum()} rows): actual_current RMSE {rmse:.3f} A   R2 {ss:.3f}")
-    print("coefficients:")
-    for name, c in zip(LinearModel.FEATURE_NAMES, coef):
-        print(f"  {name:12s} {c:+.4f}")
-
-    # Refit on everything and save.
-    model.fit(recordings)
     model.save(args.out)
     print(f"saved {args.out}")
 
