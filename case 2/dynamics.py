@@ -30,6 +30,7 @@ from utils import (ACC_COL, N_JOINTS, TIME_COL, VEL_COL, UR10e, get_block,
 DEG2RAD = np.pi / 180.0
 MAX_JOINT_SPEED = np.pi          # rad/s: URScript clamps a movej speed to this
 MAX_JOINT_ACC = 4.0 * np.pi      # rad/s^2: a generous joint acceleration ceiling
+MAX_JOINT_JERK = 20.0 * np.pi    # rad/s^3: generous jerk ceiling (constant-jerk ramp time acc/jerk ~0.2s at MAX_JOINT_ACC)
 GRID = 50                        # samples along a move's geometry for the M,g cache
 
 
@@ -54,7 +55,9 @@ def trapezoidal(distance: float, vel: float, acc: float, dt: float) -> np.ndarra
     Standard trapezoidal profile at peak speed ``vel`` (rad/s) and acceleration
     ``acc`` (rad/s^2), sampled at ``dt`` (s); triangular if it never reaches
     ``vel``. All joints of a movej share this one profile (they start and stop
-    together), so ``q(t) = start + s(t) * (dest - start)``.
+    together), so ``q(t) = start + s(t) * (dest - start)``. Kept alongside
+    ``s_curve`` (same signature) so the two speed-profile strategies can be
+    compared directly, e.g. via ``GapEnv(..., profile=trapezoidal)``.
     """
     if distance <= 1e-9 or vel <= 0 or acc <= 0:
         return np.array([0.0, 1.0])                  # degenerate: no motion
@@ -71,6 +74,85 @@ def trapezoidal(distance: float, vel: float, acc: float, dt: float) -> np.ndarra
     d = np.where(t < t_acc, 0.5 * acc * t ** 2,
                  np.where(t < t_acc + t_flat, d_acc + vel * (t - t_acc),
                           distance - 0.5 * acc * np.clip(total - t, 0, None) ** 2))
+    return np.clip(d, 0.0, distance) / distance
+
+
+def _accel_phase(v_peak: float, acc: float, jerk: float):
+    """Shape of a 0 -> ``v_peak`` jerk-limited ramp: jerk up to ``a_peak``, hold
+    it for ``t_a``, jerk back to 0, arriving at ``v_peak`` exactly.
+
+    ``a_peak`` is ``acc``, or reduced to ``sqrt(v_peak * jerk)`` if ``v_peak``
+    is too small for the ramp to ever reach ``acc`` (a jerk-limited triangle,
+    ``t_a`` = 0). Returns ``(a_peak, t_j, t_a, duration, distance)``.
+    """
+    v_peak = max(v_peak, 0.0)
+    a_peak = min(acc, np.sqrt(v_peak * jerk)) if v_peak > 0 else 0.0
+    t_j = a_peak / jerk if jerk > 0 else 0.0
+    t_a = max((v_peak - a_peak * t_j) / a_peak, 0.0) if a_peak > 1e-12 else 0.0
+    v1 = 0.5 * a_peak * t_j                           # velocity at the end of the jerk-up phase
+    d1 = a_peak * t_j ** 2 / 6.0                       # distance at the end of the jerk-up phase
+    d2 = v1 * t_a + 0.5 * a_peak * t_a ** 2            # distance added by the constant-accel phase
+    v2 = v1 + a_peak * t_a                             # velocity at the end of the constant-accel phase
+    d3 = v2 * t_j + a_peak * t_j ** 2 / 3.0            # distance added by the jerk-down phase
+    return a_peak, t_j, t_a, 2 * t_j + t_a, d1 + d2 + d3
+
+
+def _ramp_profile(t: np.ndarray, a_peak: float, t_j: float, t_a: float) -> np.ndarray:
+    """Distance covered by time ``t`` (array, clipped to the ramp's own
+    duration) into a 0 -> ``v_peak`` jerk-limited ramp shaped by ``_accel_phase``.
+    """
+    jerk = a_peak / t_j if t_j > 0 else 0.0
+    v1 = 0.5 * a_peak * t_j
+    d1 = a_peak * t_j ** 2 / 6.0
+    d2 = d1 + v1 * t_a + 0.5 * a_peak * t_a ** 2
+    v2 = v1 + a_peak * t_a
+    u2 = np.clip(t - t_j, 0.0, t_a)
+    u3 = np.clip(t - t_j - t_a, 0.0, t_j)
+    q1 = jerk * np.clip(t, 0.0, t_j) ** 3 / 6.0
+    q2 = d1 + v1 * u2 + 0.5 * a_peak * u2 ** 2
+    q3 = d2 + v2 * u3 + 0.5 * a_peak * u3 ** 2 - jerk * u3 ** 3 / 6.0
+    return np.where(t < t_j, q1, np.where(t < t_j + t_a, q2, q3))
+
+
+def s_curve(distance: float, vel: float, acc: float, dt: float,
+            jerk: float = MAX_JOINT_JERK) -> np.ndarray:
+    """Progress ``s(t)`` in [0,1] for a joint move of ``distance`` (rad),
+    jerk-limited.
+
+    Same accel-cruise-decel shape as a trapezoidal profile, but the accel/decel
+    ramps are jerk-limited (jerk up, hold ``acc``, jerk down) instead of an
+    instantaneous acceleration step, so acceleration is continuous -- closer to
+    what a real UR controller does (see ``analysis.py``'s duration mismatch on
+    the swing scripts, ~25% under a plain trapezoid). Sampled at ``dt`` (s).
+    All joints of a movej share this one profile, so
+    ``q(t) = start + s(t) * (dest - start)``.
+
+    Degrades exactly like a trapezoidal profile: a jerk-limited triangle (no
+    constant-acceleration plateau) if ``vel`` is never reached under ``acc``,
+    and -- one derivative smoother -- a reduced peak speed (found by bisection,
+    since a ramp's distance grows monotonically with its peak speed) if even a
+    single ramp up and back down would overshoot ``distance``.
+    """
+    if distance <= 1e-9 or vel <= 0 or acc <= 0 or jerk <= 0:
+        return np.array([0.0, 1.0])                  # degenerate: no motion
+    a_peak, t_j, t_a, t_ramp, d_ramp = _accel_phase(vel, acc, jerk)
+    if 2 * d_ramp > distance:                         # a single up+down ramp overshoots
+        lo, hi = 0.0, vel
+        for _ in range(50):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (mid, hi) if 2 * _accel_phase(mid, acc, jerk)[4] < distance else (lo, mid)
+        vel = 0.5 * (lo + hi)
+        a_peak, t_j, t_a, t_ramp, d_ramp = _accel_phase(vel, acc, jerk)
+    t_cruise = (distance - 2 * d_ramp) / vel if vel > 0 else 0.0
+    total = 2 * t_ramp + t_cruise
+    t = np.arange(0.0, total + dt, dt)
+    up = _ramp_profile(np.clip(t, 0.0, t_ramp), a_peak, t_j, t_a)
+    u3 = np.clip(t - t_ramp - t_cruise, 0.0, t_ramp)
+    down = distance - _ramp_profile(t_ramp - u3, a_peak, t_j, t_a)
+    d = np.where(t < t_ramp, up,
+                 np.where(t < t_ramp + t_cruise,
+                          d_ramp + vel * np.clip(t - t_ramp, 0.0, t_cruise),
+                          down))
     return np.clip(d, 0.0, distance) / distance
 
 

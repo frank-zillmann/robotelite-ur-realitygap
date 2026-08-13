@@ -35,6 +35,7 @@ class Recording:
         self.target_q = np.column_stack([df[f"target_q{j}"] for j in range(6)])
         self.actual_q = np.column_stack([df[f"actual_q{j}"] for j in range(6)])
         self.target_qd = np.column_stack([df[f"target_qd{j}"] for j in range(6)])
+        self.actual_qd = np.column_stack([df[f"actual_qd{j}"] for j in range(6)])
         self.target_current = np.column_stack([df[f"target_current{j}"] for j in range(6)])
         self.actual_current = np.column_stack([df[f"actual_current{j}"] for j in range(6)])
         # Commanded movej parameters, if record.py logged them (raw URScript
@@ -87,6 +88,21 @@ class Recording:
         return fig
 
 
+def joint_stats(rec: Recording, joint: int) -> dict:
+    """Range of motion, current-gap RMS/max, and RMS position error for one joint.
+
+    Shared by ``main``'s printed table and ``report.py``'s HTML summary, so both
+    read the same numbers.
+    """
+    gap = rec.current_gap(joint)
+    return {
+        "moved": float(rec.target_q[:, joint].max() - rec.target_q[:, joint].min()),
+        "gap_rms": float(np.sqrt(np.mean(gap ** 2))),
+        "gap_max": float(np.max(np.abs(gap))),
+        "pos_err": float(np.sqrt(np.mean((rec.actual_q[:, joint] - rec.target_q[:, joint]) ** 2))),
+    }
+
+
 def main():
     # Print per-joint stats, then plot one joint.
     ap = argparse.ArgumentParser(description="Per-joint stats and a plot for a recorded run.")
@@ -103,13 +119,9 @@ def main():
     # and RMS position lag (actual minus target).
     print(f"{'joint':10s} {'moved':>9s} {'gap RMS':>9s} {'gap max':>9s} {'pos err':>10s}")
     for j in range(N_JOINTS):
-        moved = rec.target_q[:, j].max() - rec.target_q[:, j].min()   # range of motion (rad)
-        gap = rec.current_gap(j)
-        gap_rms = float(np.sqrt(np.mean(gap ** 2)))
-        gap_max = float(np.max(np.abs(gap)))
-        pos_err = float(np.sqrt(np.mean((rec.actual_q[:, j] - rec.target_q[:, j]) ** 2)))
-        print(f"{JOINT_NAMES[j]:10s} {moved:8.3f}r {gap_rms:8.3f}A {gap_max:8.3f}A "
-              f"{pos_err*1e3:7.2f}mrad")
+        st = joint_stats(rec, j)
+        print(f"{JOINT_NAMES[j]:10s} {st['moved']:8.3f}r {st['gap_rms']:8.3f}A "
+              f"{st['gap_max']:8.3f}A {st['pos_err']*1e3:7.2f}mrad")
 
     if not args.no_plot:
         import matplotlib.pyplot as plt

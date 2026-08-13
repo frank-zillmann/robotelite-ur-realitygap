@@ -31,3 +31,6 @@ docs/assets/
 docs/~$*.pptx
 docs/~$*.docx
 docs/*.tmp
+
+# ── personal working notes, not part of the student repo ──────────────────────
+**/kianna_notes/
