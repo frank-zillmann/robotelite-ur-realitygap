@@ -32,6 +32,10 @@ Outputs -> bronze_tier/:
     overshoot_heatmap.png     combined (vel, acc) grid, from the randomized
     rms_heatmap.png           test-6/test-7 runs
     per_joint_overshoot.png   bar chart, mean peak overshoot by joint
+    per_run/test-N_overshoot_by_joint.png,   the presentation bar chart
+    per_run/test-N_rms_by_joint.png          (degrees + % of move distance,
+                               per joint) computed on one recording at a
+                               time instead of pooled across all 7
 """
 from __future__ import annotations
 
@@ -470,6 +474,25 @@ def build_presentation_plots(df: pd.DataFrame, combo_files: list[str], out_dir: 
     print(f"[results] presentation plots -> {pres_dir}")
 
 
+def build_per_file_bar_plots(df: pd.DataFrame, out_dir: str):
+    """Same bar chart as ``overshoot_by_joint.png``/``rms_by_joint.png``, run once
+    per recording instead of once on the pooled ``df`` -- the un-averaged
+    complement. Each file gets its own scale (a joint that barely moves in one
+    file shouldn't be squashed by another file's larger bars).
+    """
+    run_dir = os.path.join(out_dir, "per_run")
+    os.makedirs(run_dir, exist_ok=True)
+    for file_name, df_file in df.groupby("file"):
+        d = _add_deg_pct_cols(df_file)
+        plot_metric_by_joint(d, "overshoot_deg", "overshoot_pct",
+                             os.path.join(run_dir, f"{file_name}_overshoot_by_joint.png"),
+                             f"{file_name}: peak overshoot by joint")
+        plot_metric_by_joint(d, "rms_deg", "rms_pct",
+                             os.path.join(run_dir, f"{file_name}_rms_by_joint.png"),
+                             f"{file_name}: RMS position error by joint")
+    print(f"[results] per-file bar charts -> {run_dir}")
+
+
 # --- orchestration -----------------------------------------------------------
 
 def build_trajectory_plots(df: pd.DataFrame, recs: dict, out_dir: str, n_show: int):
@@ -655,6 +678,7 @@ def main():
                            "RMS position error by joint and travel direction", "RMS pos error (mrad)")
 
     build_presentation_plots(df, combo_files, args.out, args.presentation_name)
+    build_per_file_bar_plots(df, args.out)
 
     log = log_summary(df, args.out, vel_sweep_files, acc_sweep_files)
     print(f"[results] run complete -> {args.out}")
