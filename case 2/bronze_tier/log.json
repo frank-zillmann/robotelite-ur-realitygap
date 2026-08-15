@@ -290,6 +290,6 @@
   "note": "correlations below are computed within each (joint, direction) group in the single-parameter sweep files, then averaged -- pooling every file/joint/direction into one Pearson r mixed different speed regimes and flipped the sign. duration_range_by_file uses the motion-only window (i1-i0); it shows the swept vel/acc register (20-100 for vel, 11-100 for acc) barely changes how long the dominant joint's move actually takes (ratio ~1.0-1.35) -- so over this range the controller is not simply running a trapezoidal profile capped at the commanded vel/acc the way dynamics.py's model assumes; something else (a lower default speed limit, a blend/safety cap) is binding instead. Worth flagging for the Dynamics swap point.",
   "corr_vel_overshoot": -0.26962303471320237,
   "corr_acc_overshoot": -0.33209487245979186,
-  "corr_vel_rms": 0.10088277086731144,
-  "corr_acc_rms": 0.029432804219524676
+  "corr_vel_rms": 0.10088277086731148,
+  "corr_acc_rms": 0.02943280421952464
 }

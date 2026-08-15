@@ -58,6 +58,8 @@ OUT_DIR = os.path.join(HERE, "bronze_tier")
 # was essentially holding position and its stats are noise, not signal.
 MOVED_EPS_RAD = 0.05
 
+RAD2DEG = 180.0 / np.pi
+
 
 # --- per-move metrics ---------------------------------------------------------
 
@@ -105,6 +107,7 @@ def collect_segment_stats(paths: list[str]) -> tuple[pd.DataFrame, dict]:
                 "direction": 1 if seg.dest >= seg.start else -1,
                 "rms_pos_err_mrad": rms_pos_error_mrad(rec, seg),
                 "peak_overshoot_mrad": peak_overshoot_mrad(rec, seg),
+                "duration_s": float(rec.t[seg.i1] - rec.t[seg.i0]),
                 "i0": seg.i0, "i1": seg.i1, "i2": seg.i2,
             })
     return pd.DataFrame(rows), recs
@@ -323,6 +326,150 @@ def plot_per_joint_overshoot(df: pd.DataFrame, out_path: str):
     plt.close(fig)
 
 
+# --- presentation plots -------------------------------------------------------
+# A curated subset (4 plots) of the analysis above, in degrees and % of move
+# distance instead of mrad, with the value for each joint / (vel, acc) cell
+# printed directly on the plot -- meant to go straight into a slide, and to be
+# regenerated unchanged (just point --data-glob at the new recordings and
+# --presentation-name at a new folder) once the optimized trajectories are
+# recorded, so baseline and optimized are directly comparable.
+
+def _add_deg_pct_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Return ``df`` with degree and %-of-move-distance columns added.
+
+    % is each row's error as a fraction of that row's own commanded travel
+    (``dist_rad``) -- comparable across joints/moves of very different size,
+    unlike the raw mrad number.
+    """
+    df = df.copy()
+    df["overshoot_deg"] = df["peak_overshoot_mrad"] / 1e3 * RAD2DEG
+    df["rms_deg"] = df["rms_pos_err_mrad"] / 1e3 * RAD2DEG
+    df["overshoot_pct"] = df["peak_overshoot_mrad"] / 1e3 / df["dist_rad"] * 100
+    df["rms_pct"] = df["rms_pos_err_mrad"] / 1e3 / df["dist_rad"] * 100
+    return df
+
+
+def plot_metric_by_joint(df: pd.DataFrame, deg_col: str, pct_col: str, out_path: str,
+                         title: str):
+    """Bar chart, one bar per joint, labeled with both degrees and % of move distance."""
+    sub = df[df["dist_rad"] > MOVED_EPS_RAD]
+    deg = sub.groupby("joint_name")[deg_col].mean().reindex(JOINT_NAMES).dropna()
+    pct = sub.groupby("joint_name")[pct_col].mean().reindex(deg.index)
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    bars = ax.bar(deg.index, deg.values, color="darkorange", edgecolor="black")
+    for bar, d, p in zip(bars, deg.values, pct.values):
+        ax.text(bar.get_x() + bar.get_width() / 2, d, f"{d:.2f}°\n({p:.2f}%)",
+                ha="center", va="bottom", fontsize=9)
+    ax.set_ylabel("degrees")
+    ax.set_title(title)
+    ax.set_ylim(0, deg.max() * 1.25)
+    ax.tick_params(axis="x", rotation=20)
+    ax.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_duration_by_joint(df: pd.DataFrame, out_path: str):
+    """Bar chart, mean move duration (motion-only window, i0:i1) per joint, in
+    seconds -- the "did it actually get faster" companion to the overshoot/RMS
+    by-joint plots. Vibration is trivial to reduce by slowing down; this is
+    what catches that.
+    """
+    sub = df[df["dist_rad"] > MOVED_EPS_RAD]
+    dur = sub.groupby("joint_name")["duration_s"].mean().reindex(JOINT_NAMES).dropna()
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    bars = ax.bar(dur.index, dur.values, color="steelblue", edgecolor="black")
+    for bar, d in zip(bars, dur.values):
+        ax.text(bar.get_x() + bar.get_width() / 2, d, f"{d:.2f}s",
+                ha="center", va="bottom", fontsize=9)
+    ax.set_ylabel("seconds")
+    ax.set_title("Mean move duration by joint (motion-only window)")
+    ax.set_ylim(0, dur.max() * 1.25)
+    ax.tick_params(axis="x", rotation=20)
+    ax.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_heatmap_labeled(df_combo: pd.DataFrame, deg_col: str, pct_col: str, out_path: str,
+                         title: str, bins: int = 4):
+    """(vel, acc) grid, coarse enough that every cell's mean value (degrees, then
+    % of move distance) can be printed inside it -- the same data as
+    ``plot_heatmap`` but sized for reading off numbers rather than spotting a
+    gradient by eye.
+
+    Bins are quantile-based (equal segment count per bin), not equal-width:
+    the combo runs mix a narrow 20-100 sweep (test-1) with a 10-990 randomized
+    one (test-6/7), so equal-width bins leave most of the grid empty. Equal-
+    count bins keep every cell populated.
+    """
+    df_combo = df_combo[df_combo["dist_rad"] > MOVED_EPS_RAD]
+    if df_combo.empty:
+        return
+    df_combo = df_combo.copy()
+    df_combo["vel_bin"] = pd.qcut(df_combo["vel"], bins, duplicates="drop")
+    df_combo["acc_bin"] = pd.qcut(df_combo["acc"], bins, duplicates="drop")
+    deg = df_combo.groupby(["acc_bin", "vel_bin"], observed=True)[deg_col].mean().unstack()
+    pct = df_combo.groupby(["acc_bin", "vel_bin"], observed=True)[pct_col].mean().unstack()
+    acc_index = deg.index.sort_values()
+    vel_cols = deg.columns.sort_values()
+    deg = deg.reindex(index=acc_index, columns=vel_cols)
+    pct = pct.reindex(index=acc_index, columns=vel_cols)
+
+    fig, ax = plt.subplots(figsize=(8.5, 6.5))
+    im = ax.imshow(deg.values, origin="lower", aspect="auto", cmap="magma")
+    vmin, vmax = np.nanmin(deg.values), np.nanmax(deg.values)
+    for i in range(deg.shape[0]):
+        for j in range(deg.shape[1]):
+            d, p = deg.values[i, j], pct.values[i, j]
+            if np.isnan(d):
+                continue
+            color = "black" if (d - vmin) / max(vmax - vmin, 1e-9) > 0.6 else "white"
+            ax.text(j, i, f"{d:.2f}°\n{p:.2f}%", ha="center", va="center",
+                    fontsize=7.5, color=color)
+    ax.set_xticks(range(len(vel_cols)))
+    ax.set_xticklabels([f"{iv.left:.0f}-{iv.right:.0f}" for iv in vel_cols], fontsize=7.5)
+    ax.set_yticks(range(len(acc_index)))
+    ax.set_yticklabels([f"{iv.left:.0f}-{iv.right:.0f}" for iv in acc_index], fontsize=7.5)
+    ax.set_xlabel("vel (deg/s)")
+    ax.set_ylabel("acc (deg/s^2)")
+    ax.set_title(title)
+    fig.colorbar(im, ax=ax, label="degrees")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def build_presentation_plots(df: pd.DataFrame, combo_files: list[str], out_dir: str,
+                             folder_name: str):
+    """Write the curated 4-plot presentation set to ``out_dir/folder_name/``."""
+    pres_dir = os.path.join(out_dir, folder_name)
+    os.makedirs(pres_dir, exist_ok=True)
+    df = _add_deg_pct_cols(df)
+
+    plot_metric_by_joint(df, "overshoot_deg", "overshoot_pct",
+                         os.path.join(pres_dir, "overshoot_by_joint.png"),
+                         "Peak overshoot by joint")
+    plot_metric_by_joint(df, "rms_deg", "rms_pct",
+                         os.path.join(pres_dir, "rms_by_joint.png"),
+                         "RMS position error by joint")
+    plot_duration_by_joint(df, os.path.join(pres_dir, "duration_by_joint.png"))
+
+    combo = df[df["file"].isin(combo_files)]
+    if not combo.empty:
+        plot_heatmap_labeled(combo, "overshoot_deg", "overshoot_pct",
+                             os.path.join(pres_dir, "overshoot_heatmap.png"),
+                             "Peak overshoot over (vel, acc)")
+        plot_heatmap_labeled(combo, "rms_deg", "rms_pct",
+                             os.path.join(pres_dir, "rms_heatmap.png"),
+                             "RMS position error over (vel, acc)")
+    print(f"[results] presentation plots -> {pres_dir}")
+
+
 # --- orchestration -----------------------------------------------------------
 
 def build_trajectory_plots(df: pd.DataFrame, recs: dict, out_dir: str, n_show: int):
@@ -454,6 +601,10 @@ def main():
     ap.add_argument("--out", default=OUT_DIR, help="output directory")
     ap.add_argument("--n-traj", type=int, default=6,
                     help="settings overlaid per trajectory sweep plot")
+    ap.add_argument("--presentation-name", default="presentation_plots_baseline",
+                    help="subfolder (under --out) for the curated 4-plot presentation "
+                         "set; pass e.g. presentation_plots_optimized when re-running "
+                         "against the optimized-trajectory recordings")
     args = ap.parse_args()
 
     paths = sorted(glob.glob(args.data_glob))
@@ -502,6 +653,8 @@ def main():
     plot_direction_boxplot(df, "rms_pos_err_mrad",
                            os.path.join(args.out, "rms_by_direction.png"),
                            "RMS position error by joint and travel direction", "RMS pos error (mrad)")
+
+    build_presentation_plots(df, combo_files, args.out, args.presentation_name)
 
     log = log_summary(df, args.out, vel_sweep_files, acc_sweep_files)
     print(f"[results] run complete -> {args.out}")
