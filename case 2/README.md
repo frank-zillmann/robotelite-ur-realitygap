@@ -40,8 +40,10 @@ pip install -r requirements.txt
 Distill once, then either mode reuses the model.
 
 ```bash
-# 1. distill the gap model from the recorded real runs
-python train_distillation_model.py --csvs data/test-4.csv data/test-5.csv data/test-6.csv --out models/distill.pkl
+# 1. distill the gap model — fixed train/test file split by default
+#    (train: test-1,2,3,6.csv, test: test-4,5,7.csv), whatever DistillModel
+#    or Preprocess is plugged in. Override with --train-csvs/--test-csvs.
+python train_distillation_model.py --out models/distill.pkl
 
 # 2. train the RL agent on several scripts (--loop repeats each for more moves)
 python train_rla.py --mode params --robot-ip 127.0.0.1 --loop 5 --model models/distill.pkl --steps 20000 \
@@ -103,7 +105,10 @@ actuals, `EvaluationMetric` scores them.
 - **`DistillModel`** (`train_distillation_model.py`): a per-row least-squares
   `LinearModel` predicting `actual_current` from `[target_current, qd, qdd, pos,
   vel, acc, joint]`. Change the features (`_row_features`), the predicted channel
-  (`predicts`), or the whole model.
+  (`predicts`), or the whole model — add a new subclass to `MODELS` to select it
+  with `--model`. Training always uses the fixed file-level split (`--train-csvs`
+  / `--test-csvs`, defaults `DEFAULT_TRAIN_CSVS` / `DEFAULT_TEST_CSVS` at the top
+  of the file) so held-out numbers are comparable across models/preprocessing.
 - **`Dynamics`** (`dynamics.py`): `UR10eDynamics`, `tau = M(q)qdd + g(q)`,
   `current = tau/Kt` (Coriolis dropped); `vel`/`acc` deg/s to rad/s. Override
   `current(q, qd, qdd)` for friction, Coriolis, identified parameters.

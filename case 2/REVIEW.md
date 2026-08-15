@@ -224,9 +224,9 @@ compare the recording against the baseline with `analysis.py`/
 and optimized come back with the same flat zero gap, per §3/§4.
 
 What this loop misses (dropped Coriolis, generic dynamics params,
-`actual_current`-only distill model, row-level held-out split, no
-model/agent provenance on the resulting recording) is covered where it's
-actionable, in §5-§6 — not repeated here.
+`actual_current`-only distill model, no model/agent provenance on the
+resulting recording) is covered where it's actionable, in §5-§6 — not
+repeated here.
 
 ## 5. Findings from actually running it this session
 
@@ -241,12 +241,18 @@ actionable, in §5-§6 — not repeated here.
 - **`data/test-*.csv` are real hardware sweeps**, not synthetic — a resource
   for Bronze analysis and offline validation that doesn't require live
   hardware access.
-- **`train_distillation_model.py`'s held-out split is row-level**, not
+- **`train_distillation_model.py`'s held-out split was row-level**, not
   run-level (every 5th row, `--holdout 0.2`) — optimistic, since a held-out
-  row's neighbors are still in training. Our run: RMSE 0.627A, R² 0.978
-  pooled across all 6 joints — but joint current scales vary hugely (base
-  ±13A vs wrist3 ±0.0005A), so a single pooled RMSE can hide a bad fit on the
-  small joints. Not yet checked per-joint.
+  row's neighbors are still in training. Our original run: RMSE 0.627A, R²
+  0.978 pooled across all 6 joints — but joint current scales vary hugely
+  (base ±13A vs wrist3 ±0.0005A), so a single pooled RMSE can hide a bad fit
+  on the small joints. **Resolved 2026-08-15**: the script now defaults to a
+  fixed file-level split (train `test-1,2,3,6.csv`, test `test-4,5,7.csv`,
+  never mixed) and reports per-joint RMSE/R² — see §9.2. With that split,
+  held-out RMSE 0.680A/R² 0.977 vs in-sample RMSE 0.670A/R² 0.973: close
+  enough that the linear model isn't meaningfully overfitting the 4 training
+  runs, but wrist2/wrist3 R² is weak (0.43/0.07) — see §9.2's per-joint
+  caveat.
 - **Coefficients from our run**: `target_current +1.09` (expected),
   `qd -0.374` (real signal — instantaneous commanded speed matters),
   `vel +0.0001` / `acc +0.0001` (the raw movej register barely matters
@@ -329,10 +335,10 @@ actionable, in §5-§6 — not repeated here.
   slopes across joints is a known limitation of the baseline, per its own
   docstring) — something that can capture the post-stop ring a linear model
   structurally cannot.
-- Fix the held-out evaluation to be **run-level**: train on
-  `test-1,2,4,5`, evaluate entirely on `test-3` (a full run, and a parameter
-  sweep — vel — that `test-2` never varied). Report per-joint RMSE/R², not
-  just pooled.
+- ~~Fix the held-out evaluation to be **run-level**~~ — done 2026-08-15: the
+  script now defaults to a fixed file-level split (train `test-1,2,3,6.csv`,
+  test `test-4,5,7.csv`) and reports per-joint RMSE/R² alongside pooled, for
+  whichever `DistillModel` is selected (§9.2).
 - Once the model predicts `actual_q`, validate that channel the same way.
 - Offline predicted-vs-actual check: for the held-out sweep, plot the
   model's predicted metric vs the real measured metric across the swept
@@ -392,12 +398,13 @@ that, and how to turn it into something to hand to the company.
 
 ### The validation plan (do this, in order)
 
-1. **Run-level held-out split for the distill model** (§6 Silver). Train on
-   `test-1,2,4,5`, evaluate entirely on `test-3` — a full real run the model
-   never saw, not just held-out rows from runs it partly trained on (today's
-   split is row-level, `--holdout 0.2`, and optimistic per §5). Report
-   per-joint RMSE/R², since pooled RMSE hides a bad fit on small joints
-   (wrist current is ~1/20,000th of base current — §5).
+1. ~~**Run-level held-out split for the distill model**~~ (§6 Silver) — done
+   2026-08-15: `train_distillation_model.py` now defaults to a fixed
+   file-level split (train `test-1,2,3,6.csv`, test `test-4,5,7.csv` — full
+   real runs the model never saw during `fit()`) and reports per-joint
+   RMSE/R², since pooled RMSE hides a bad fit on small joints (wrist current
+   is ~1/20,000th of base current — §5). See §9.2 for how to read the
+   result.
 2. **Predicted-vs-real curve across a swept parameter.** `test-2` (acc
    100→10, vel fixed) and `test-3` (vel 100→10, acc fixed) are clean
    single-variable sweeps. Hold one out, plot the model's *predicted* gap
@@ -542,57 +549,66 @@ anywhere else in the pipeline.
 ### 9.2 `train_distillation_model.py` — fit the reality-gap model
 
 ```bash
-python train_distillation_model.py \
-    --csvs data/test-*.csv --out models/distill.pkl
+python train_distillation_model.py --out models/distill.pkl
 ```
 
-Every run: builds one design matrix from *all* `--csvs`, fits a fresh
-`LinearModel` from scratch (nothing is fine-tuned incrementally — adding a
-CSV means refitting on everything), evaluates it on a deterministic
-held-out row split (`train_distillation_model.py:471-472`, every
-`1/holdout`-th row), overwrites `models/distill.pkl`, and appends one row to
-`results/runs_summary.csv`.
+As of 2026-08-15 this is a **fixed file-level train/test split by default** —
+`model.fit()` only ever sees `DEFAULT_TRAIN_CSVS` (`data/test-1,2,3,6.csv`),
+and every printed/plotted/logged metric comes from predicting the disjoint
+`DEFAULT_TEST_CSVS` (`data/test-4,5,7.csv`), which the model never trains on.
+The pairing isn't arbitrary: `{2,4}` are both acc sweeps at vel=100, `{3,5}`
+are both vel sweeps at acc=100, `{6,7}` are both wide random vel/acc combos
+(`test-1` is a standalone low-range grid) — holding out one file from each
+pair means the test set covers the same regimes as training, so the number
+measures generalization to a new run, not extrapolation into an unseen
+speed/accel range. Override with `--train-csvs`/`--test-csvs` (the two must
+not overlap — the script exits if they do); pick `--model` to train a
+different registered `DistillModel` subclass (`MODELS` at the top of the
+file) — the split logic doesn't change based on which one you pick. The
+model saved to `--out` (default `models/distill.pkl`) is fit on the training
+files only — it is *not* refit on the test files afterward, so the reported
+numbers describe the exact model that gets deployed.
 
 **Files, and how to read them:**
-- `results/<datetime>/log.json` — `held_out_metrics.actual_current.{rmse,r2}`
-  is the number that matters: RMSE in amps (lower is better), R² in [0,1]
-  (closer to 1 is better, i.e. more of the real current variance the model
-  explains). `full_data_metrics` is fit quality on everything including
-  training rows — always better than `held_out_metrics`, not a fair
-  comparison number, useful only to sanity-check the fit didn't collapse.
-  `params` is the fitted `LinearModel` coefficients (`coef` per feature).
-- `per_joint_rmse_actual_current.png` — bar per joint; check no single joint
-  (usually wrist2/wrist3, lighter links, less current signal — see §5) is
-  dragging the overall RMSE up so much that the "average" number hides a
-  joint the model can't predict at all.
-- `residuals_actual_current.png` — should look centered on zero with no
-  obvious structure (a slope or curve here means the linear model is
-  missing a term, not just noisy).
+- `results/<datetime>/log.json` — `held_out_metrics.actual_current.overall.
+  {rmse,r2}` is the number that matters: RMSE in amps (lower is better), R²
+  in [0,1] (closer to 1 is better). `in_sample_metrics` is the same model
+  evaluated on the *training* files — a sanity check only (should look at
+  least as good as held-out; if it doesn't, the fit itself is broken, not a
+  generalization issue). `training.{train_csvs,test_csvs}` records exactly
+  which files were used for each. `params` is the fitted `LinearModel`
+  coefficients (`coef` per feature).
+- `per_joint_rmse_actual_current.png` — bar per joint, computed on the
+  held-out files; check no single joint (usually wrist2/wrist3, lighter
+  links, less current signal — see §5) is dragging the overall RMSE up so
+  much that the "average" number hides a joint the model can't predict at
+  all.
+- `residuals_actual_current.png` — held-out residuals; should look centered
+  on zero with no obvious structure (a slope or curve here means the linear
+  model is missing a term, not just noisy).
 - `results/runs_summary.csv` / `results/comparison_plot.png` — one row/point
-  per training run ever done; this is the only place you can see the trend
-  across runs rather than one run's number in isolation.
+  per training run ever done, `*_rmse`/`*_r2` columns are the held-out
+  numbers above; this is the only place you can see the trend across runs
+  rather than one run's number in isolation.
 
 **Is this distill model better than the last one?**
-1. Compare `held_out_metrics.actual_current.rmse`/`r2` against the *previous
-   row* in `runs_summary.csv`, not just against the number in your head —
-   RMSE down and R² up is the win condition.
-2. **Discount this number by the known validation gap**: the split above is
-   row-level (every Nth *row*), not run-level, so adjacent rows from the
-   same run sit on both sides of the split and leak timing/geometry
-   correlation into "held-out" — the reported R² is optimistic (§8 flags
-   this explicitly: don't present the current `runs_summary.csv` numbers to
-   the company as-is). A model that looks better on this split may not
-   actually generalize better to a genuinely new run; the real test is
-   §8's run-level held-out check (predict a CSV that had zero rows in
-   training).
-3. Look at `per_joint_rmse` before declaring victory — an improved overall
+1. Compare `held_out_metrics.actual_current.overall.{rmse,r2}` against the
+   *previous row* in `runs_summary.csv`, not just against the number in your
+   head — RMSE down and R² up is the win condition. Because the split is
+   now file-level and fixed, these numbers are directly comparable across
+   runs in a way the old row-level holdout wasn't (§8's caveat about
+   adjacent-row leakage no longer applies to this metric — it still applies
+   to anything that reintroduces a row-level split).
+2. Look at `per_joint_rmse` before declaring victory — an improved overall
    RMSE that comes from getting the already-good joints slightly better
    while a bad joint stays bad isn't the same as a genuinely better model.
-4. More training CSVs isn't automatically better: it's more data but also a
-   wider range of speeds/geometries for one linear fit to cover, which can
-   raise held-out error even as the model becomes more broadly usable. Read
-   the trend in `comparison_plot.png`, don't judge one run against the
-   immediately preceding one.
+3. Compare `held_out_metrics` against `in_sample_metrics` in the same
+   `log.json`: a large gap (held-out much worse than in-sample) means the
+   model is overfitting to the four training runs, not learning the
+   underlying gap.
+4. `--train-csvs`/`--test-csvs` change what "better" means — only compare
+   runs that used the same split (the default, unless you deliberately
+   swept it).
 
 ### 9.3 `train_rla.py` — train the RL agent
 

@@ -55,21 +55,25 @@ python record.py --robot-ip 192.168.1.100 --out data/test-1.csv --float-register
 Trains a model that predicts `actual_current` from the commanded trajectory.
 Must be trained on real robot recordings (not URSim — URSim has zero gap).
 
+Uses a **fixed file-level train/test split by default**: `fit()` only sees
+`data/test-1,2,3,6.csv`; every printed/plotted/logged metric comes from
+predicting `data/test-4,5,7.csv`, which the model never trains on. This split
+is the same no matter which `--model` or `Preprocess` (`preprocess.py`) is
+active, so numbers stay comparable across runs. The saved model is fit on the
+training files only — it is *not* refit on the test files afterward.
+
 ```bash
-# Train on three real runs, save model
+# Default split (train 1,2,3,6 / test 4,5,7), save model
+python train_distillation_model.py --out models/distill.pkl
+
+# Override the split explicitly (must not overlap)
 python train_distillation_model.py \
-    --csvs data/test-4.csv data/test-5.csv data/test-6.csv \
+    --train-csvs data/test-1.csv data/test-2.csv \
+    --test-csvs data/test-3.csv \
     --out models/distill.pkl
 
-# Use a glob to include all runs
-python train_distillation_model.py \
-    --csvs data/test-*.csv \
-    --out models/distill.pkl
-
-# Change the held-out fraction (default 0.2 = 20%)
-python train_distillation_model.py \
-    --csvs data/test-*.csv \
-    --holdout 0.3
+# Select a different registered DistillModel (MODELS dict in the file)
+python train_distillation_model.py --model linear --out models/distill.pkl
 ```
 
 **Output (automatic, no flags needed):**
@@ -77,9 +81,9 @@ python train_distillation_model.py \
 models/distill.pkl                         ← latest model (overwritten each run)
 results/<datetime>/
   distill.pkl                              ← versioned copy
-  log.json                                 ← features, coefficients, RMSE, R²
-  residuals_actual_current.png             ← error distribution
-  per_joint_rmse_actual_current.png        ← per-joint RMSE bar chart
+  log.json                                 ← features, coefficients, held-out + in-sample RMSE/R²
+  residuals_actual_current.png             ← error distribution (held-out files)
+  per_joint_rmse_actual_current.png        ← per-joint RMSE bar chart (held-out files)
 results/runs_summary.csv                   ← one row per run for comparison
 results/comparison_plot.png                ← RMSE / R² trend across all runs
 ```

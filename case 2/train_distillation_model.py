@@ -22,17 +22,27 @@ The channels a model fills must be the ones the metric reads (see metrics.py).
     m.save("models/distill.pkl")
     augment(m, "sim_to_real.csv")         # overwrite actual_current with predictions
 
-Run as a script to train on the recorded runs, print held-out error, and save:
+Run as a script to fit on a fixed train set, report error on a fixed, disjoint
+test set, and save. The split is fixed by default (data/test-{1,2,3,6}.csv to
+train, data/test-{4,5,7}.csv to test) so numbers stay comparable across runs no
+matter which DistillModel or Preprocess is plugged in:
 
-    python train_distillation_model.py --csvs data/test-*.csv --out models/distill.pkl
+    python train_distillation_model.py --out models/distill.pkl
+
+Override either list to use a different split (they must not overlap):
+
+    python train_distillation_model.py \
+        --train-csvs data/test-1.csv data/test-2.csv \
+        --test-csvs data/test-3.csv \
+        --out models/distill.pkl
 
 train_rla.py and run.py depend only on the interface, so a custom subclass of
-DistillModel (or LinearModel) can replace the baseline via its pickle.
+DistillModel (or LinearModel) can replace the baseline via its pickle; add it
+to MODELS below to select it with --model.
 """
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import pickle
@@ -48,6 +58,15 @@ import pandas as pd
 from preprocess import Identity, Preprocess, default_preprocess
 from utils import (JOINT_NAMES, N_JOINTS, VEL_COL, ACC_COL, frame_dt,
                    get_block, set_block)
+
+# Fixed file-level train/test split, used regardless of --model or the active
+# Preprocess. data/test-{2,4}.csv are both acc sweeps at vel=100, {3,5} are
+# both vel sweeps at acc=100, and {6,7} are both wide random vel/acc combos
+# (test-1 is a standalone low-range vel/acc grid) — so holding out one file
+# from each pair (4, 5, 7) tests generalization to a new run within a regime
+# the model has seen, rather than extrapolation to an unseen regime.
+DEFAULT_TRAIN_CSVS = ["data/test-1.csv", "data/test-2.csv", "data/test-3.csv", "data/test-6.csv"]
+DEFAULT_TEST_CSVS  = ["data/test-4.csv", "data/test-5.csv", "data/test-7.csv"]
 
 
 class DistillModel(ABC):
@@ -218,6 +237,11 @@ class LinearModel(DistillModel):
         }
 
 
+# Models selectable via --model. Add a new DistillModel subclass here to make
+# it available from the CLI without touching the train/test split logic.
+MODELS = {"linear": LinearModel}
+
+
 def augment(model: DistillModel, csv: str, pre: Preprocess = None):
     """Overwrite a recording's actual_* columns with the model's predictions.
 
@@ -352,6 +376,33 @@ def _plot_per_joint_rmse(metrics: dict, channels: list, run_dir: str):
         print(f"[results] plot -> {path}")
 
 
+def _plot_per_joint_r2(metrics: dict, channels: list, run_dir: str):
+    for ch in channels:
+        ch_short = ch.replace("actual_", "")
+        ovr      = metrics[ch]["overall"]
+        joint_r2 = [metrics[ch]["per_joint"][j]["r2"] for j in range(N_JOINTS)]
+        fig, ax  = plt.subplots(figsize=(9, 5))
+        bars = ax.bar(JOINT_NAMES, joint_r2, color="steelblue", edgecolor="black")
+        ax.axhline(ovr["r2"], color="red", linestyle="--", linewidth=1.2,
+                   label=f"Overall R²={ovr['r2']:.4f}")
+        ax.axhline(0, color="black", linewidth=0.8)
+        for bar, val in zip(bars, joint_r2):
+            va = "bottom" if val >= 0 else "top"
+            offset = 0.01 if val >= 0 else -0.01
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + offset,
+                    f"{val:.4f}", ha="center", va=va, fontsize=8)
+        ax.set_xlabel("Joint")
+        ax.set_ylabel(f"R² ({ch_short})")
+        ax.set_title(f"Per-joint R² — {ch}")
+        ax.tick_params(axis="x", rotation=20)
+        ax.legend()
+        fig.tight_layout()
+        path = os.path.join(run_dir, f"per_joint_r2_{ch}.png")
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"[results] plot -> {path}")
+
+
 def _update_summary(model: DistillModel, held_out_metrics: dict,
                     results_dir: str, dt_str: str):
     """Append a row to runs_summary.csv and regenerate the comparison plot."""
@@ -394,17 +445,24 @@ def _update_summary(model: DistillModel, held_out_metrics: dict,
     print(f"[results] comparison -> {path}")
 
 
-def log_run(model: DistillModel, recordings, holdout_fraction: float,
-            held_out_metrics: dict, results_dir: str = None, dt_str: str = None):
+def log_run(model: DistillModel, train_csvs: list, test_csvs: list,
+            train_recordings, test_recordings,
+            results_dir: str = None, dt_str: str = None):
     """Log a training run: save log.json, residual plot, per-joint RMSE plot,
     update runs_summary.csv and regenerate the comparison plot.
 
+    Metrics that matter are computed on ``test_recordings`` only — files
+    ``model.fit()`` never saw. ``train_recordings`` are evaluated too and
+    logged as ``in_sample_metrics`` purely as a sanity check: it should
+    always look better than the held-out numbers, and if it doesn't, the fit
+    itself is broken (not a generalization problem).
+
     Args:
-        model:             fitted DistillModel.
-        recordings:        list of Recording objects used for training (all data).
-        holdout_fraction:  fraction that was held out during training evaluation.
-        held_out_metrics:  {channel: {"rmse": float, "r2": float, "n_rows": int}}
-                           computed on the held-out split before final refit.
+        model:             fitted DistillModel (already fit on train_recordings).
+        train_csvs:        paths passed to model.fit(), for the log.
+        test_csvs:         held-out paths, never passed to fit(), for the log.
+        train_recordings:  Recording objects for train_csvs (preprocessed).
+        test_recordings:   Recording objects for test_csvs (preprocessed).
         results_dir:       override for RESULTS_DIR.
         dt_str:            override for the run timestamp (default: now).
     """
@@ -413,19 +471,20 @@ def log_run(model: DistillModel, recordings, holdout_fraction: float,
     run_dir     = os.path.join(results_dir, dt_str)
     os.makedirs(run_dir, exist_ok=True)
 
-    eval_data    = _evaluate_model(model, recordings)
-    full_metrics = _compute_metrics(eval_data)
+    held_out_eval    = _evaluate_model(model, test_recordings)
+    held_out_metrics = _compute_metrics(held_out_eval)
+    in_sample_metrics = _compute_metrics(_evaluate_model(model, train_recordings))
 
     log = {
         "datetime":          dt_str,
         "model_class":       type(model).__name__,
         "params":            model.params(),
         "training": {
-            "n_recordings":    len(recordings),
-            "holdout_fraction": holdout_fraction,
+            "train_csvs": train_csvs,
+            "test_csvs":  test_csvs,
         },
         "held_out_metrics":  held_out_metrics,
-        "full_data_metrics": full_metrics,
+        "in_sample_metrics": in_sample_metrics,
     }
     log_path = os.path.join(run_dir, "log.json")
     with open(log_path, "w") as f:
@@ -436,60 +495,70 @@ def log_run(model: DistillModel, recordings, holdout_fraction: float,
     model.save(model_path)           # versioned copy alongside its log and plots
     print(f"[results] model -> {model_path}")
 
-    _plot_residuals(eval_data, full_metrics, model.predicts(), run_dir)
-    _plot_per_joint_rmse(full_metrics, model.predicts(), run_dir)
-    _update_summary(model, held_out_metrics, results_dir, dt_str)
+    _plot_residuals(held_out_eval, held_out_metrics, model.predicts(), run_dir)
+    _plot_per_joint_rmse(held_out_metrics, model.predicts(), run_dir)
+    _plot_per_joint_r2(held_out_metrics, model.predicts(), run_dir)
+    summary_row = {ch: m["overall"] for ch, m in held_out_metrics.items()}
+    _update_summary(model, summary_row, results_dir, dt_str)
     print(f"[results] run complete -> {run_dir}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Train the distillation model.")
-    ap.add_argument("--csvs", nargs="+", default=sorted(glob.glob("data/test-*.csv")),
-                    help="recorded runs to train on")
+    ap = argparse.ArgumentParser(
+        description="Fit a DistillModel on a fixed train set and report error "
+                    "on a fixed, disjoint test set (see module docstring). The "
+                    "split defaults are the same no matter which --model or "
+                    "Preprocess (preprocess.default_preprocess) is active, so "
+                    "runs stay comparable.")
+    ap.add_argument("--train-csvs", nargs="+", default=DEFAULT_TRAIN_CSVS,
+                    help="recordings model.fit() sees (default: %(default)s)")
+    ap.add_argument("--test-csvs", nargs="+", default=DEFAULT_TEST_CSVS,
+                    help="held-out recordings, never passed to fit(); the "
+                        "printed/plotted/logged metrics come from these "
+                        "(default: %(default)s)")
+    ap.add_argument("--model", choices=sorted(MODELS), default="linear",
+                    help="DistillModel to train (default: %(default)s)")
     ap.add_argument("--out", default="models/distill.pkl", help="pickle path")
-    ap.add_argument("--holdout", type=float, default=0.2,
-                    help="fraction of rows held out for the error report")
     args = ap.parse_args()
+
+    overlap = set(args.train_csvs) & set(args.test_csvs)
+    if overlap:
+        raise SystemExit(f"--train-csvs and --test-csvs overlap, the test set "
+                          f"would not be held out: {sorted(overlap)}")
 
     # Import under the real module name (not "__main__") so the saved pickle
     # loads cleanly in train_rla.py and run.py.
-    from train_distillation_model import LinearModel
+    from train_distillation_model import MODELS as _MODELS
     from analysis import Recording
 
-    # Preprocess the training data the same way the model will see it later.
+    # Preprocess train and test the same way the model will see them later.
     pre = default_preprocess()
-    recordings = [Recording(r.path, df=pre.transform_distill(r.df))
-                  for r in (Recording(p) for p in args.csvs)]
-    model = LinearModel()
+    train_recordings = [Recording(r.path, df=pre.transform_distill(r.df))
+                        for r in (Recording(p) for p in args.train_csvs)]
+    test_recordings  = [Recording(r.path, df=pre.transform_distill(r.df))
+                        for r in (Recording(p) for p in args.test_csvs)]
 
-    # Build the row matrix once (same features as fit) to estimate held-out
-    # error: predict the measured actual_current on held-out rows.
-    X, y = model._design(recordings)
-    print(f"{len(y)} rows from {len(recordings)} runs")
+    model = _MODELS[args.model]()
+    model.fit(train_recordings)
+    print(f"trained {type(model).__name__} on {len(train_recordings)} run(s): "
+          f"{[os.path.basename(p) for p in args.train_csvs]}")
 
-    # Deterministic split (no RNG): every 1/holdout-th row is a test row.
-    step = max(int(round(1 / args.holdout)), 2)
-    is_test = np.arange(len(y)) % step == 0
-    coef, *_ = np.linalg.lstsq(X[~is_test], y[~is_test], rcond=None)
-    err = X[is_test] @ coef - y[is_test]
-    rmse = float(np.sqrt(np.mean(err ** 2)))
-    ss = float(1 - np.sum(err ** 2) / np.sum((y[is_test] - y[is_test].mean()) ** 2))
-    print(f"held-out ({is_test.sum()} rows): actual_current RMSE {rmse:.3f} A   R2 {ss:.3f}")
-    print("coefficients:")
-    for name, c in zip(LinearModel.FEATURE_NAMES, coef):
-        print(f"  {name:12s} {c:+.4f}")
+    held_out_metrics = _compute_metrics(_evaluate_model(model, test_recordings))
+    print(f"held-out on {len(test_recordings)} run(s) never seen by fit(): "
+          f"{[os.path.basename(p) for p in args.test_csvs]}")
+    for ch, m in held_out_metrics.items():
+        ovr = m["overall"]
+        print(f"  {ch}: RMSE={ovr['rmse']:.4f}  R2={ovr['r2']:.4f}")
+        for pj in m["per_joint"]:
+            print(f"    {pj['joint']:10s} RMSE={pj['rmse']:.4f}  R2={pj['r2']:.4f}")
 
-    # Refit on everything and save.
-    model.fit(recordings)
-    dt_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     model.save(args.out)             # models/distill.pkl — "latest" for pipeline defaults
     print(f"saved {args.out}")
 
     # Log this run: save results/<datetime>/{log.json, model, plots} and update summary.
-    held_out_metrics = {
-        "actual_current": {"rmse": rmse, "r2": ss, "n_rows": int(is_test.sum())}
-    }
-    log_run(model, recordings, args.holdout, held_out_metrics, dt_str=dt_str)
+    dt_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_run(model, args.train_csvs, args.test_csvs, train_recordings, test_recordings,
+            dt_str=dt_str)
 
 
 if __name__ == "__main__":

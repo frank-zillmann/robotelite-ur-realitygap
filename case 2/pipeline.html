@@ -104,18 +104,19 @@ tr:last-child td{border-bottom:none}
 <!-- train_distillation_model.py -->
 <div class="card" style="border-top:3px solid var(--c2)">
   <div style="font-weight:700;color:#c084fc;font-family:monospace;margin-bottom:.5rem">② train_distillation_model.py</div>
-  <p style="font-size:.85rem;margin-bottom:.75rem">Trains a <code>LinearModel</code> via least-squares on features <code>[target_current, qd, qdd, pos, vel, acc, joint_onehot]</code> → <code>actual_current</code>. Evaluates on a held-out split, then refits on all data.</p>
+  <p style="font-size:.85rem;margin-bottom:.75rem">Trains a <code>LinearModel</code> via least-squares on features <code>[target_current, qd, qdd, pos, vel, acc, joint_onehot]</code> → <code>actual_current</code>. Fixed file-level split by default: fits on <code>test-1,2,3,6.csv</code>, reports RMSE/R² on <code>test-4,5,7.csv</code> (never seen by <code>fit()</code>) — same split no matter which <code>--model</code>/<code>Preprocess</code> is active. The saved model is <em>not</em> refit on the test files afterward.</p>
   <div class="io-label">Inputs</div>
   <div class="io-item"><code>data/test-*.csv</code> real robot recordings</div>
   <div class="io-label">Outputs</div>
   <div class="io-item"><code>models/distill.pkl</code> <span class="tag" style="background:#1f3a6e;color:#93c5fd">latest</span></div>
   <div class="io-item"><code>results/&lt;dt&gt;/distill.pkl</code> <span class="tag" style="background:#3d1f8e;color:#d8b4fe">versioned</span></div>
-  <div class="io-item"><code>results/&lt;dt&gt;/log.json</code> — features, RMSE, R²</div>
+  <div class="io-item"><code>results/&lt;dt&gt;/log.json</code> — features, held-out + in-sample RMSE/R²</div>
   <div class="io-item"><code>results/&lt;dt&gt;/residuals.png</code> + <code>per_joint_rmse.png</code></div>
   <div class="io-item"><code>results/runs_summary.csv</code> — cross-run comparison</div>
   <pre><code>python train_distillation_model.py \
-  --csvs data/test-4.csv data/test-5.csv \
-  --out models/distill.pkl</code></pre>
+  --out models/distill.pkl
+# override the split:
+#   --train-csvs data/test-1.csv ... --test-csvs data/test-4.csv ...</code></pre>
 </div>
 
 <!-- train_rla.py -->
@@ -312,10 +313,8 @@ cd "case 2"
 python record.py --robot-ip &lt;real_ip&gt; --out data/test-N.csv \
   --float-register 1 vel 2 acc
 
-# ── 2. Train distillation model ─────────────────────────────────────────────
-python train_distillation_model.py \
-  --csvs data/test-4.csv data/test-5.csv data/test-6.csv \
-  --out models/distill.pkl
+# ── 2. Train distillation model (fixed split: train 1,2,3,6 / test 4,5,7) ───
+python train_distillation_model.py --out models/distill.pkl
 
 # ── 3. Train RL agent (leave triangle out) ───────────────────────────────────
 python train_rla.py --mode params --model models/distill.pkl \
@@ -394,13 +393,11 @@ python analysis.py --csv results/&lt;dt&gt;_triangle.optimized.csv --joint 1</co
     <tbody>
       <tr><td><code>datetime</code></td><td>When this training run happened</td></tr>
       <tr><td><code>model_class</code></td><td>Class name, e.g. <code>LinearModel</code></td></tr>
-      <tr><td><code>n_recordings</code></td><td>How many CSV files were used for training</td></tr>
-      <tr><td><code>holdout_fraction</code></td><td>Fraction held out for evaluation (default 0.2)</td></tr>
-      <tr><td><code>rmse_actual_current</code></td><td>Root-mean-square prediction error on the held-out set, in Amperes. <strong>Lower is better.</strong></td></tr>
-      <tr><td><code>r2_actual_current</code></td><td>R² on held-out set (0–1). <strong>Closer to 1 is better.</strong> Measures what fraction of the variance in actual_current the model explains.</td></tr>
-      <tr><td><code>n_rows_holdout</code></td><td>Number of samples in the held-out set</td></tr>
+      <tr><td><code>actual_current_rmse</code></td><td>Root-mean-square prediction error on <code>data/test-4,5,7.csv</code> (held out, never passed to <code>fit()</code>), in Amperes. <strong>Lower is better.</strong> One <code>&lt;channel&gt;_rmse</code> column per channel the model predicts.</td></tr>
+      <tr><td><code>actual_current_r2</code></td><td>R² on the same held-out files (0–1). <strong>Closer to 1 is better.</strong> Measures what fraction of the variance in actual_current the model explains.</td></tr>
     </tbody>
   </table>
+  <p style="font-size:.8rem;color:var(--muted);margin-top:.5rem">Which files count as "held out" is fixed by default (<code>DEFAULT_TRAIN_CSVS</code>/<code>DEFAULT_TEST_CSVS</code> in <code>train_distillation_model.py</code>: train <code>test-1,2,3,6.csv</code>, test <code>test-4,5,7.csv</code>) so rows are comparable across runs — see <code>results/&lt;dt&gt;/log.json</code>'s <code>training.{train_csvs,test_csvs}</code> for the exact files used in any one run, and its <code>held_out_metrics</code>/<code>in_sample_metrics</code> for per-joint detail.</p>
 </div>
 
 <!-- runs_summary_rla.csv -->
