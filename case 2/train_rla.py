@@ -138,7 +138,7 @@ def evaluate(model: DistillModel, metric: EvaluationMetric, frame,
     ``augment`` does, so env reward, run.py, and the saved dataset agree.
     """
     frame = pre.transform_distill(frame)
-    preds, _ = model.predict(frame)
+    preds = model.predict(frame)["mean"]
     for base in model.predicts():
         set_block(frame, base, preds[base])
     frame = pre.revert_distill(frame)

@@ -9,7 +9,7 @@ run without hardware.
 
     fit(recordings)  -> learn from recorded real runs
     predicts()       -> which actual_* channels this model fills in
-    predict(df)      -> (mean, std) of those channels, {channel: (n, N_JOINTS)}
+    predict(df)      -> {"mean": {channel: (n, N_JOINTS)}, "var": ..., ...}
 
 The channels must be the ones the metric reads (metrics.py). ``CNNModel``, the one
 implementation here, is a causal temporal CNN over a whole move.
@@ -61,11 +61,20 @@ class DistillModel(ABC):
         """
 
     @abstractmethod
-    def predict(self, df) -> tuple[dict, dict | None]:
-        """``(mean, std)`` as ``{base: (n, N_JOINTS)}`` for a commanded-trajectory
-        frame (``t``, ``target_q*``, ``target_qd*``) sampled at the training rate.
-        ``std`` is None without a notion of spread; a risk-averse objective can
-        score ``mean + k * std``."""
+    def predict(self, df) -> dict[str, dict]:
+        """What the model says about a commanded-trajectory frame (``t``,
+        ``target_q*``, ``target_qd*``, sampled at the training rate).
+
+        ``{quantity: {base: (n, N_JOINTS)}}``, one inner dict per base in
+        ``predicts()``. Only ``"mean"`` is required; a model with a notion of
+        spread adds variances, which add up rather than needing quadrature:
+
+            mean            the predicted actual_* channel
+            var             total, i.e. var_aleatoric + var_epistemic
+            var_aleatoric   noise the model expects even where it is sure
+            var_epistemic   how much the model itself is unsure
+
+        A risk-averse objective can score ``mean + k * sqrt(var)``."""
 
     def bounds(self):
         """Optional ``((vel_lo, vel_hi), (acc_lo, acc_hi))`` the model trusts.
@@ -112,7 +121,8 @@ class CNNModel(DistillModel):
     Joints and quantities are channels, so the net mixes across them; each target is
     learned as a residual on its commanded twin (``RESIDUAL``). ``members > 1`` makes
     it a deep ensemble, trained jointly; ``predict`` returns the ensemble mean and
-    its std, aleatoric (predicted log-variance) plus epistemic (disagreement).
+    both halves of its variance, aleatoric (the predicted log-variance) and
+    epistemic (the members' disagreement).
     """
 
     def __init__(self, targets=("actual_current",), hidden: int = 48,
@@ -250,14 +260,18 @@ class CNNModel(DistillModel):
             x = standardize(features(df.iloc[sl], self.pad), self.stats)
             with torch.inference_mode():
                 mu, lv = self.forward(torch.from_numpy(x.T[None]).float())
-                # Ensemble mixture: mean of variances + variance of means.
-                std = torch.sqrt(torch.exp(lv).mean(0) + mu.var(0, unbiased=False))
-                out.append((mu.mean(0)[0].T.numpy() * sy + my, std[0].T.numpy() * sy))
-        gap, spread = (np.vstack(v) for v in zip(*out))
+                # Mixture of the members' Gaussians: mean of their variances is the
+                # aleatoric half, the variance of their means the epistemic one.
+                out.append([z[0].T.numpy() for z in
+                            (mu.mean(0), torch.exp(lv).mean(0), mu.var(0, unbiased=False))])
+        gap, ale, epi = (np.vstack(v) for v in zip(*out))
+        gap, ale, epi = gap * sy + my, ale * sy ** 2, epi * sy ** 2   # real units
         cols = lambda k: slice(k * N_JOINTS, (k + 1) * N_JOINTS)
-        return ({b: gap[:, cols(k)] + get_block(df, RESIDUAL[b])
-                 for k, b in enumerate(self.targets)},
-                {b: spread[:, cols(k)] for k, b in enumerate(self.targets)})
+        split = lambda z: {b: z[:, cols(k)] for k, b in enumerate(self.targets)}
+        return {"mean": {b: v + get_block(df, RESIDUAL[b])
+                         for b, v in split(gap).items()},
+                "var": split(ale + epi), "var_aleatoric": split(ale),
+                "var_epistemic": split(epi)}
 
 
 def augment(model: DistillModel, csv: str, pre: Preprocess = None):
@@ -268,7 +282,7 @@ def augment(model: DistillModel, csv: str, pre: Preprocess = None):
     """
     pre = pre or Identity()
     df = pre.transform_distill(pd.read_csv(csv))
-    preds, _ = model.predict(df)
+    preds = model.predict(df)["mean"]
     for base in model.predicts():
         set_block(df, base, preds[base])
     df = pre.revert_distill(df)

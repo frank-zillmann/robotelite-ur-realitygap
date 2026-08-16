@@ -1,11 +1,14 @@
 """Interactive plot of a recorded UR run.
 
-Loads a CSV from ``record.py`` and plots up to three sources of one quantity:
+Loads a CSV from ``record.py`` and plots up to five sources of one quantity:
 
-    target   what the controller commanded  (target_* columns)
-    actual   what the robot measured        (actual_* columns)
-    script   what the URScript alone implies, rebuilt through this repo's own
-             models (``--script``, see ``script_plan``)
+    target          what the controller commanded  (target_* columns)
+    actual          what the robot measured        (actual_* columns)
+    script          what the URScript alone implies, rebuilt through this repo's
+                    own models (``--script``, see ``script_plan``)
+    model(target)   the distilled model's actual_*, from the recorded commands
+    model(script)   the same, from the rebuilt ones (``--model``), each with a
+                    +-1 sd band, aleatoric and with the ensemble's disagreement
 
     python analysis.py --csv data/test-4.csv --script data/test-4.script --quantity "angle q" --joint 1
 
@@ -245,18 +248,56 @@ def script_plan(rec: Recording, script_path: str, payload: float = 0.0,
 
 # --- viewer -------------------------------------------------------------------
 
-def view(rec: Recording, plan: dict = None, quantity: str = "current", joint: int = 1):
-    """Plotly figure comparing target / actual / script for one channel."""
+COLORS = {"target": "#636efa", "actual": "#ef553b", "script": "#00cc96",
+          "model(target)": "#ab63fa", "model(script)": "#ffa15a"}
+_rgba = lambda c, a: f"rgba({int(c[1:3], 16)},{int(c[3:5], 16)},{int(c[5:7], 16)},{a})"
+
+
+def _plan_frame(t, plan: dict):
+    """The rebuilt plan as a commanded-trajectory frame a DistillModel can read."""
+    from utils import set_block
+    df = pd.DataFrame({TIME_COL: t})
+    for base, block in plan.items():
+        set_block(df, base, block)
+    return df
+
+
+def view(rec: Recording, plan: dict = None, quantity: str = "current", joint: int = 1,
+         model=None):
+    """Plotly figure comparing target / actual / script (+ model) for one channel."""
     import plotly.graph_objects as go
 
     t_base, a_base, unit, comps = QUANTITIES[quantity]
     fig = go.Figure()
-    for name, block, dash in (("target", rec.channel(t_base), "solid"),
-                              ("actual", rec.channel(a_base), "solid"),
-                              ("script", (plan or {}).get(t_base), "dash")):
+    for name, block in (("target", rec.channel(t_base)),
+                        ("actual", rec.channel(a_base)),
+                        ("script", (plan or {}).get(t_base))):
         if block is not None:
             fig.add_scattergl(x=rec.t, y=block[:, joint], name=name,
-                              line=dict(dash=dash, width=1.5))
+                              line=dict(color=COLORS[name], width=1.5))
+
+    # The distilled model run on the recorded commands and on the script's rebuilt
+    # ones: both predict the actual channel, so they belong next to "actual".
+    for name, df in (("model(target)", rec.df),
+                     ("model(script)", _plan_frame(rec.t, plan) if plan else None)):
+        if df is None or model is None or a_base not in model.predicts():
+            continue
+        p = model.predict(df)
+        mean, colour = p["mean"][a_base][:, joint], COLORS[name]
+        # Widest band first so the narrower one occludes it: the model's own noise
+        # inside, the ensemble's disagreement added on top.
+        for key, alpha, tag in (("var", 0.12, "+epistemic"),
+                                ("var_aleatoric", 0.22, "aleatoric")):
+            if key in p:
+                half = np.sqrt(p[key][a_base][:, joint])
+                fig.add_scattergl(x=np.concatenate([rec.t, rec.t[::-1]]),
+                                  y=np.concatenate([mean + half, (mean - half)[::-1]]),
+                                  fill="toself", fillcolor=_rgba(colour, alpha),
+                                  line=dict(width=0), hoverinfo="skip",
+                                  name=f"{name} +-1sd {tag}")
+        fig.add_scattergl(x=rec.t, y=mean, name=name,
+                          line=dict(color=colour, width=1.5))
+
     fig.update_layout(title=f"{rec.path} - {quantity} - {comps[joint]}",
                       xaxis_title="time [s]", yaxis_title=f"{quantity} [{unit}]",
                       hovermode="x unified", template="plotly_white")
@@ -278,12 +319,19 @@ def main():
     ap.add_argument("--fit-duration", action="store_true",
                     help="re-time each rebuilt move to end when the recorded one "
                          "did, hiding dynamics.py's duration error")
+    ap.add_argument("--model", default=None,
+                    help="distilled model pickle; adds its prediction (with an "
+                         "uncertainty band) for the recorded and the rebuilt commands")
     args = ap.parse_args()
 
     rec = Recording(args.csv)
     plan = (script_plan(rec, args.script, args.payload, args.fit_duration)
             if args.script else {})
-    view(rec, plan, args.quantity, args.joint).show()
+    model = None
+    if args.model:
+        from train_distillation_model import DistillModel      # pulls in torch
+        model = DistillModel.load(args.model)
+    view(rec, plan, args.quantity, args.joint, model).show()
 
 
 if __name__ == "__main__":

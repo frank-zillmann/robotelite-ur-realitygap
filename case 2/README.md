@@ -62,6 +62,9 @@ python analysis.py --csv optimized.csv --joint 0 --quantity current
 # 6. inspect the training data and also see what the script implies rebuilt through dynamics.py
 python analysis.py --csv data/test-1.csv --script data/test-1.script --joint 0 --quantity current
 
+# 6b. add the distilled model's prediction (+-1 sd band) for both command sources
+python analysis.py --csv data/test-1.csv --script data/test-1.script --model models/distill.pkl
+
 # note: you might notice something is off. Is the pipeline not finished?
 ```
 
@@ -81,7 +84,7 @@ distillation.
 |------|------|
 | `record.py` | passive RTDE logger: stream robot state to a CSV, never moves the robot |
 | `send.py` | send a URScript (or a `servoj` path) to the robot, run it, record it |
-| `analysis.py` | `Recording` (shared CSV loader) + a plotly target/actual/script viewer |
+| `analysis.py` | `Recording` (shared CSV loader) + a plotly target/actual/script/model viewer |
 | `common.py` | `segments`: split a recording into moves, plus the shared data prep (`features`, `blocks`, and the torch `MoveDataset`/`loaders`) |
 | `dynamics.py` | `Dynamics` interface + `UR10eDynamics`: candidate target torque/current |
 | `train_distillation_model.py` | `DistillModel` interface + `CNNModel`: predict the actual channels |
@@ -108,9 +111,10 @@ actuals, `EvaluationMetric` scores them.
 - **`DistillModel`** (`train_distillation_model.py`): `CNNModel`, a causal
   dilated-convolution net over the last ~1 s of the commanded trajectory,
   predicting the gap `actual - target` for all six joints at once, with a per-row
-  uncertainty (`predict` returns `(mean, std)`). It is a sequence model because
-  the gap is dynamic — the ring-down after a stop is invisible to any per-row
-  model. `CNNModel(targets=("actual_q",))` switches the channel (write the
+  uncertainty (`predict` returns `{"mean", "var", "var_aleatoric",
+  "var_epistemic"}`, each `{channel: (n, N_JOINTS)}`). It is a sequence model
+  because the gap is dynamic — the ring-down after a stop is invisible to any
+  per-row model. `CNNModel(targets=("actual_q",))` switches the channel (write the
   matching metric too); `members=K` makes it an ensemble. Its data comes from
   `common.loaders`, so a different architecture only has to bring its own network
   and training loop.
