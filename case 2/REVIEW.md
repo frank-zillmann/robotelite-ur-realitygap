@@ -228,6 +228,109 @@ What this loop misses (dropped Coriolis, generic dynamics params,
 resulting recording) is covered where it's actionable, in §5-§6 — not
 repeated here.
 
+### There is no real-time inference anywhere in this pipeline
+
+Worth stating plainly, since it's easy to assume "RL agent" implies the
+agent runs live alongside the robot: it never does. Two separate facts in
+this doc combine to establish that:
+
+- §4 step 3 above: `GapEnv`/`PathEnv` are one-step contextual bandits —
+  `reset()` samples a move, `step(action)` scores it once, episode over.
+  There's no multi-step sequence, no delayed reward, nothing for PPO's
+  credit-assignment machinery (advantage estimation, discounting) to
+  actually do that a direct optimizer wouldn't also do.
+- This section: `search_agent`/`agent_paths` (`run.py:59-63`, `106-109`)
+  call `agent.predict()` a handful of times — once per move in the one
+  script being optimized — entirely inside `run.py`, before the robot ever
+  moves. The result is baked into a static file (`.optimized.script` or
+  `.path`). `send.py` then just streams that finished file to the
+  controller; it never imports `stable_baselines3` or calls `predict()`.
+  The robot executes a normal URScript/servoj stream, indistinguishable
+  from one a human had hand-written.
+
+So PPO's entire job is: run inference a few times on a laptop to produce a
+better static trajectory file, then get out of the way. Given both facts
+together, the strongest justification for PPO here isn't sequential
+decision-making (there isn't any) — it's **amortization**: one trained
+policy answers "good `(vel, acc)` for any move" in one forward pass,
+including moves outside the current script, instead of re-running a
+black-box optimizer (CMA-ES, Bayesian optimization, even grid search) from
+scratch per move. But since `run.py` only ever queries the policy for the
+moves in the one script it's optimizing, that generalization property is
+barely exercised in practice — a direct per-move optimizer over the same
+`GapEnv._cost`/`score` objective (2-3 continuous parameters, a cheap
+deterministic numpy evaluation) would likely be simpler and converge at
+least as reliably, at the cost of re-optimizing per move instead of once
+at training time.
+
+### Why `run.py` averages `vel`/`acc` across moves
+
+`search_agent` (`run.py:59-63`) genuinely asks the agent for a *different*
+`(vel, acc)` per move — each move has its own observation (`observe()`,
+`train_rla.py:103-117`), so each gets its own predicted action. The
+averaging that follows isn't a modeling choice, it's forced by the output
+format: a script like `triangle.script` sets `vel`/`acc` **once**
+(`triangle.script:12-13`, `vel = 999` / `acc = 999`) and every `movej` in
+the file — all four corner-to-corner moves — reuses those same two
+variables. `utils.get_param`/`set_param` (`utils.py:240-250`) read/write
+exactly that single assignment via regex; there is no per-move slot to
+write a per-move answer into. Averaging the agent's N per-move opinions
+into one number is how `run_params` collapses them to fit the one slot the
+script format has.
+
+**Path mode doesn't have this problem.** `run_path`/`build_full_path`
+(`run.py:120-137`) never averages anything — each move keeps its own
+`(accel_frac, decel_frac, dt)` plan, written into its own block of rows in
+the output CSV. The constraint that forces params-mode averaging is
+specific to `movej` scripts having one shared `vel`/`acc`, not to the
+agent or the optimization method.
+
+### `movej` vs `servoj`: who decides the trajectory
+
+Both are URScript motion primitives, but they split the planning work
+between Python and the controller in opposite ways.
+
+**`movej` (params mode)** hands the controller a destination pose plus two
+scalar limits (`v`, `a`) and nothing else. The controller's own onboard
+trajectory planner decides every intermediate joint angle, sample by
+sample, at its own real-time control rate — a trapezoidal speed profile
+bounded by those two limits, entirely inside the controller's firmware.
+Python never sees or influences an intermediate point; the only lever it
+has is the two numbers. `dynamics.trapezoidal()` (`dynamics.py:51-74`) is
+**this repo's own model** of what that onboard planner does — used so
+`GapEnv` can score a hypothetical `(vel, acc)` offline without ever
+running it — not the controller's actual behavior; `duration_range_by_file`
+in `bronze_exploration.py`'s `log.json` (§Bronze) shows the real controller
+already diverges from this trapezoidal assumption over the swept
+vel/acc range (move duration barely changes, ratio ~1.0-1.35), i.e. the
+model and the firmware disagree.
+
+**`servoj` (path mode)** inverts this. `run.py`'s `build_full_path()`
+(`run.py:120-137`) computes the entire trajectory in Python ahead of
+time — every joint-angle setpoint, at the recorded resolution, re-timed by
+the agent's chosen speed shape (`speed_profile`, `train_rla.py:120-138`) —
+and writes it to a dense CSV. `send.py`'s `wrap_path()` (`send.py:104-126`)
+turns each row into one call:
+
+```
+servoj([q0..q5], 0, 0, dt, SERVO_LOOKAHEAD, SERVO_GAIN)
+```
+
+streamed back to back. `servoj` doesn't plan anything — it servos the
+joints toward that one setpoint over `dt` seconds with a fixed tracking
+gain (`SERVO_GAIN = 300`) and a short lookahead (`SERVO_LOOKAHEAD = 0.1s`,
+`send.py:49-50`) to smooth into the next setpoint. The controller's role
+shrinks from "plan a trajectory" to "track wherever you're pointed at,
+right now" — the trajectory shape *and* timing are decided entirely
+offline, before the robot moves at all.
+
+| | `movej` (params mode) | `servoj` (path mode) |
+|---|---|---|
+| Computed by Python | one shared `(vel, acc)` for the whole script | every joint setpoint, every move, at recording resolution |
+| Decided by the controller | the entire intermediate trajectory, live, from its own planner | nothing — tracks each incoming setpoint |
+| Per-move granularity | no — hence the averaging above | yes — each move keeps its own timing plan |
+| Output file | `<script>.optimized.script` (same file, `vel`/`acc` lines rewritten) | `<script>.path` (new CSV of dense setpoints) |
+
 ## 5. Findings from actually running it this session
 
 - **Git LFS pointers, not data** — one-time env fix, not a pipeline bug.
