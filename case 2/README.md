@@ -40,7 +40,8 @@ pip install -r requirements.txt
 Distill once, then either mode reuses the model.
 
 ```bash
-# 1. distill the gap model (trained and validated on the CSVs in data/)
+# 1. distill the gap model (trained and validated on the CSVs in data/;
+#    losses, errors and calibration go to runs/, watch with `tensorboard --logdir runs`)
 python train_distillation_model.py --out models/distill.pkl
 
 # 2. train the RL agent on several scripts (--loop repeats each for more moves)
@@ -81,7 +82,7 @@ distillation.
 | `record.py` | passive RTDE logger: stream robot state to a CSV, never moves the robot |
 | `send.py` | send a URScript (or a `servoj` path) to the robot, run it, record it |
 | `analysis.py` | `Recording` (shared CSV loader) + a plotly target/actual/script viewer |
-| `common.py` | `segments`: split a recording into moves, plus the shared data prep (`moves`, `features`, `blocks`, and the torch `MoveDataset`/`loaders`) |
+| `common.py` | `segments`: split a recording into moves, plus the shared data prep (`features`, `blocks`, and the torch `MoveDataset`/`loaders`) |
 | `dynamics.py` | `Dynamics` interface + `UR10eDynamics`: candidate target torque/current |
 | `train_distillation_model.py` | `DistillModel` interface + `CNNModel`: predict the actual channels |
 | `metrics.py` | `EvaluationMetric` interface + `CurrentGapMetric`: the per-row `score` to minimize |

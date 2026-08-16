@@ -304,11 +304,17 @@ class PathEnv(_MoveEnv):
         return accel_frac, decel_frac, dt
 
     def score(self, move, accel_frac, decel_frac, dt) -> tuple[float, float]:
-        """(max per-row score, cycle_time) for a re-timed path of ``move``."""
-        s = speed_profile(accel_frac, decel_frac, PATH_ROWS)
+        """(max per-row score, cycle_time) for a re-timed path of ``move``.
+
+        The motion lasts ``PATH_ROWS * dt`` whatever the servoj step is, but it is
+        sampled for scoring at the recording's step: DistillModel is a temporal
+        filter and only holds at the rate it was trained on.
+        """
+        cycle = PATH_ROWS * dt
+        s = speed_profile(accel_frac, decel_frac, max(2, round(cycle / self.rec.dt)))
         vel = float(move.vel) if move.vel is not None else 0.0
         acc = float(move.acc) if move.acc is not None else 0.0
-        return float(self._candidate(move, s, dt, vel, acc).max()), PATH_ROWS * dt
+        return float(self._candidate(move, s, self.rec.dt, vel, acc).max()), cycle
 
     def baseline(self, move) -> tuple[float, float]:
         """(max per-row score, cycle_time) for the recorded motion, its own timing.
