@@ -1,0 +1,128 @@
+{
+  "TCP speed (linear)": [
+    {
+      "component": "x",
+      "unit": "m/s",
+      "max_gap_display": 0.35613500000000003,
+      "rms_gap_display": 0.00681394653241214,
+      "pct_max_of_full_scale": 12.076053007340205,
+      "pct_rms_of_full_scale": 0.23105165039827869,
+      "source_file": "test-6",
+      "row_index": 884
+    },
+    {
+      "component": "y",
+      "unit": "m/s",
+      "max_gap_display": 0.631491,
+      "rms_gap_display": 0.010405996818862095,
+      "pct_max_of_full_scale": 21.413000097317795,
+      "pct_rms_of_full_scale": 0.35285318538978816,
+      "source_file": "test-6",
+      "row_index": 178265
+    },
+    {
+      "component": "z",
+      "unit": "m/s",
+      "max_gap_display": 0.659913,
+      "rms_gap_display": 0.034850050718518925,
+      "pct_max_of_full_scale": 22.37675142356942,
+      "pct_rms_of_full_scale": 1.1817177749598582,
+      "source_file": "test-6",
+      "row_index": 178258
+    }
+  ],
+  "TCP speed (angular)": [
+    {
+      "component": "rx",
+      "unit": "deg/s",
+      "max_gap_display": 57.571773282996844,
+      "rms_gap_display": 1.5678927587457179,
+      "pct_max_of_full_scale": 12.623178492216486,
+      "pct_rms_of_full_scale": 0.3437759343109585,
+      "source_file": "test-6",
+      "row_index": 178258
+    },
+    {
+      "component": "ry",
+      "unit": "deg/s",
+      "max_gap_display": 23.229886254225068,
+      "rms_gap_display": 1.1854303488074476,
+      "pct_max_of_full_scale": 5.093381423211657,
+      "pct_rms_of_full_scale": 0.2599172828936689,
+      "source_file": "test-6",
+      "row_index": 178258
+    },
+    {
+      "component": "rz",
+      "unit": "deg/s",
+      "max_gap_display": 7.882524162291812,
+      "rms_gap_display": 0.29773596439045735,
+      "pct_max_of_full_scale": 1.7283210815951313,
+      "pct_rms_of_full_scale": 0.0652815435018561,
+      "source_file": "test-6",
+      "row_index": 178266
+    }
+  ],
+  "qd (joint velocity)": [
+    {
+      "component": "base",
+      "unit": "deg/s",
+      "max_gap_display": 8.12872412685953,
+      "rms_gap_display": 0.2904356375836712,
+      "pct_max_of_full_scale": 2.532244516798991,
+      "pct_rms_of_full_scale": 0.09047595161018307,
+      "source_file": "test-6",
+      "row_index": 178266
+    },
+    {
+      "component": "shoulder",
+      "unit": "deg/s",
+      "max_gap_display": 34.966983983259496,
+      "rms_gap_display": 1.443378085385585,
+      "pct_max_of_full_scale": 10.892847644814301,
+      "pct_rms_of_full_scale": 0.449638367023479,
+      "source_file": "test-6",
+      "row_index": 178264
+    },
+    {
+      "component": "elbow",
+      "unit": "deg/s",
+      "max_gap_display": 30.985385673336385,
+      "rms_gap_display": 0.6051514516929805,
+      "pct_max_of_full_scale": 9.652507791837376,
+      "pct_rms_of_full_scale": 0.18851561714575335,
+      "source_file": "test-6",
+      "row_index": 178258
+    },
+    {
+      "component": "wrist1",
+      "unit": "deg/s",
+      "max_gap_display": 7.9670927328531205,
+      "rms_gap_display": 0.36057011457375293,
+      "pct_max_of_full_scale": 2.4818934155895285,
+      "pct_rms_of_full_scale": 0.1123241090854587,
+      "source_file": "test-6",
+      "row_index": 69014
+    },
+    {
+      "component": "wrist2",
+      "unit": "deg/s",
+      "max_gap_display": 2.633657801098346,
+      "rms_gap_display": 0.1358587176463839,
+      "pct_max_of_full_scale": 0.8204320163750859,
+      "pct_rms_of_full_scale": 0.042322446604213936,
+      "source_file": "test-7",
+      "row_index": 5012
+    },
+    {
+      "component": "wrist3",
+      "unit": "deg/s",
+      "max_gap_display": 0.5912351487954962,
+      "rms_gap_display": 0.03846333688984614,
+      "pct_max_of_full_scale": 0.18418043721390803,
+      "pct_rms_of_full_scale": 0.011982024782373129,
+      "source_file": "test-6",
+      "row_index": 59250
+    }
+  ]
+}
