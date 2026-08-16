@@ -23,7 +23,8 @@ from __future__ import annotations
 import numpy as np
 
 from common import segments
-from utils import JOINT_NAMES, N_JOINTS, get_block
+from preprocess import default_preprocess
+from utils import JOINT_NAMES, N_JOINTS, get_block, set_block
 
 SETTLE_TOL = 0.01   # rad: a joint counts as "settled" once |actual - dest| stays under this
 
@@ -89,17 +90,29 @@ def per_run_metrics(rec) -> dict:
     return out
 
 
-def reality_gap_error(model, recordings) -> dict:
+def reality_gap_error(model, recordings, pre=None) -> dict:
     """RMSE/R2 of ``model``'s predicted ``actual_*`` channels against the real
     recorded ones, over every joint of every recording -- whether the distilled
     model predicts the real robot, not just how well it fit its own training rows.
+
+    ``pre`` (a preprocess.Preprocess, default ``default_preprocess()``) is applied
+    the same way ``augment`` uses it: ``transform_distill`` before ``predict``,
+    ``revert_distill`` after, so predictions land back in the real units the
+    recorded ``actual_*`` columns are already in. Matters once ``pre`` stops being
+    a no-op; harmless (an identity round trip) while it still is.
     """
+    pre = pre or default_preprocess()
     err, y = [], []
     for rec in recordings:
-        preds = model.predict(rec.df)
+        transformed = pre.transform_distill(rec.df)
+        preds = model.predict(transformed)
         for base in model.predicts():
+            pred_df = transformed.copy()
+            set_block(pred_df, base, preds[base])
+            pred_df = pre.revert_distill(pred_df)
+            predicted = get_block(pred_df, base)
             actual = get_block(rec.df, base)
-            err.append((preds[base] - actual).ravel())
+            err.append((predicted - actual).ravel())
             y.append(actual.ravel())
     err, y = np.concatenate(err), np.concatenate(y)
     rmse = float(np.sqrt(np.mean(err ** 2)))

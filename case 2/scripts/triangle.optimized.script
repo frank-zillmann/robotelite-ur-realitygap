@@ -10,7 +10,7 @@
 # URScript does not allow a `global` declaration inside a loop.
 
 vel = 180
-acc = 497
+acc = 546
 
 # Three corners of the triangle [rad]; the cycle is C1 -> C2 -> C3 -> C1.
 CORNER_1 = [ 0.0, -1.4, 1.4, -1.57, -1.57, 0.0]
