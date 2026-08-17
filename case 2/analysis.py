@@ -8,9 +8,12 @@ Loads a CSV from ``record.py`` and plots up to five sources of one quantity:
                     own models (``--script``, see ``script_plan``)
     model(target)   the distilled model's actual_*, from the recorded commands
     model(script)   the same, from the rebuilt ones (``--model``), each with a
-                    +-1 sd band, aleatoric and with the ensemble's disagreement
+                    band of ``--sd-factor`` standard deviations, aleatoric and
+                    with the ensemble's disagreement added
 
-    python analysis.py --csv data/test-4.csv --script data/test-4.script --quantity "angle q" --joint 1
+    python analysis.py --csv data/test-4.csv --script data/test-4.script --model models/distill.pkl --joint 1
+
+Only the first ``--max-points`` rows are plotted, at the recording's full rate.
 
 ``--joint`` picks the component, which is a joint (0..5 = base..wrist3) for the
 per-joint quantities and a Cartesian axis (0..5 = x, y, z, rx, ry, rz) for the
@@ -263,17 +266,23 @@ def _plan_frame(t, plan: dict):
 
 
 def view(rec: Recording, plan: dict = None, quantity: str = "current", joint: int = 1,
-         model=None):
-    """Plotly figure comparing target / actual / script (+ model) for one channel."""
+         model=None, sd_factor: float = 1.0, max_points: int = 5000):
+    """Plotly figure comparing target / actual / script (+ model) for one channel.
+
+    Only the first ``max_points`` rows are shown, at the recording's full rate: a
+    run is ~174k rows, and every trace of it makes a page the browser chokes on.
+    """
     import plotly.graph_objects as go
 
     t_base, a_base, unit, comps = QUANTITIES[quantity]
+    keep = slice(None, max_points)
+    t = rec.t[keep]
     fig = go.Figure()
     for name, block in (("target", rec.channel(t_base)),
                         ("actual", rec.channel(a_base)),
                         ("script", (plan or {}).get(t_base))):
         if block is not None:
-            fig.add_scattergl(x=rec.t, y=block[:, joint], name=name,
+            fig.add_scattergl(x=t, y=block[keep, joint], name=name,
                               line=dict(color=COLORS[name], width=1.5))
 
     # The distilled model run on the recorded commands and on the script's rebuilt
@@ -282,20 +291,22 @@ def view(rec: Recording, plan: dict = None, quantity: str = "current", joint: in
                      ("model(script)", _plan_frame(rec.t, plan) if plan else None)):
         if df is None or model is None or a_base not in model.predicts():
             continue
-        p = model.predict(df)
+        # Predicting the shown rows only is exact, not an approximation: the model
+        # is causal, so row t never depends on a row after it.
+        p = model.predict(df.iloc[keep])
         mean, colour = p["mean"][a_base][:, joint], COLORS[name]
         # Widest band first so the narrower one occludes it: the model's own noise
         # inside, the ensemble's disagreement added on top.
         for key, alpha, tag in (("var", 0.12, "+epistemic"),
                                 ("var_aleatoric", 0.22, "aleatoric")):
             if key in p:
-                half = np.sqrt(p[key][a_base][:, joint])
-                fig.add_scattergl(x=np.concatenate([rec.t, rec.t[::-1]]),
+                half = sd_factor * np.sqrt(p[key][a_base][:, joint])
+                fig.add_scattergl(x=np.concatenate([t, t[::-1]]),
                                   y=np.concatenate([mean + half, (mean - half)[::-1]]),
                                   fill="toself", fillcolor=_rgba(colour, alpha),
                                   line=dict(width=0), hoverinfo="skip",
-                                  name=f"{name} +-1sd {tag}")
-        fig.add_scattergl(x=rec.t, y=mean, name=name,
+                                  name=f"{name} +-{sd_factor:g}sd {tag}")
+        fig.add_scattergl(x=t, y=mean, name=name,
                           line=dict(color=colour, width=1.5))
 
     fig.update_layout(title=f"{rec.path} - {quantity} - {comps[joint]}",
@@ -322,6 +333,11 @@ def main():
     ap.add_argument("--model", default=None,
                     help="distilled model pickle; adds its prediction (with an "
                          "uncertainty band) for the recorded and the rebuilt commands")
+    ap.add_argument("--sd-factor", type=float, default=1.0,
+                    help="width of the uncertainty bands, in standard deviations")
+    ap.add_argument("--max-points", type=int, default=10000,
+                    help="rows drawn per trace, from the start of the run; the page "
+                         "grows by ~0.2 MB per 1000 rows and trace")
     args = ap.parse_args()
 
     rec = Recording(args.csv)
@@ -331,7 +347,8 @@ def main():
     if args.model:
         from train_distillation_model import DistillModel      # pulls in torch
         model = DistillModel.load(args.model)
-    view(rec, plan, args.quantity, args.joint, model).show()
+    view(rec, plan, args.quantity, args.joint, model, args.sd_factor,
+         args.max_points).show()
 
 
 if __name__ == "__main__":
