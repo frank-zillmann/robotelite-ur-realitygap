@@ -9,7 +9,7 @@ the RL stages so both cut a recording the same way:
 The rest is the data preparation the distilled models share, so a new architecture
 only has to bring its own network and training loop:
 
-    train, val = loaders(recordings, targets=("actual_current",), pad=127)
+    train, val = loaders(recordings, targets=("actual_q",), pad=127)
     for xb, yb, mask in train:   # (b, N_FEAT, pad+n), (b, n_out, n), (b, n)
         ...
 """
@@ -27,7 +27,7 @@ from utils import N_JOINTS, SCRIPT_COL, frame_dt, get_block
 SETTLE_S = 1.0             # settle kept after a move ends; the rest of a pause is idle
 
 # Each channel is learned as ``actual - target``, the gap itself: more accurate than
-# predicting the channel outright, and CurrentGapMetric is |actual - target|, so the
+# predicting the channel outright, and GapMetric is |actual - target|, so the
 # score reduces to |predicted gap|, independent of dynamics.py.
 RESIDUAL = {"actual_current": "target_current", "actual_q": "target_q",
             "actual_qd": "target_qd"}
@@ -153,7 +153,7 @@ class MoveDataset(Dataset):
     leading ``pad`` rows are the network's warm-up.
     """
 
-    def __init__(self, recordings, targets=("actual_current",), pad: int = 0):
+    def __init__(self, recordings, targets=("actual_q",), pad: int = 0):
         self.moves = [(rec, s) for rec in recordings for s in segments(rec)]
         seqs = []
         for rec, s in self.moves:
@@ -190,7 +190,7 @@ def collate(batch):
             torch.stack([fill(torch.ones(y.shape[1]), y.shape[1]) for _, y in batch]))
 
 
-def loaders(recordings, targets=("actual_current",), pad: int = 0, batch: int = 16,
+def loaders(recordings, targets=("actual_q",), pad: int = 0, batch: int = 16,
             val_frac: float = 0.2, seed: int = 0):
     """``(train, val)`` DataLoader over whole moves of ``recordings``.
 

@@ -16,7 +16,7 @@ implementation here, is a causal temporal CNN over a whole move.
 
     m = CNNModel().fit([Recording("data/test-4.csv"), Recording("data/test-6.csv")])
     m.save("models/distill.pkl")
-    augment(m, "sim_to_real.csv")         # overwrite actual_current with predictions
+    augment(m, "sim_to_real.csv")         # overwrite actual_q with predictions
 
 As a script: train on every run in ``data/``, log to ``runs/``, save the pickle.
 
@@ -54,7 +54,7 @@ class DistillModel(ABC):
 
     @abstractmethod
     def predicts(self) -> list[str]:
-        """Per-joint channel bases this model predicts, e.g. ``["actual_current"]``.
+        """Per-joint channel bases this model predicts, e.g. ``["actual_q"]``.
 
         These are the ``actual_*`` columns ``predict`` returns and ``augment``
         overwrites in the recording.
@@ -125,7 +125,7 @@ class CNNModel(DistillModel):
     epistemic (the members' disagreement).
     """
 
-    def __init__(self, targets=("actual_current",), hidden: int = 48,
+    def __init__(self, targets=("actual_q",), hidden: int = 48,
                  dilations=(1, 2, 4, 8, 16, 32), kernel: int = 3, members: int = 3,
                  epochs: int = 50, batch: int = 16, lr: float = 3e-3,
                  val_frac: float = 0.2, seed: int = 0):

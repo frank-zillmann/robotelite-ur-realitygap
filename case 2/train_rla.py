@@ -42,7 +42,7 @@ from common import segments
 from dynamics import (DEG2RAD, GRID, MAX_JOINT_ACC, MAX_JOINT_SPEED, Dynamics,
                       default_dynamics, trapezoidal)
 from train_distillation_model import DistillModel, augment
-from metrics import CurrentGapMetric, EvaluationMetric, SCORE_COL, add_score
+from metrics import GapMetric, EvaluationMetric, SCORE_COL, add_score
 from preprocess import Identity, Preprocess, default_preprocess
 from utils import ACC_COL, N_JOINTS, SCRIPT_COL, VEL_COL, get_block, set_block
 
@@ -378,7 +378,7 @@ def main():
     out = args.out or f"models/agent_{args.mode}.zip"
 
     model = DistillModel.load(args.model)
-    metric = CurrentGapMetric()
+    metric = GapMetric()
     pre = default_preprocess()
     rec = build_dataset(model, metric, args.scripts, args.robot_ip, args.loop, pre)
     dyn = default_dynamics(rec)

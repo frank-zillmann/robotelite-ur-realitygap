@@ -265,7 +265,7 @@ def _plan_frame(t, plan: dict):
     return df
 
 
-def view(rec: Recording, plan: dict = None, quantity: str = "current", joint: int = 1,
+def view(rec: Recording, plan: dict = None, quantity: str = "angle q", joint: int = 1,
          model=None, sd_factor: float = 1.0, max_points: int = 5000):
     """Plotly figure comparing target / actual / script (+ model) for one channel.
 
@@ -320,7 +320,7 @@ def main():
     ap.add_argument("--csv", default="data/test-4.csv", help="recorded run CSV")
     ap.add_argument("--script", default=None,
                     help="URScript of the run; adds the rebuilt plan as a third trace")
-    ap.add_argument("--quantity", choices=list(QUANTITIES), default="current",
+    ap.add_argument("--quantity", choices=list(QUANTITIES), default="angle q",
                     help="which channel to plot")
     ap.add_argument("--joint", type=int, default=1, choices=range(N_JOINTS),
                     help="component 0..5: a joint (base..wrist3), or a Cartesian "
