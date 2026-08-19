@@ -14,7 +14,7 @@ metric scores them. One step per episode (a contextual bandit): reset returns a
 move, step scores the candidate.
 
     observation : the move + its baseline (built in `observe`)
-    action      : params -> [vel, acc] (deg/s); path -> [accel_frac, decel_frac, speed]
+    action      : params -> [vel, acc] (rad/s, rad/s^2); path -> [accel_frac, decel_frac, speed]
     reward      : -OBJECTIVE(score, cycle_time)
 
 Modes (``--mode``, saved as ``models/agent_<mode>.zip``):
@@ -39,7 +39,7 @@ from stable_baselines3 import PPO
 
 from analysis import Recording
 from common import segments
-from dynamics import (DEG2RAD, GRID, MAX_JOINT_ACC, MAX_JOINT_SPEED, Dynamics,
+from dynamics import (GRID, MAX_JOINT_ACC, MAX_JOINT_SPEED, Dynamics,
                       default_dynamics, trapezoidal)
 from train_distillation_model import DistillModel, augment
 from metrics import CurrentGapMetric, EvaluationMetric, SCORE_COL, add_score
@@ -49,10 +49,11 @@ from utils import ACC_COL, N_JOINTS, SCRIPT_COL, VEL_COL, get_block, set_block
 # Training-data file (sim targets + predicted actuals + score label).
 SIM_TO_REAL = "sim_to_real.csv"
 
-# Action bounds in the URScript units (deg/s, deg/s^2). A movej speed above the
-# joint limit (~180 deg/s = pi rad/s) clamps, so the useful range stays below it.
-VEL_BOUNDS = (20.0, 180.0)
-ACC_BOUNDS = (40.0, 600.0)
+# Action bounds in the URScript units (rad/s, rad/s^2) -- movej's a/v natively.
+# A movej speed above the joint limit (MAX_JOINT_SPEED, pi rad/s) clamps, so the
+# useful range stays below it.
+VEL_BOUNDS = (0.1, 2.0)
+ACC_BOUNDS = (0.2, 4.0)
 
 # --- objective the optimizer minimizes ---------------------------------------
 # Cost of one move, weighting the metric ``score`` against ``cycle_time`` (move
@@ -212,14 +213,14 @@ class _MoveEnv(gym.Env):
         u = np.linspace(0.0, 1.0, len(g))
         return np.column_stack([np.interp(s, u, g[:, j]) for j in range(N_JOINTS)])
 
-    def _candidate(self, move, s, dt, vel_deg, acc_deg):
+    def _candidate(self, move, s, dt, vel, acc):
         """Per-row score of the candidate whose progress is ``s(t)`` at step ``dt``.
 
         Places the move's geometry at the given progress, asks ``dynamics`` for the
         commanded frame, and scores it through the model and metric.
         """
         q = self._q_at(move, s)
-        frame = self.dyn.frame(q, dt, vel_deg, acc_deg, s=s, key=move.i0)
+        frame = self.dyn.frame(q, dt, vel, acc, s=s, key=move.i0)
         return evaluate(self.model, self.metric, frame, self.pre)
 
     def reset(self, *, seed=None, options=None):
@@ -252,20 +253,20 @@ class GapEnv(_MoveEnv):
         return start + np.linspace(0.0, 1.0, GRID)[:, None] * travel
 
     def _unmap(self, action) -> tuple[float, float]:
-        """Map a normalized action in [-1,1]^2 to (vel, acc) in deg/s, deg/s^2."""
+        """Map a normalized action in [-1,1]^2 to (vel, acc) in rad/s, rad/s^2."""
         a = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
         vel = VEL_BOUNDS[0] + (a[0] + 1) / 2 * (VEL_BOUNDS[1] - VEL_BOUNDS[0])
         acc = ACC_BOUNDS[0] + (a[1] + 1) / 2 * (ACC_BOUNDS[1] - ACC_BOUNDS[0])
         return float(vel), float(acc)
 
-    def score(self, move, vel_deg, acc_deg) -> tuple[float, float]:
-        """(score, cycle_time) for a movej of ``move`` at vel/acc in deg/s."""
+    def score(self, move, vel, acc) -> tuple[float, float]:
+        """(score, cycle_time) for a movej of ``move`` at vel/acc in rad/s, rad/s^2."""
         _, _, distance = move_line(self.rec, move)
-        vel = min(vel_deg * DEG2RAD, MAX_JOINT_SPEED)
-        acc = min(acc_deg * DEG2RAD, MAX_JOINT_ACC)
+        vel = min(vel, MAX_JOINT_SPEED)
+        acc = min(acc, MAX_JOINT_ACC)
         dt = self.rec.dt
         s = trapezoidal(distance, vel, acc, dt)
-        return float(_aggregate(self._candidate(move, s, dt, vel_deg, acc_deg))), len(s) * dt
+        return float(_aggregate(self._candidate(move, s, dt, vel, acc))), len(s) * dt
 
     def _cost(self, move, action) -> tuple[float, float, float]:
         score, cycle = self.score(move, *self._unmap(action))

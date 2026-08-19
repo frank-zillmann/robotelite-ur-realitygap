@@ -1,0 +1,27 @@
+# T05 elbow_pump - one cycle: the elbow flexes between two poses and back.
+#
+# Isolates joint 2 (elbow): base, shoulder and both wrists stay fixed, only the
+# elbow moves. Widened from the original 0.9-1.6 rad down to 0.6, so this also
+# touches the straighter-arm/longer-reach region T08 covers more fully -- while
+# staying isolated to one joint. Analyze it with --joint 2.
+#
+# SAFETY: the 0.6 rad end is straighter (more reach) than any previously-used
+# elbow angle -- verify clearance before running on real hardware.
+#
+# Edit vel and acc below (rad/s, rad/s^2), then run it with send.py (--loop N
+# repeats the cycle). Plain assignments (no `global`): send.py wraps this in a
+# repeat loop, and URScript does not allow a `global` declaration inside a loop.
+
+vel = 0.6
+acc = 1.2
+
+# Two joint poses [rad]; the elbow swings between them.
+POSE_A = [0.0, -1.2, 0.6, -1.5708, -1.5708, 0.0]
+POSE_B = [0.0, -1.2, 1.6, -1.5708, -1.5708, 0.0]
+
+write_output_float_register(1, vel)
+write_output_float_register(2, acc)
+movej(POSE_A, a=acc, v=vel)
+sleep(0.8)
+movej(POSE_B, a=acc, v=vel)
+sleep(0.8)

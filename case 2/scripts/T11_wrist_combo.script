@@ -1,0 +1,36 @@
+# T11 wrist_combo - one cycle: wrist1, wrist2 AND wrist3 all move together.
+#
+# Fills a gap in the trainable set: T06 combines wrist1+wrist2, T07 isolates
+# wrist3 alone, but nothing T01-T08 moves wrist3 *together with* another
+# joint -- that combination only showed up in the held-out T10 (which also
+# moves base/shoulder/elbow at the same time, so it's confounded with reach).
+# This isolates the wrist-only interaction: base/shoulder/elbow stay fixed at
+# the same neutral pose T06/T10 use, only the three wrist joints move.
+#
+# Each individual joint's range here is reused from an already-run script --
+# wrist1/wrist2 -1.9/-1.2 rad from T06, wrist3 0/1.5708 rad from T07 -- so the
+# only new thing is moving them simultaneously, not a new pose in isolation.
+# Analyze it with --joint 3, 4, or 5.
+#
+# SAFETY: same wrist1/wrist2/wrist3 ranges as T06/T07, just simultaneous --
+# clearance already checked for each axis individually, but re-verify tool/
+# cable clearance for all three moving at once.
+#
+# Edit vel and acc below (rad/s, rad/s^2), then run it with send.py (--loop N
+# repeats the cycle). Plain assignments (no `global`): send.py wraps this in a
+# repeat loop, and URScript does not allow a `global` declaration inside a loop.
+
+vel = 0.6
+acc = 1.2
+
+# Two poses [rad]; wrist1, wrist2 and wrist3 all swing together, base/shoulder/
+# elbow fixed at the T06/T10 neutral pose.
+POSE_A = [0.0, -1.3, 1.3, -1.9, -1.9, 0.0]
+POSE_B = [0.0, -1.3, 1.3, -1.2, -1.2, 1.5708]
+
+write_output_float_register(1, vel)
+write_output_float_register(2, acc)
+movej(POSE_A, a=acc, v=vel)
+sleep(0.8)
+movej(POSE_B, a=acc, v=vel)
+sleep(0.8)

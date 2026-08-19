@@ -1,14 +1,14 @@
-# Shoulder swing - one cycle: the shoulder swings between two poses and back.
+# T02 shoulder_swing - one cycle: the shoulder swings between two poses and back.
 #
-# Edit vel and acc below (the two movej parameters), then run it with send.py.
-# `send.py --loop N` repeats this cycle N times then stops; without --loop it
-# runs once.
+# Edit vel and acc below (rad/s, rad/s^2 -- movej's native units), then run it
+# with send.py. `send.py --loop N` repeats this cycle N times then stops;
+# without --loop it runs once.
 #
 # Plain assignments (no `global`): send.py wraps this in a repeat loop, and
 # URScript does not allow a `global` declaration inside a loop.
 
-vel = 999
-acc = 999
+vel = 0.6
+acc = 1.2
 
 # Two joint poses; the shoulder swings between them [rad].
 POSE_A = [0.0, -1.2, 1.6, -1.57, -1.57, 0.0]

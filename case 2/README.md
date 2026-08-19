@@ -70,11 +70,52 @@ Step 3 tests transfer: if the drop the model predicted holds on hardware, the mo
 matched the robot; if not, it was missing something, which sends you back to the
 distillation.
 
+## Recording more data
+
+`record.py`/`send.py` log the URScript `movej(a=acc, v=vel)` numbers straight
+through (see `utils.VEL_COL`/`ACC_COL`): those are **radians**, movej's native
+units, not degrees. Older recordings in `data/legacy_unclamped/` were made
+before this was fixed -- their `vel`/`acc` columns hold deg-scale numbers (10,
+100, up to ~990) fed straight into `v=`/`a=`, which is rad/s, so every one of
+those runs saturated at the robot's real joint speed limit regardless of the
+requested value. That is why they all look like the same speed: they are.
+Don't mix them into a new distillation/training set; they're kept only for
+reference.
+
+`collect_data.py` records the full matrix used for this case: 11 trajectories
+(T01-T11; `collect_data.TRAJECTORIES` maps each id to its `scripts/*.script`
+file, and that file's header comment says what it moves) x 3 velocities
+(slow/medium/fast, rad/s) x 2 repetitions = 66 runs.
+**T09 and T10 are held out** -- new joint-space combinations no other
+trajectory trains on -- and are written to `data/heldout/` instead of `data/`,
+specifically so it's structurally awkward to accidentally train on them. Use
+them only for a final generalization check, after everything else is decided.
+T11 moves wrist1/wrist2/wrist3 together (extending T06's wrist1+wrist2 combo
+to include wrist3) so the trainable set has *some* example of wrist3 combined
+with other joints, not just isolated (T07) or only inside the held-out T10.
+
+```bash
+python collect_data.py --list                        # preview the 66 runs, no robot needed
+python collect_data.py --robot-ip 127.0.0.1           # record all 66 against URSim
+python collect_data.py --robot-ip <robot-ip> --yes-i-am-supervising   # real hardware
+```
+
+Recording against anything but `127.0.0.1` prints a pre-flight checklist (Remote
+Control mode, someone at the e-stop, workspace clearance for T05-T11 -- new this
+session and not previously validated on your cell, especially T06/T10/T11's
+wrist1/wrist2 motion, T07/T10/T11's wrist3 motion, and T08/T09/T10's
+extended-reach poses) and refuses to move the
+robot until you pass
+`--yes-i-am-supervising`, confirming you've actually gone through it. Every run
+is logged to `data/manifest.csv`, so a partial batch (e.g. stopped because the
+robot wasn't in Remote Control mode) can be resumed with `--only`.
+
 ## Folder contents
 
 | File | Role |
 |------|------|
 | `record.py` | passive RTDE logger: stream robot state to a CSV, never moves the robot |
+| `collect_data.py` | records the 11 trajectories x 3 velocities x 2 reps dataset, T09/T10 held out |
 | `send.py` | send a URScript (or a `servoj` path) to the robot, run it, record it |
 | `analysis.py` | `Recording` (shared CSV loader) + per-joint stats and a current plot |
 | `common.py` | `segments`: split a recording into waypoint-to-waypoint moves |
@@ -105,8 +146,9 @@ actuals, `EvaluationMetric` scores them.
   vel, acc, joint]`. Change the features (`_row_features`), the predicted channel
   (`predicts`), or the whole model.
 - **`Dynamics`** (`dynamics.py`): `UR10eDynamics`, `tau = M(q)qdd + g(q)`,
-  `current = tau/Kt` (Coriolis dropped); `vel`/`acc` deg/s to rad/s. Override
-  `current(q, qd, qdd)` for friction, Coriolis, identified parameters.
+  `current = tau/Kt` (Coriolis dropped); `vel`/`acc` are rad/s (movej's native
+  units, no deg/rad conversion). Override `current(q, qd, qdd)` for friction,
+  Coriolis, identified parameters.
 - **`EvaluationMetric`** (`metrics.py`): `CurrentGapMetric`, `|actual_current -
   target_current|` summed over joints. Change `needs`/`per_row` for overshoot,
   jerk, a weighted mix.
@@ -114,7 +156,7 @@ actuals, `EvaluationMetric` scores them.
   scale features into and out of the learners.
 - **The RLA** (`train_rla.py`): observation = 16 numbers (the move + its distilled
   channels + baseline score); objective = `score + cycle_time` (`OBJECTIVE`).
-  `params` action = `[vel, acc]` (deg/s), a trapezoidal speed along the movej line;
+  `params` action = `[vel, acc]` (rad/s, rad/s^2), a trapezoidal speed along the movej line;
   `path` action = `[accel_frac, decel_frac, speed]`, replaying the recorded
   trajectory at a trapezoidal speed profile. Change `observe`, the `OBJECTIVE`
   weights, or the action.

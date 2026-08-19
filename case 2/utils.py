@@ -18,7 +18,9 @@ JOINT_NAMES = ("base", "shoulder", "elbow", "wrist1", "wrist2", "wrist3")
 TIME_COL = "t"                                           # seconds since recording started
 # The optimized motion parameters, from the URScript `movej(..., a=acc, v=vel)`,
 # logged by record.py through these output float registers (raw script values,
-# e.g. 100).
+# in rad/s and rad/s^2: movej's a/v are native rad, e.g. 0.6). Do NOT treat these
+# as degrees -- URScript's movej takes rad/s directly, it does not clamp deg-scale
+# numbers into range, it just saturates at the joint's real (much smaller) limit.
 VEL_COL = "vel"                                          # output_double_register_1
 ACC_COL = "acc"                                          # output_double_register_2
 SCL_COL = "script_control_line"                          # URScript line running now
@@ -246,5 +248,9 @@ def get_param(text: str, name: str) -> float:
 
 
 def set_param(text: str, name: str, value: float) -> str:
-    """Return the script with `<name>` set to ``value`` (rounded int)."""
-    return re.sub(_PARAM.format(name=name), rf"\g<1>{int(round(value))}", text)
+    """Return the script with `<name>` set to ``value``.
+
+    Kept to 4 decimals (not rounded to int): ``vel``/``acc`` are rad/s and
+    rad/s^2, so integer rounding would flatten e.g. 0.3 to 0.
+    """
+    return re.sub(_PARAM.format(name=name), rf"\g<1>{value:.4f}", text)

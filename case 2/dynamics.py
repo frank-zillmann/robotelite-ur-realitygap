@@ -7,10 +7,16 @@ inverse dynamics:
     tau     = M(q) qdd + g(q)          (utils.UR10e; Coriolis dropped by default)
     current = tau / Kt                 (Kt fit from the recording: moment / current)
 
-Units: the ``vel``/``acc`` registers (and the URScript numbers) are deg/s and
-deg/s^2; joint speeds in the recording are rad/s. The trajectory is built in rad,
-with the speed clamped to the joint limit (URScript clamps a movej speed above the
-limit).
+Units: everything here is radians. The ``vel``/``acc`` registers, the URScript
+`movej(a=acc, v=vel)` numbers, and joint speeds in the recording are all rad/s and
+rad/s^2 -- that is what `movej` takes natively. (A previous version of this
+pipeline treated them as deg/s and multiplied by a stray ``DEG2RAD`` before use;
+that made every "vel" number 57x too large by the time it reached the physics, and
+because the deg-scale number was written into the script unconverted, on the robot
+it saturated at the joint speed limit every time -- so every recorded run ran at
+the same clamped max regardless of the requested speed. Fixed: no conversion, no
+clamping surprises.) The trajectory is built in rad, with the speed clamped to the
+joint limit (URScript clamps a movej speed above the limit).
 
 ``Dynamics`` is an interface; subclass it for a different torque model (friction,
 Coriolis, identified inertial parameters, a learned model). The default is fast
@@ -27,7 +33,6 @@ import pandas as pd
 from utils import (ACC_COL, N_JOINTS, TIME_COL, VEL_COL, UR10e, get_block,
                    joint_cols)
 
-DEG2RAD = np.pi / 180.0
 MAX_JOINT_SPEED = np.pi          # rad/s: URScript clamps a movej speed to this
 MAX_JOINT_ACC = 4.0 * np.pi      # rad/s^2: a generous joint acceleration ceiling
 GRID = 50                        # samples along a move's geometry for the M,g cache
@@ -92,15 +97,15 @@ class Dynamics(ABC):
         Both let an implementation reuse pose-dependent terms cached per move.
         """
 
-    def frame(self, q: np.ndarray, dt: float, vel_deg: float, acc_deg: float,
+    def frame(self, q: np.ndarray, dt: float, vel: float, acc: float,
               s: np.ndarray = None, key=None) -> pd.DataFrame:
         """Assemble a commanded-trajectory DataFrame for a candidate ``q(t)``.
 
         Differentiates ``q`` for ``qd``/``qdd``, asks ``current`` for the commanded
         current, and lays it out with the same columns a URSim recording has (the
         ``actual_*`` columns are zeros for the distill model to overwrite). ``dt``
-        is the sample period; ``vel_deg``/``acc_deg`` are stored as the register
-        columns (still deg/s). ``s`` is each row's progress along the move geometry
+        is the sample period; ``vel``/``acc`` (rad/s, rad/s^2) are stored as the
+        register columns. ``s`` is each row's progress along the move geometry
         in [0,1] (how the cached pose terms are looked up).
         """
         q = np.asarray(q, dtype=float)
@@ -114,8 +119,8 @@ class Dynamics(ABC):
             out[f"target_qd{j}"] = qd[:, j]
             out[f"target_current{j}"] = cur[:, j]
             out[f"actual_current{j}"] = 0.0          # distill overwrites these
-        out[VEL_COL] = float(vel_deg)
-        out[ACC_COL] = float(acc_deg)
+        out[VEL_COL] = float(vel)
+        out[ACC_COL] = float(acc)
         return pd.DataFrame(out)
 
 
