@@ -61,8 +61,28 @@ import pandas as pd
 
 import ur_style
 from preprocess import Identity, Preprocess, default_preprocess
-from utils import (JOINT_NAMES, N_JOINTS, VEL_COL, ACC_COL, frame_dt,
+from utils import (JOINT_NAMES, N_JOINTS, VEL_COL, ACC_COL, UR10e, frame_dt,
                    get_block, set_block)
+
+# Shared physics instance for the gravity-torque feature (PerJointPositionModel).
+# payload=0.0 (default): recordings don't log a per-run payload to plug in here.
+_UR10E = UR10e()
+
+
+def _gravity_block(q: np.ndarray) -> np.ndarray:
+    """Gravity torque per joint, ``(n, N_JOINTS)`` Nm, for a whole trajectory.
+
+    ``UR10e.gravity_batch`` takes the full 6-joint pose for every row at once
+    -- the torque on any one joint depends on the pose of the whole chain,
+    not just that joint's own angle. Computed once per recording here, not
+    once per joint inside ``_design``'s/``predict``'s per-joint loop, since a
+    single call already returns all six joints' torques (looping per joint
+    would redo the same FK/Jacobian work six times over). Uses the batched
+    (numpy-vectorized) method, not ``gravity`` in a Python loop -- the latter
+    is bit-identical but ~150x slower over the ~1e6 rows a full training run
+    covers (verified: 7.5s vs. several minutes for 1.08M rows).
+    """
+    return _UR10E.gravity_batch(q)
 
 # Train on every recorded run; holdout is a row-level fraction, not a set of
 # held-out files. Matches original_train.py's methodology: pool every row of
@@ -163,28 +183,44 @@ class PerJointPositionModel(DistillModel):
     fit), so a joint's average static bias -- e.g. gravity sag at its typical
     poses -- has somewhere to go instead of leaking into the other slopes.
 
-    Features: ``target_current``, ``qd``, ``qdd``, ``pos``, ``vel``, ``acc``,
-    plus the intercept. Being linear and per-row, it still can't reproduce the
-    settle-window ring (a decaying oscillation after the commanded motion
-    stops -- see ``bronze_tier/trajectories/worst_move_test-4_shoulder.png``),
-    and it doesn't read any physics beyond what's already logged.
+    Features: ``target_current``, ``qd``, ``qdd``, ``pos``, ``gravity_torque``,
+    ``vel``, ``acc``, plus the intercept. ``gravity_torque`` is
+    ``utils.UR10e.gravity(target_q)[joint]`` -- the torque needed to hold the
+    whole arm against gravity at that instant's commanded pose, Nm. It
+    depends on all six joints' angles at once (the torque felt at any one
+    joint depends on the pose of the whole chain, not just that joint's own
+    angle), which is why it's computed from the full pose and only then
+    sliced to this joint's column, rather than being a function of ``pos``
+    alone. Justification: direction of travel alone (a proxy for "moving
+    with or against gravity") swung measured overshoot 3.4x on the same
+    joint at the same speed, bigger than anything vel/acc explained
+    (`bronze_tier/segment_stats.csv`); gravity torque is the physical
+    quantity behind that effect, and generalizes to poses the sweeps didn't
+    cover in a way a direction flag can't.
+
+    Being linear and per-row, it still can't reproduce the settle-window
+    ring (a decaying oscillation after the commanded motion stops -- see
+    ``bronze_tier/trajectories/worst_move_test-4_shoulder.png``); gravity
+    torque is a *static*, pose-dependent term and has nothing to say about
+    that dynamic, history-dependent effect.
 
     Extension points:
 
     - Add lag features (recent ``qd``/``qdd``/jerk) or a decaying-oscillation
       term to capture the ring -- a linear-in-recent-history model still fits
       with ``lstsq``, a nonlinear one needs a different regressor.
-    - Add ``utils.UR10e.gravity(q)``/``mass_matrix(q)`` at the joint's own pose
-      as features -- direct physical drivers of static/dynamic deflection.
+    - Add ``utils.UR10e.mass_matrix(q)`` (effective inertia at the pose) --
+      the other direct physical driver of deflection not yet included.
     - Override ``_row_features`` (kept with a ``(joint, ...)`` signature even
       though this baseline ignores ``joint``) to feed a joint-specific physics
       term, e.g. a different neighbouring-joint coupling term per joint.
     """
 
-    FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "vel", "acc", "bias"]
+    FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "gravity_torque",
+                     "vel", "acc", "bias"]
 
     def __init__(self):
-        self.coefs = None                    # (N_JOINTS, 7) one row per joint
+        self.coefs = None                    # (N_JOINTS, 8) one row per joint
         self.vel_range = None
         self.acc_range = None
 
@@ -193,19 +229,23 @@ class PerJointPositionModel(DistillModel):
 
     # --- features -------------------------------------------------------------
 
-    def _row_features(self, joint: int, tgt_i, pos, qd, qdd, vel, acc) -> np.ndarray:
-        """Feature rows for one joint over a whole trajectory, shape ``(n, 7)``.
+    def _row_features(self, joint: int, tgt_i, pos, qd, qdd, vel, acc, gravity) -> np.ndarray:
+        """Feature rows for one joint over a whole trajectory, shape ``(n, 8)``.
 
         ``joint`` is unused by this baseline (each joint already gets its own
         coefficients from being fit separately) but kept in the signature so a
         subclass can look up a joint-specific physics term without changing the
-        call sites.
+        call sites. ``gravity`` is this joint's own column of
+        ``_gravity_block(full 6-joint pose)`` -- already sliced to one joint
+        by the caller, since computing it needs the whole pose, not just this
+        joint's ``pos``.
         """
         tgt_i, pos = np.asarray(tgt_i), np.asarray(pos)
         qd, qdd = np.asarray(qd), np.asarray(qdd)
         vel, acc = np.asarray(vel), np.asarray(acc)
+        gravity = np.asarray(gravity)
         bias = np.ones(len(pos))
-        return np.column_stack([tgt_i, qd, qdd, pos, vel, acc, bias])
+        return np.column_stack([tgt_i, qd, qdd, pos, gravity, vel, acc, bias])
 
     # --- fit ------------------------------------------------------------------
 
@@ -222,11 +262,12 @@ class PerJointPositionModel(DistillModel):
                 raise ValueError(f"{rec.path} has no vel/acc registers; record "
                                  "with `--float-register 1 vel 2 acc`")
             qdd = np.gradient(rec.target_qd, rec.dt, axis=0)     # commanded accel
+            grav = _gravity_block(rec.target_q)     # (n, N_JOINTS), full-pose FK once per recording
             for j in range(N_JOINTS):
                 Xs, ys = per_joint[j]
                 Xs.append(self._row_features(j, rec.target_current[:, j], rec.target_q[:, j],
                                              rec.target_qd[:, j], qdd[:, j],
-                                             rec.vel_cmd, rec.acc_cmd))
+                                             rec.vel_cmd, rec.acc_cmd, grav[:, j]))
                 ys.append(rec.actual_q[:, j] - rec.target_q[:, j])
         return {j: (np.vstack(Xs), np.concatenate(ys)) for j, (Xs, ys) in per_joint.items()}
 
@@ -234,11 +275,13 @@ class PerJointPositionModel(DistillModel):
         """Fit one row model per joint, independently, on every row of every real run."""
         design = self._design(recordings)
         self.coefs = np.zeros((N_JOINTS, len(self.FEATURE_NAMES)))
+        vel_col = self.FEATURE_NAMES.index("vel")
+        acc_col = self.FEATURE_NAMES.index("acc")
         vel_all, acc_all = [], []
         for j, (X, y) in design.items():
             self.coefs[j], *_ = np.linalg.lstsq(X, y, rcond=None)
-            vel_all.append(X[:, 4])          # feature columns 4/5 are vel/acc
-            acc_all.append(X[:, 5])
+            vel_all.append(X[:, vel_col])
+            acc_all.append(X[:, acc_col])
         self.vel_range = (float(np.min(vel_all)), float(np.max(vel_all)))
         self.acc_range = (float(np.min(acc_all)), float(np.max(acc_all)))
         return self
@@ -253,9 +296,10 @@ class PerJointPositionModel(DistillModel):
         qdd = np.gradient(qd, dt, axis=0)
         vel = df[VEL_COL].to_numpy(dtype=float)
         acc = df[ACC_COL].to_numpy(dtype=float)
+        grav = _gravity_block(q)
         out = np.zeros_like(q)
         for j in range(N_JOINTS):
-            feats = self._row_features(j, ti[:, j], q[:, j], qd[:, j], qdd[:, j], vel, acc)
+            feats = self._row_features(j, ti[:, j], q[:, j], qd[:, j], qdd[:, j], vel, acc, grav[:, j])
             out[:, j] = q[:, j] + feats @ self.coefs[j]     # target_q + predicted error
         return {"actual_q": out}
 
@@ -516,24 +560,31 @@ def _plot_per_joint_metrics(metrics: dict, channels: list, run_dir: str):
     ur_style.apply()
     for ch in channels:
         scale, unit = _plot_units(ch)
+        ovr        = metrics[ch]["overall"]
         joint_rmse = [metrics[ch]["per_joint"][j]["rmse"] * scale for j in range(N_JOINTS)]
         joint_r2   = [metrics[ch]["per_joint"][j]["r2"] for j in range(N_JOINTS)]
 
         fig, (ax_rmse, ax_r2) = plt.subplots(1, 2, figsize=(14, 5))
 
         bars = ax_rmse.bar(JOINT_NAMES, joint_rmse, color=ur_style.BLUE, edgecolor=ur_style.NAVY)
+        ax_rmse.axhline(ovr["rmse"] * scale, color=ur_style.GRAY, linestyle="--", linewidth=1.2,
+                        label=f"Overall RMSE={ovr['rmse'] * scale:.4f}")
         _annotate_bars(ax_rmse, bars, joint_rmse)
         ax_rmse.set_ylabel(f"RMSE ({unit})")
         ax_rmse.set_title(f"Held-out {ch} RMSE per joint")
         ax_rmse.tick_params(axis="x", rotation=20)
+        ax_rmse.legend()
 
         bar_colors = [ur_style.BLUE if v >= 0 else ur_style.NAVY for v in joint_r2]
         bars = ax_r2.bar(JOINT_NAMES, joint_r2, color=bar_colors, edgecolor=ur_style.NAVY)
         ax_r2.axhline(0, color=ur_style.GRAY, linewidth=0.8)
+        ax_r2.axhline(ovr["r2"], color=ur_style.GRAY, linestyle="--", linewidth=1.2,
+                     label=f"Overall R²={ovr['r2']:.4f}")
         _annotate_bars(ax_r2, bars, joint_r2)
         ax_r2.set_ylabel("R²")
         ax_r2.set_title(f"Held-out {ch} R² per joint")
         ax_r2.tick_params(axis="x", rotation=20)
+        ax_r2.legend()
 
         fig.tight_layout()
         path = os.path.join(run_dir, f"per_joint_metrics_{ch}.png")

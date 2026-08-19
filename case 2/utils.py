@@ -191,6 +191,64 @@ class UR10e:
             tau -= mass * (Jv.T @ g_vec)
         return tau
 
+    # --- batched (vectorized over many poses at once) --------------------------
+    # Same physics as fk/gravity above, one call for a whole (n, 6) trajectory
+    # instead of n Python-level calls -- for a feature computed over ~1e6
+    # recorded rows (see train_distillation_model.py), calling gravity() in a
+    # per-row loop is prohibitively slow; these vectorize the FK/Jacobian math
+    # with numpy instead. Kept as separate methods rather than making the
+    # single-pose ones dispatch on input shape, so the simple case stays simple.
+
+    @staticmethod
+    def _dh_batch(theta: np.ndarray, a: float, d: float, alpha: float) -> np.ndarray:
+        """Batched ``_dh``: ``theta`` is ``(n,)``, ``a``/``d``/``alpha`` scalars.
+
+        Returns ``(n, 4, 4)``.
+        """
+        ct, st = np.cos(theta), np.sin(theta)
+        ca, sa = np.cos(alpha), np.sin(alpha)
+        T = np.zeros((len(theta), 4, 4))
+        T[:, 0, 0], T[:, 0, 1], T[:, 0, 2], T[:, 0, 3] = ct, -st * ca, st * sa, a * ct
+        T[:, 1, 0], T[:, 1, 1], T[:, 1, 2], T[:, 1, 3] = st, ct * ca, -ct * sa, a * st
+        T[:, 2, 1], T[:, 2, 2], T[:, 2, 3] = sa, ca, d
+        T[:, 3, 3] = 1.0
+        return T
+
+    def _frames_batch(self, q: np.ndarray) -> list[np.ndarray]:
+        """Batched ``_frames``: ``q`` is ``(n, 6)``. Returns 7 arrays of ``(n, 4, 4)``."""
+        q = np.asarray(q, dtype=float)
+        frames = [np.broadcast_to(np.eye(4), (len(q), 4, 4)).copy()]
+        for i in range(6):
+            frames.append(frames[-1] @ self._dh_batch(q[:, i], _A[i], _D[i], _ALPHA[i]))
+        return frames
+
+    def _point_jacobian_batch(self, frames: list[np.ndarray], point: np.ndarray,
+                              up_to: int) -> np.ndarray:
+        """Batched ``_point_jacobian``: ``point`` is ``(n, 3)``. Returns ``(n, 6, 6)``."""
+        n = point.shape[0]
+        J = np.zeros((n, 6, 6))
+        for j in range(up_to):
+            z = frames[j][:, :3, 2]
+            p = frames[j][:, :3, 3]
+            J[:, :3, j] = np.cross(z, point - p)
+            J[:, 3:, j] = z
+        return J
+
+    def gravity_batch(self, q: np.ndarray) -> np.ndarray:
+        """Batched ``gravity``: ``q`` is ``(n, 6)``. Returns ``(n, 6)`` Nm."""
+        q = np.asarray(q, dtype=float)
+        frames = self._frames_batch(q)
+        g_vec = np.array([0.0, 0.0, -_G])
+        tau = np.zeros((len(q), 6))
+        for i in range(6):
+            com_h = np.einsum("nij,j->ni", frames[i + 1], np.append(_COM[i], 1.0))
+            Jv = self._point_jacobian_batch(frames, com_h[:, :3], up_to=i + 1)[:, :3]
+            tau -= _MASS[i] * np.einsum("nkj,k->nj", Jv, g_vec)
+        if self.payload > 0.0:
+            Jv = self._point_jacobian_batch(frames, frames[6][:, :3, 3], up_to=6)[:, :3]
+            tau -= self.payload * np.einsum("nkj,k->nj", Jv, g_vec)
+        return tau
+
     def mass_matrix(self, q) -> np.ndarray:
         """Joint-space inertia matrix M(q) (6x6), symmetric positive definite."""
         M = np.zeros((6, 6))

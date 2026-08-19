@@ -60,42 +60,81 @@ to go instead of leaking into the other coefficients.
 
 ## 3. Feature engineering
 
-`FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "vel", "acc", "bias"]`
-— seven features per joint per row:
+`FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "gravity_torque", "vel", "acc", "bias"]`
+— eight features per joint per row:
 
 | feature | source | why it's here |
 |---|---|---|
 | `target_current` | recorded/commanded current | proxy for commanded torque — the physical driver of elastic deflection (torque -> position error), already logged so free to use |
 | `qd` | `target_qd` (commanded velocity) | tracking lag and settle-window ring both scale with how fast the joint is being driven |
 | `qdd` | `np.gradient(qd, dt)` | commanded acceleration — same reasoning, and a proxy for the torque term `M(q)qdd` |
-| `pos` | `target_q` | commanded angle — needed for any pose-dependent effect (gravity torque, inertia change with pose) even though this baseline doesn't yet compute those directly |
+| `pos` | `target_q` | commanded angle — the residual's reference point, and the input `gravity_torque` (below) is computed from; other pose-dependent physics (inertia at this pose) still isn't computed, see §7 |
+| `gravity_torque` | `utils.UR10e.gravity(target_q)[joint]` | direct physical driver of static deflection — see below |
 | `vel`, `acc` | the raw `movej` register values (not the realized `qd`/`qdd`) | the *commanded profile shape*, independent of what was actually achieved |
 | `bias` | constant 1 | per-joint intercept, see §2 |
 
-This is the same feature basis the old current-predicting baseline used,
-carried over for the position target largely unchanged — it has **not** been
-re-justified from scratch for position the way the split/metric/model-shape
-decisions above were. That re-justification is open work; see §6.
+This is the same feature basis the old current-predicting baseline used
+(plus `gravity_torque`), carried over for the position target largely
+unchanged — it has **not** been re-justified from scratch for position the
+way the split/metric/model-shape decisions above were. That re-justification
+is open work; see §6.
 
-**What's deliberately not in here yet, with the evidence for adding it**
-(from `bronze_exploration.py`'s `segment_stats.csv`, 2497 real moves):
+**`gravity_torque`** (added 2026-08-19): `utils.UR10e.gravity(q)` returns all
+six joints' torques from one full-pose call — a joint's own `pos` alone
+isn't enough, since gravity torque on any joint depends on the whole
+kinematic chain's configuration. Computed once per recording (not once per
+joint) via the new `utils.UR10e.gravity_batch` and sliced per joint;
+`_gravity_block` in this file wraps that call. **Performance note**: the
+per-row `gravity()` method is not vectorized and is ~150x too slow to call
+in a loop over the ~1e6 rows a training run covers (verified: would have
+taken minutes, called 2-3x per run) — `gravity_batch` vectorizes the same
+FK/Jacobian math with numpy (verified bit-identical output against the
+per-row method on random poses, 7.5s for 1.08M rows).
 
-- **Direction of travel / gravity torque.** Same joint, same speed range,
-  opposite direction: shoulder(+) mean peak overshoot 5.5 mrad vs.
-  shoulder(-) 1.6 mrad — a 3.4x swing from direction alone, bigger than
-  anything vel/acc explain (`corr(vel, overshoot) = -0.27`,
-  `corr(acc, overshoot) = -0.33`, both weak). `utils.UR10e.gravity(q)` already
-  exists and is unused by this model.
+Justification: direction of travel alone (same joint, same speed range,
+opposite direction) swung measured peak overshoot 3.4x (shoulder+ 5.5 mrad
+vs. shoulder- 1.6 mrad, `bronze_exploration.py`'s `segment_stats.csv`) —
+bigger than anything vel/acc explain (`corr(vel, overshoot)=-0.27`,
+`corr(acc, overshoot)=-0.33`, both weak). Gravity torque is the physical
+quantity direction was standing in for.
+
+**Result**: held-out R² 0.437 → 0.445 overall. Moved almost exactly where
+physics predicts and nowhere else: shoulder +0.0095 (0.388→0.398), wrist2
++0.0067 (0.833→0.840), elbow +0.0005, wrist1 +0.0008 — and **base and
+wrist3 essentially unchanged** (base 0.7246→0.7246 to 4 decimals). That's
+not noise: the base joint rotates about the vertical axis, so gravity does
+essentially zero work as it rotates — the feature correctly contributed
+nothing there. wrist3 was already at the noise floor (§6) and stayed there.
+
+**A coefficient-scale trap, seen concretely in `coefficients.png`**:
+`gravity_torque`'s fitted weight rounds to `+0.0000` in the plot for every
+joint, including shoulder/elbow where it measurably helped R² above. Not a
+bug — gravity torque is tens of Nm while the fit target is millirad-scale,
+so its coefficient (rad of position error per Nm) is naturally tiny in raw
+units even though the feature carries real signal (a large-magnitude
+feature times a small-looking coefficient still moves the prediction). This
+is the concrete case for showing *standardized* coefficients
+(`coef_j × std(feature_j)`, comparable across features regardless of native
+units) instead of raw ones — proposed, not yet implemented; see §7.
+
+**Still not in here, with the evidence for adding it:**
+
 - **Lag/history features.** The settle-window "ring" (a damped oscillation
   after the commanded motion stops, ~0.3-0.5 s to decay,
   `bronze_tier/trajectories/worst_move_test-4_shoulder.png`) has memory — a
-  memoryless per-row linear model structurally cannot reproduce it. Recent
-  `qd`/`qdd`/jerk history, or a decaying-oscillation term, is the fix.
+  memoryless per-row linear model structurally cannot reproduce it, no
+  matter what pose-dependent (static) feature you add. Recent `qd`/`qdd`/
+  jerk history, or a decaying-oscillation term, is the fix — this is also
+  why shoulder/elbow's R² is still the weakest among the "real" (non-noise-
+  floor) joints even after `gravity_torque`: gravity is a static term and
+  has nothing to say about a dynamic, history-dependent effect.
 ~~Feature scaling~~ — checked and it's a non-issue for this model: plain OLS
 (`lstsq`, no regularization) is invariant to per-column rescaling, it just
 rescales the corresponding coefficient — RMSE/R² come out identical either
 way. Only matters if we add regularization (ridge/lasso) or move to a
-gradient-based/nonlinear method (§7).
+gradient-based/nonlinear method (§7). (Don't confuse this with the
+coefficient-*display* issue above — that's about interpreting the plot, not
+about fit quality.)
 
 ## 4. Evaluation metric: R² against "no gap," not "the mean"
 
@@ -168,33 +207,35 @@ an unseen run. Measured effect on this data: row-level held-out R²=0.437 vs.
 the stricter file-level split's 0.432 — a small optimistic bias in this case,
 but worth stating whenever these numbers are reported.
 
-## 6. Current results (last run: 2026-08-19, `results/2026-08-19_13-00-35/`)
+## 6. Current results (last run: 2026-08-19, `results/2026-08-19_13-59-27/`)
 
-7 files, 20% row holdout (216,099 held-out rows/joint).
+7 files, 20% row holdout (216,099 held-out rows/joint). With `gravity_torque`
+(previous run without it in parentheses):
 
 | joint | held-out RMSE (deg) | held-out R² |
 |---|---|---|
-| overall | 0.0242 | 0.437 |
-| base | 0.0076 | 0.725 |
-| shoulder | 0.0566 | 0.388 |
-| elbow | 0.0153 | 0.462 |
-| wrist1 | 0.0053 | 0.913 |
-| wrist2 | 0.0035 | 0.833 |
-| wrist3 | 0.0019 | 0.022 |
+| overall | 0.0242 | 0.445 (was 0.437) |
+| base | 0.0076 | 0.725 (unchanged) |
+| shoulder | 0.0561 | 0.398 (was 0.388) |
+| elbow | 0.0153 | 0.462 (was 0.462) |
+| wrist1 | 0.0053 | 0.914 (was 0.913) |
+| wrist2 | 0.0035 | 0.840 (was 0.833) |
+| wrist3 | 0.0019 | 0.022 (unchanged) |
 
 In-sample (100%-refit model, scored on its own training data) matches the
-held-out numbers almost exactly (e.g. overall R²=0.437 vs 0.437) — the
+held-out numbers almost exactly (e.g. overall R²=0.445 vs 0.445) — the
 expected sanity check for this much data, not evidence of good
 generalization (see §5's caveat).
 
 Reading these: shoulder and elbow — the joints with the largest settle-window
-ring — fit worst despite being the "easy," high-signal joints on the current
-channel. That's the linear/no-history model failing on exactly the nonlinear,
-memory-dependent effect it can't represent (§3). wrist3's R²≈0.02 is likely
-near the noise floor — its gap is tiny (RMSE 0.002°) and may be dominated by
-encoder/measurement noise rather than a systematic, learnable effect (worth
-an FFT/autocorrelation check on its residual before spending feature-
-engineering effort there).
+ring — are still the weakest of the non-noise-floor joints even after adding
+the (static) gravity feature, exactly as §3 predicts: the ring is a dynamic,
+history-dependent effect a static pose feature can't touch. wrist3's R²≈0.02
+is likely near the noise floor — its gap is tiny (RMSE 0.002°) and may be
+dominated by encoder/measurement noise rather than a systematic, learnable
+effect (worth an FFT/autocorrelation check on its residual before spending
+feature-engineering effort there; also consistent with it not moving at all
+when `gravity_torque` was added).
 
 **Plots each run produces** (`results/<datetime>/`), styled with `ur_style.py`:
 
@@ -214,28 +255,48 @@ that doesn't have any.
 
 ## 7. Not yet done, in priority order
 
-1. **Gravity torque feature** — `utils.UR10e.gravity(q)` already exists,
-  unused. Cheapest, most evidence-backed: direction alone swings overshoot
-  3.4x (shoulder+ vs shoulder-, bronze-tier data) while vel/acc barely
-  correlate (~0.3) — gravity torque is the physical quantity direction
-  stands in for.
-2. **Lag/history features for the settle-window ring** — shoulder (R²=0.39)
+1. ~~Gravity torque feature~~ — done, see §3/§6 (2026-08-19).
+2. **Lag/history features for the settle-window ring** — shoulder (R²=0.40)
   and elbow (R²=0.46) are the weakest joints that aren't just noise, and
   they're exactly the joints with the biggest ring. No per-row feature fixes
   this; needs recent `qd`/`qdd`/jerk at a few lags, or a decaying-oscillation
   term. Still fits with plain `lstsq`.
-3. **A non-linear regressor** — after, not instead of, 1-2: it can't see
-  history it isn't given, so swapping the regressor alone just buys a
-  fancier memoryless model.
-4. `dynamics.Dynamics.frame()` doesn't emit an `actual_q` placeholder column
+3. **Standardized coefficients in `coefficients.png`** — cheap, and now
+  demonstrated as a real gap (§3): `gravity_torque`'s raw weight rounds to
+  `0.0000` in the plot despite measurably improving R², because it's in
+  Nm-scale units against a millirad-scale target. Show `coef_j × std(feature_j)`
+  instead so bar heights are comparable across features regardless of native
+  units; doesn't change the fit, only the display.
+4. **Leave-one-file-out CV diagnostic** — 7 cheap refits (42 params), gives
+  an honest file-level generalization number alongside the row-level holdout
+  (§5's caveat); doesn't change what gets shipped.
+5. **A non-linear regressor** (e.g. gradient-boosted trees, per joint) —
+  after, not instead of, 2: it can't see history it isn't given, so swapping
+  the regressor alone just buys a fancier memoryless model.
+6. `dynamics.Dynamics.frame()` doesn't emit an `actual_q` placeholder column
   (only `actual_current`) — relevant once this model needs to run inside
   `train_rla.py`'s candidate scoring, not for offline training/evaluation.
-5. `train_rla.py`/`run.py` still wired to `CurrentGapMetric`/`actual_current`
+7. `train_rla.py`/`run.py` still wired to `CurrentGapMetric`/`actual_current`
   — need to switch to `PositionGapMetric` before they'll run against a model
   from this file.
 
 ## Changelog
 
+- **2026-08-19** — Added the `gravity_torque` feature to `PerJointPositionModel`
+  (`FEATURE_NAMES` now 8 entries). Added `utils.UR10e.gravity_batch` (and
+  its `_dh_batch`/`_frames_batch`/`_point_jacobian_batch` helpers) after
+  discovering the naive per-row `gravity()` loop was ~150x too slow for
+  training-scale data (would have taken minutes, called 2-3x per run);
+  verified the batched version is bit-identical to the per-row one on random
+  poses before wiring it in, then confirmed a full training run completes in
+  ~41s. Held-out R² 0.437→0.445 overall, moving almost exactly where physics
+  predicts (shoulder/wrist2 up, base/wrist3 unchanged — base rotates about
+  the vertical axis, so gravity does ~zero work there, and wrist3 is already
+  noise-floor). Also found and documented a coefficient-display gap while
+  reviewing `coefficients.png`: `gravity_torque`'s raw-unit weight rounds to
+  `0.0000` despite the real R² gain, because it's Nm-scale against a
+  millirad-scale target — added "standardized coefficients" to §7 as the
+  proposed (not yet implemented) fix.
 - **2026-08-19** — Fixed the split phase-alignment inconsistency in
   `old_position_model.py` (`_held_out_mask`, replacing the old inline
   `arange(len(y)) % step`): each recording's held-out mask is now computed
