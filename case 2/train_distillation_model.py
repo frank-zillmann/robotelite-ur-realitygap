@@ -200,41 +200,62 @@ class LinearModel(DistillModel):
         return self.vel_range, self.acc_range
 
 
-def _annotate_bars(ax, bars, values, fmt="{:.3f}"):
-    """Print each bar's value above (or below, if negative) the bar itself."""
-    for bar, v in zip(bars, values):
-        y = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width() / 2, y, fmt.format(v),
-                ha="center", va="bottom" if y >= 0 else "top", fontsize=9)
-    ax.margins(y=0.15)
+def _annotate_bars(ax, bars, values, fmt: str = "{:.4f}") -> None:
+    """Value labels above (below, for negative bars) each bar.
+
+    Matches train_distillation_model.py's ``_annotate_bars`` exactly (offset
+    scales with the data's own range, fontsize 8, 4 decimal digits by
+    default) so plots from this file are a direct visual comparison against
+    that file's.
+    """
+    span = max((abs(v) for v in values), default=1.0) or 1.0
+    for bar, val in zip(bars, values):
+        va     = "bottom" if val >= 0 else "top"
+        offset = 0.015 * span * (1 if val >= 0 else -1)
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + offset,
+                fmt.format(val), ha="center", va=va, fontsize=8)
 
 
-def plot_per_joint_metrics(rmse: np.ndarray, r2: np.ndarray):
+def plot_per_joint_metrics(rmse: np.ndarray, r2: np.ndarray,
+                           overall_rmse: float, overall_r2: float):
     """RMSE and R2 of held-out ``actual_q`` predictions, one bar per joint.
 
-    ``rmse`` is taken in radians (as computed in ``main()``) and shown in
-    degrees here -- easier to read than radians, and R2 is already unitless
-    so it needs no conversion.
+    ``rmse``/``overall_rmse`` are taken in radians (as computed in ``main()``)
+    and shown in degrees here -- easier to read than radians; R2 is already
+    unitless so it needs no conversion. Styled identically to
+    ``train_distillation_model.py``'s ``_plot_per_joint_metrics`` -- same
+    colors (BLUE/NAVY), same NAVY bar outline, same diverging R² sign
+    coloring, same overall reference line + legend, same annotation digits --
+    so a run from here drops in for a direct visual comparison.
     """
     import matplotlib.pyplot as plt
     import ur_style
     ur_style.apply()
 
     rmse_deg = np.degrees(rmse)
-    fig, (ax_rmse, ax_r2) = plt.subplots(1, 2, figsize=(12, 5))
+    overall_rmse_deg = np.degrees(overall_rmse)
+    fig, (ax_rmse, ax_r2) = plt.subplots(1, 2, figsize=(14, 5))
 
-    bars = ax_rmse.bar(JOINT_NAMES, rmse_deg, color=ur_style.BLUE)
-    _annotate_bars(ax_rmse, bars, rmse_deg, "{:.3f}°")
+    bars = ax_rmse.bar(JOINT_NAMES, rmse_deg, color=ur_style.BLUE, edgecolor=ur_style.NAVY)
+    ax_rmse.axhline(overall_rmse_deg, color=ur_style.GRAY, linestyle="--", linewidth=1.2,
+                    label=f"Overall RMSE={overall_rmse_deg:.4f}")
+    _annotate_bars(ax_rmse, bars, rmse_deg)
     ax_rmse.set_ylabel("RMSE (deg)")
     ax_rmse.set_title("Held-out actual_q RMSE per joint")
+    ax_rmse.tick_params(axis="x", rotation=20)
+    ax_rmse.legend()
 
-    bars = ax_r2.bar(JOINT_NAMES, r2, color=ur_style.MID_BLUE)
-    _annotate_bars(ax_r2, bars, r2, "{:.3f}")
-    ax_r2.set_ylabel(r"$R^2$")
-    ax_r2.set_title(r"Held-out actual_q $R^2$ per joint")
+    bar_colors = [ur_style.BLUE if v >= 0 else ur_style.NAVY for v in r2]
+    bars = ax_r2.bar(JOINT_NAMES, r2, color=bar_colors, edgecolor=ur_style.NAVY)
+    ax_r2.axhline(0, color=ur_style.GRAY, linewidth=0.8)
+    ax_r2.axhline(overall_r2, color=ur_style.GRAY, linestyle="--", linewidth=1.2,
+                 label=f"Overall R²={overall_r2:.4f}")
+    _annotate_bars(ax_r2, bars, r2)
+    ax_r2.set_ylabel("R²")
+    ax_r2.set_title("Held-out actual_q R² per joint")
+    ax_r2.tick_params(axis="x", rotation=20)
+    ax_r2.legend()
 
-    for ax in (ax_rmse, ax_r2):
-        plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
     fig.tight_layout()
     return fig
 
@@ -379,7 +400,7 @@ def main():
         out_dir = os.path.join("results", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
         os.makedirs(out_dir, exist_ok=True)
 
-        fig_metrics = plot_per_joint_metrics(rmse_per_joint, r2_per_joint)
+        fig_metrics = plot_per_joint_metrics(rmse_per_joint, r2_per_joint, rmse, ss)
         fig_metrics.savefig(os.path.join(out_dir, "per_joint_metrics.png"),
                             dpi=150, bbox_inches="tight")
 
