@@ -121,6 +121,17 @@ n≫10,000) internally carves out its own validation split, which is
 non-deterministic without a seed, undermining this project's otherwise
 deterministic ("no RNG") split methodology (§5).
 
+**`PerJointPositionModelNoGravity`** (added 2026-08-19, `--model
+linear_per_joint_no_gravity`): the linear model's pre-gravity 7-feature set,
+as a permanent, reproducible ablation baseline rather than a historical
+number to trust. Only overrides `FEATURE_NAMES`; everything else is
+inherited unchanged, which is the whole point of the `FEATURE_NAMES`-driven
+refactor above — dropping a feature needs no other code changes. Reran under
+the current code and got an exact match to the originally-recorded
+pre-gravity numbers (overall R²=0.4368, per-joint bit-for-bit) — confirms
+the later split/metric/tree refactors didn't silently change the linear
+model's behavior.
+
 ## 3. Feature engineering
 
 `FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "gravity_torque", "vel", "acc", "bias"]`
@@ -396,6 +407,14 @@ that doesn't have any.
 
 ## Changelog
 
+- **2026-08-19** — Added `PerJointPositionModelNoGravity` (`--model
+  linear_per_joint_no_gravity`) as a permanent, reproducible ablation
+  baseline (7-feature `FEATURE_NAMES` override, nothing else) rather than
+  relying on an older recorded number. Reran it and got an exact match to
+  the historical pre-gravity result (R²=0.4368 overall, per-joint
+  bit-for-bit) — confirms later refactors (the `_row_split_fit_predict`
+  hook, the `bounds()` fix, the tree model) didn't change the linear model's
+  behavior.
 - **2026-08-19** — Added `gravity_torque` to `PerJointTreeModel` (removed its
   `FEATURE_NAMES` override so it inherits the parent's full 8-feature set;
   fixed its `predict()` override, which had no gravity-conditional logic

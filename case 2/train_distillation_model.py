@@ -451,9 +451,29 @@ class PerJointTreeModel(PerJointPositionModel):
         return None
 
 
+class PerJointPositionModelNoGravity(PerJointPositionModel):
+    """``PerJointPositionModel`` without the ``gravity_torque`` feature.
+
+    Exists purely as a reproducible ablation baseline -- everything
+    (``_row_features``, ``_design``, ``fit``, ``predict``, ``bounds``,
+    ``params``, ``coefficients``, ``_row_split_fit_predict``) is inherited
+    unchanged; dropping the feature is the *only* difference, and the
+    ``"gravity_torque" in self.FEATURE_NAMES`` guards already in the parent
+    (see its ``_design``/``predict``) mean nothing else needs to know this
+    class exists. Compare its results against ``PerJointPositionModel``'s to
+    see gravity's effect under the exact current code, rather than trusting
+    an older recorded number that predates later refactors -- see
+    ``ModelReview.md`` §3/§6 for the comparison this produced.
+    """
+
+    FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "vel", "acc", "bias"]
+
+
 # Models selectable via --model. Add a new DistillModel subclass here to make
 # it available from the CLI without touching the train/test split logic.
-MODELS = {"linear_per_joint": PerJointPositionModel, "tree_per_joint": PerJointTreeModel}
+MODELS = {"linear_per_joint": PerJointPositionModel,
+         "linear_per_joint_no_gravity": PerJointPositionModelNoGravity,
+         "tree_per_joint": PerJointTreeModel}
 
 
 def augment(model: DistillModel, csv: str, pre: Preprocess = None):
