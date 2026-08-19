@@ -1,7 +1,7 @@
 """Shared helpers for the case 2 scripts: constants, robot physics, scripts.
 
 - constants: joint count/names and the CSV column names.
-- `UR10e`: numpy-only kinematics and dynamics (FK, Jacobian, gravity, mass
+- `UR5e`: numpy-only kinematics and dynamics (FK, Jacobian, gravity, mass
   matrix, Coriolis) usable as physics features for the gap model.
 - URScript helpers: load a `.script`, read/replace its `vel`/`acc` parameters.
 """
@@ -52,43 +52,50 @@ def frame_dt(df) -> float:
     return float(np.median(np.diff(df[TIME_COL].to_numpy(dtype=float))))
 
 
-# --- UR10e kinematics and dynamics (numpy only) ------------------------------
-# UR10e parameters, from Universal Robots "DH Parameters for calculations of
-# kinematics and dynamics" (universal-robots.com). Standard (classic) DH.
-#   joint i rotates by q[i] about z of the previous frame.
-_A = np.array([0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0])          # link length a [m]
-_D = np.array([0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655])    # link offset d [m]
+# --- UR5e kinematics and dynamics (numpy only) -------------------------------
+# UR5e parameters, from Universal Robots "DH Parameters for calculations of
+# kinematics and dynamics" (universal-robots.com), cross-checked against the
+# official Universal_Robots_ROS2_Description package (config/ur5e/*.yaml).
+# Standard (classic) DH. joint i rotates by q[i] about z of the previous frame.
+_A = np.array([0.0, -0.425, -0.3922, 0.0, 0.0, 0.0])             # link length a [m]
+_D = np.array([0.1625, 0.0, 0.0, 0.1333, 0.0997, 0.0996])        # link offset d [m]
 _ALPHA = np.array([np.pi / 2, 0.0, 0.0, np.pi / 2, -np.pi / 2, 0.0])  # twist [rad]
 
-_MASS = np.array([7.369, 13.051, 3.989, 2.1, 1.98, 0.615])      # link masses [kg]
+_MASS = np.array([3.761, 8.058, 2.846, 1.37, 1.3, 0.365])        # link masses [kg]
 
 # Centre of mass of each link, in that link's DH frame [m].
 _COM = np.array([
-    [0.021, 0.000, 0.027],
-    [0.380, 0.000, 0.158],
-    [0.240, 0.000, 0.068],
-    [0.000, 0.007, 0.018],
-    [0.000, 0.007, 0.018],
-    [0.000, 0.000, -0.026],
+    [0.0, -0.02561, 0.00193],
+    [0.2125, 0.0, 0.11336],
+    [0.15, 0.0, 0.0265],
+    [0.0, -0.0018, 0.01634],
+    [0.0, 0.0018, 0.01634],
+    [0.0, 0.0, -0.001159],
 ])
 
-# Inertia tensor of each link about its centre of mass, in the link frame [kg m^2].
+# Inertia tensor of each link about its centre of mass, in the link (DH) frame
+# [kg m^2]. Derived from the ROS2 description package's per-link tensors
+# (config/ur5e/physical_parameters.yaml), which are expressed in URDF joint
+# frames; rotated back into the DH frame using that file's documented
+# model->URDF roll offsets (shoulder/wrist_1: +90 deg, wrist_2: -90 deg,
+# upper_arm/forearm/wrist_3: 0) about x, matching the COM axis remapping the
+# same file documents for those links.
 _INERTIA = np.array([
-    [[0.0341, 0.0000, -0.0043], [0.0000, 0.0353, 0.0001], [-0.0043, 0.0001, 0.0216]],
-    [[0.0281, 0.0001, -0.0156], [0.0001, 0.7707, 0.0000], [-0.0156, 0.0000, 0.7694]],
-    [[0.0101, 0.0001, 0.0092], [0.0001, 0.3093, 0.0000], [0.0092, 0.0000, 0.3065]],
-    [[0.0030, 0.0000, 0.0000], [0.0000, 0.0022, -0.0002], [0.0000, -0.0002, 0.0026]],
-    [[0.0030, 0.0000, 0.0000], [0.0000, 0.0022, -0.0002], [0.0000, -0.0002, 0.0026]],
-    [[0.0000, 0.0000, 0.0000], [0.0000, 0.0004, 0.0000], [0.0000, 0.0000, 0.0003]],
+    [[0.00700210, -0.00001053, -0.00000073], [-0.00001053, 0.00657286, -0.00049994], [-0.00000073, -0.00049994, 0.00648091]],
+    [[0.01505885, -0.00005400, 0.00000563], [-0.00005400, 0.33388086, -0.00000181], [0.00000563, -0.00000181, 0.33247207]],
+    [[0.00399632, -0.00001365, 0.00137272], [-0.00001365, 0.07879254, -0.00000660], [0.00137272, -0.00000660, 0.07848510]],
+    [[0.00165491, -0.00000438, 0.00000282], [-0.00000438, 0.00126279, -0.00010157], [0.00000282, -0.00010157, 0.00135962]],
+    [[0.00135617, -0.00000444, -0.00000274], [-0.00000444, 0.00096614, 0.00005048], [-0.00000274, 0.00005048, 0.00127827]],
+    [[0.00018694, 0.00000006, -0.00000017], [0.00000006, 0.00018908, -0.00000092], [-0.00000017, -0.00000092, 0.00025756]],
 ])
 
 _G = 9.80665  # gravity [m/s^2]
 
 
-class UR10e:
-    """UR10e kinematics and dynamics. Extend by overriding the parameter arrays.
+class UR5e:
+    """UR5e kinematics and dynamics. Extend by overriding the parameter arrays.
 
-        ur = UR10e(payload=0.8)             # 0.8 kg at the tool flange
+        ur = UR5e(payload=0.8)              # 0.8 kg at the tool flange
         q  = [0, -1.57, 1.57, -1.57, -1.57, 0]
         ur.fk(q)                            # 4x4 base -> flange pose
         ur.jacobian(q)                      # 6x6 geometric Jacobian (base frame)

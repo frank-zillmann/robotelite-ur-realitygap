@@ -32,9 +32,3 @@ docs/~$*.pptx
 docs/~$*.docx
 docs/*.tmp
 
-# ── case 2: recorded runs are regenerated via collect_data.py, don't commit ───
-# them (manifest.csv and legacy_unclamped/ are kept -- small, and useful as-is)
-case 2/data/*.csv
-!case 2/data/manifest.csv
-case 2/data/heldout/
-case 2/scripts/_generated/

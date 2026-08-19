@@ -112,7 +112,7 @@ class LinearModel(DistillModel):
       joint's behaviour onto another.
     - Normalize the features: ``pos`` (radians) and ``vel``/``acc`` (raw movej
       numbers up to ~1000) are on very different scales.
-    - Add physics from ``utils.UR10e`` (gravity torque, mass matrix, Coriolis).
+    - Add physics from ``utils.UR5e`` (gravity torque, mass matrix, Coriolis).
     - Use a non-linear regressor (MLP, trees) that can capture the ring.
 
     Override ``_row_features`` to change the inputs, or ``predicts``/``predict``

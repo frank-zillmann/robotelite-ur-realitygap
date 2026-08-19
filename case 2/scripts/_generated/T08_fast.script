@@ -1,0 +1,31 @@
+# T08 reach_extend - one cycle: compact pose to a much straighter, longer-reach
+# pose and back. Every other trajectory keeps the elbow bent (0.9-1.6 rad); this
+# one straightens it to 0.6 and raises the shoulder toward horizontal, so the
+# TCP reaches noticeably farther from the base. Base also rotates a bit so the
+# reach happens off to one side, not just straight ahead. Analyze a joint with
+# --joint.
+#
+# SAFETY: this is the largest-reach pose in the whole set -- straighter arm
+# means the tool travels farther from the base than any other script. Verify
+# workspace clearance (and that this doesn't run the arm near a kinematic
+# singularity for your specific mount) before running on real hardware.
+#
+# Edit vel and acc below (rad/s, rad/s^2), then run it with send.py (--loop N
+# repeats the cycle). Plain assignments (no `global`): send.py wraps this in a
+# repeat loop, and URScript does not allow a `global` declaration inside a loop.
+
+vel = 1.0000
+acc = 2.0000
+
+# Two joint poses [rad]: compact (folded) -> extended (longer reach).
+POSE_COMPACT = [0.0, -1.3, 1.4, -1.5708, -1.5708, 0.0]
+POSE_EXTENDED = [0.3, -0.8, 0.6, -1.5708, -1.5708, 0.0]
+
+write_output_float_register(1, vel)
+write_output_float_register(2, acc)
+movej(POSE_COMPACT, a=acc, v=vel)
+sleep(0.8)
+movej(POSE_EXTENDED, a=acc, v=vel)
+sleep(0.8)
+movej(POSE_COMPACT, a=acc, v=vel)
+sleep(0.8)
