@@ -11,7 +11,7 @@ docker compose up -d
 ```
 First boot takes ~40 s while the controller starts. Then open **http://localhost**
 (hard-refresh if you catch the splash screen). You get the full PolyScope X UI
-with a 3D view of a **UR10**.
+with a 3D view of a **UR5**.
 
 ![PolyScope X full UI: 3D view, Move/Joints panel, live joint angles](images/polyscopex-full.png)
 
@@ -54,13 +54,13 @@ Case 1's `ur_client.py` talks to 30001 (motion) and 30004 (state) with the
 Python standard library only, nothing to compile.
 
 ## Robot type
-`ROBOT_TYPE` defaults to `UR10` (see `docker-compose.yml`). Override at bring-up
+`ROBOT_TYPE` defaults to `UR5` (see `docker-compose.yml`). Override at bring-up
 for a different arm, using the **internal** controller name, e.g.:
 ```bash
 ROBOT_TYPE=UR20 docker compose up -d
 ```
 Valid values: `UR3 UR5 UR7e UR10 UR12e UR15 UR16 UR18 UR20 UR30 UR8LONG` (and the
-`g` variants). Note it's `UR10`, not `UR10e`. The consumer suffix is not a valid
+`g` variants). Note it's `UR5`, not `UR5e`. The consumer suffix is not a valid
 controller type here. If you change the type, `docker compose down -v` first so
 the old robot's state is wiped.
 

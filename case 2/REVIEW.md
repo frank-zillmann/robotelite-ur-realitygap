@@ -10,7 +10,7 @@ end to end on `apostolos` branch.
 
 Three layers (PDF "Challenge" section):
 
-1. **Analyze the reality gap** — using RTDE recordings from a real UR10e
+1. **Analyze the reality gap** — using RTDE recordings from a real UR5e
    (multiple runs, varied speed/accel/blend), characterize where and why
    tracking error and vibration occur: which joints, at what speeds, under
    what loads.
@@ -36,13 +36,13 @@ either of these two position-based vibration metrics. See §6.
 
 | File | Role | Notes from testing |
 |---|---|---|
-| `utils.py` | `N_JOINTS`, column-name constants, `UR10e` (pure-numpy DH kinematics/dynamics: FK, Jacobian, gravity, mass matrix, Coriolis), URScript `vel`/`acc` read/replace helpers | `UR10e.coriolis()` exists but `UR10eDynamics` doesn't call it (see `dynamics.py`) |
+| `utils.py` | `N_JOINTS`, column-name constants, `UR5e` (pure-numpy DH kinematics/dynamics: FK, Jacobian, gravity, mass matrix, Coriolis), URScript `vel`/`acc` read/replace helpers | `UR5e.coriolis()` exists but `UR5eDynamics` doesn't call it (see `dynamics.py`) |
 | `analysis.py` | `Recording` — the CSV loader every other file depends on (wraps a run as numpy arrays: `target_q`, `actual_q`, `target_current`, `actual_current`, `vel_cmd`/`acc_cmd`, `scl`, `script`). CLI: `--csv --joint` prints per-joint stats and plots target vs actual current | The right tool to look at **real** `data/test-*.csv` gap; not useful on URSim-only recordings |
 | `plot_target_actual.py` | Standalone quick-look plotter, added this session. Generalizes `analysis.py`'s current-only plot to *any* `target_<value><i>`/`actual_<value><i>` column pair in a recording CSV — `q`, `qd`, `current`, `TCP_pose`, `TCP_speed` — for one chosen component. No stats/log.json, just target-vs-actual and the gap, for eyeballing a channel `analysis.py` doesn't cover. See usage below and §6 (Bronze). | Reads the CSV directly via `utils.get_block`/`joint_cols`, doesn't go through `Recording` — works on any of the six `target_*`/`actual_*` channel pairs, not just the three `Recording` loads |
 | `common.py` | `segments()` — splits a recording into per-`movej` `Segment`s using `script_control_line` to find move boundaries; shared by distillation and RL so both cut the same way | Confirmed: 30 segments from our 3 training scripts × 5 loops × 2 poses |
 | `record.py` | Passive RTDE logger (raw socket protocol, port 30004). Never moves the robot | Also supplies `record_stream`, reused by `send.py` |
 | `send.py` | Pushes a URScript or `servoj` path to port 30002, records via `record.py`. Auto-stops on a done-flag register. Needs Remote Control **and** the robot powered on — silently sits at a ~5s timeout otherwise (`_done_check`'s "program never started" reason, which `train_rla.py`'s `collect_moves` doesn't print, so it just looks like `0 segments pooled`) | This is what we hit twice this session — robot state, not code |
-| `dynamics.py` | `Dynamics` interface + `UR10eDynamics` — commanded joint current for a *candidate* motion, without running it anywhere. `tau = M(q)qdd + g(q)` (Coriolis dropped), `current = tau/Kt`. Builds candidate frames with `actual_current = 0.0` placeholder | The `0.0` placeholder here is one of the two "no ground truth" cases discussed in §5 |
+| `dynamics.py` | `Dynamics` interface + `UR5eDynamics` — commanded joint current for a *candidate* motion, without running it anywhere. `tau = M(q)qdd + g(q)` (Coriolis dropped), `current = tau/Kt`. Builds candidate frames with `actual_current = 0.0` placeholder | The `0.0` placeholder here is one of the two "no ground truth" cases discussed in §5 |
 | `train_distillation_model.py` | `DistillModel` interface + `LinearModel` baseline — one shared-slope linear fit predicting `actual_current` from `[target_current, qd, qdd, pos, vel, acc, joint one-hot]`. `augment()` overwrites a recording's `actual_*` columns with predictions | Only predicts `actual_current` — `actual_q` is never touched anywhere in the pipeline unless this changes |
 | `metrics.py` | `EvaluationMetric` interface + `CurrentGapMetric` baseline (`Σ\|actual_current − target_current\|`) | Doesn't implement the PDF's peak-overshoot/RMS-position spec |
 | `preprocess.py` | `Preprocess` interface + `Identity` no-op — hook for scaling features into/out of the distill model and the RL agent | Untouched in the baseline run; `pos` (rad) and `vel`/`acc` (raw register ints up to ~1000) are on very different scales, flagged in `LinearModel`'s own docstring as a thing to fix |
@@ -51,7 +51,7 @@ either of these two position-based vibration metrics. See §6.
 | `README.md` | Setup, run commands, tiers | The "you might notice something is off" note in step 5 is the URSim-zero-gap issue, confirmed in §5 |
 | `requirements.txt` | numpy/pandas/matplotlib/scikit-learn/scipy + gymnasium/stable-baselines3 | — |
 
-### `data/` — real UR10e recordings (Git LFS)
+### `data/` — real UR5e recordings (Git LFS)
 
 `test-1.csv` … `test-7.csv`, each with a matching `.script` (`test-6-7.script`
 covers both). **These are genuine real-hardware recordings**, not synthetic —
@@ -101,7 +101,7 @@ case, on-URSim) recordings.
 
 ```mermaid
 flowchart TD
-    RealData["data/test-4,5,6.csv<br/>(real UR10e recordings)"] -->|train_distillation_model.py| DistillPkl["models/distill.pkl<br/>(DistillModel)"]
+    RealData["data/test-4,5,6.csv<br/>(real UR5e recordings)"] -->|train_distillation_model.py| DistillPkl["models/distill.pkl<br/>(DistillModel)"]
 
     Scripts["scripts/*.script<br/>(shoulder/vertical/horizontal)"] -->|send.py via URSim| Targets["clean target_* trajectory<br/>(sim_to_real.csv)"]
     Targets -->|augment(): model.predict| Injected["actual_current overwritten<br/>with model's prediction"]
@@ -110,7 +110,7 @@ flowchart TD
 
     Moves --> GapEnv["GapEnv (Gym)"]
     DistillPkl -.scores candidates.-> GapEnv
-    DynPhysics["dynamics.py: UR10eDynamics<br/>(M(q)qdd + g(q), no hardware)"] -.commanded current.-> GapEnv
+    DynPhysics["dynamics.py: UR5eDynamics<br/>(M(q)qdd + g(q), no hardware)"] -.commanded current.-> GapEnv
     GapEnv -->|PPO, train_rla.py| Agent["models/agent_params.zip"]
 
     HeldOut["scripts/triangle.script<br/>(never trained on)"] -->|run.py: build_dataset| HeldOutData["triangle.sim_to_real.csv"]
@@ -450,8 +450,8 @@ offline, before the robot moves at all.
 
 ### Gold — improve the agent and the physics model
 
-- `Dynamics`: `UR10eDynamics` drops Coriolis (`utils.UR10e.coriolis()`
-  already exists, just isn't called) and uses generic UR10e parameters —
+- `Dynamics`: `UR5eDynamics` drops Coriolis (`utils.UR5e.coriolis()`
+  already exists, just isn't called) and uses generic UR5e parameters —
   add friction and/or identify parameters from your real data.
 - `train_rla.py`: retrain `GapEnv` once the metric/model changes land;
   revisit `OBJECTIVE`'s 1:1 `SCORE_WEIGHT`/`CYCLE_WEIGHT` if the new metric's
@@ -472,7 +472,7 @@ offline, before the robot moves at all.
 ### Diamond — real hardware (or the offline substitute)
 
 - **With hardware**: rerun `send.py` for baseline and optimized with
-  `--robot-ip` pointed at a real UR10e instead of `127.0.0.1` — this is the
+  `--robot-ip` pointed at a real UR5e instead of `127.0.0.1` — this is the
   step that was silently meaningless every time we ran it against URSim this
   session. If the predicted improvement doesn't hold, refit
   `DistillModel`/`Dynamics` on the new real recordings (the README's own
@@ -958,11 +958,14 @@ segments pooled`, flagged in §5).
 - Boots **powered off**, same as real hardware: open `http://localhost`,
   power on, release brakes until the state reads RUNNING/Active — one-time
   per container boot (`simulation environment/README.md`).
-- Defaults to a `UR10`, not a `UR10e` (`ROBOT_TYPE` in `docker-compose.yml`)
-  — `utils.UR10e`'s DH/mass/inertia parameters are UR10e-specific, so
+- Defaults to a `UR5`, not a `UR5e` (`ROBOT_TYPE` in `docker-compose.yml`)
+  — `utils.UR5e`'s DH/mass/inertia parameters are UR5e-specific, so
   URSim's *physics* isn't quite the robot the kinematics model assumes; this
   only matters for interpreting simulated dynamics, not the
   target-trajectory geometry the pipeline actually relies on URSim for.
+  (Same caveat shape as before this project switched from UR10e to UR5e —
+  it's inherent to the internal-controller-name-vs-published-parameters
+  split, not something the robot switch introduced.)
 - Has **zero reality gap by construction** (§3/§5) — useful for exercising
   the pipeline's plumbing, useless for anything gap-related; that's what
   `data/test-*.csv` (real hardware) and `augment()`'s injected predictions

@@ -89,7 +89,7 @@ against gravity, with no motion at all — is exactly the missing input. It
 depends on the whole arm's pose at once (how the elbow is bent changes the
 load felt at the shoulder), not just one joint's own angle, so it's computed
 once from the full 6-joint pose and then split out per joint
-(`utils.UR10e.gravity`, §3). Feeding this in means the model doesn't have to
+(`utils.UR5e.gravity`, §3). Feeding this in means the model doesn't have to
 *rediscover* gravity's effect from position/velocity data alone — it's
 handed the answer directly, the same way an engineer would rather look up a
 formula than reverse-engineer it from a scatter plot.
@@ -155,7 +155,7 @@ and `model_architecture.png` for a diagram of the whole pipeline.
 ## 1. What we predict
 
 **Position**, not current. `PerJointPositionModel.predicts() -> ["actual_q"]`
-— the actual joint angle (rad) a real UR10e ends up at, given a commanded
+— the actual joint angle (rad) a real UR5e ends up at, given a commanded
 trajectory. Internally it predicts the *residual* `actual_q - target_q` (the
 tracking gap) and adds `target_q` back before returning, so the public
 interface still hands back an absolute angle like any other `DistillModel`.
@@ -290,7 +290,7 @@ model's behavior.
 | `qdd` | `np.gradient(qd, dt)` | commanded acceleration — same reasoning, and a proxy for the torque term `M(q)qdd` |
 | `qdd_lag4`, `qdd_lag16`, `qdd_lag64` | `qdd` held 4/16/64 samples in the past (~31/125/500 ms at ~128 Hz), causal, per-recording — see below | history taps aimed at the settle-window ring — see below |
 | `pos` | `target_q` | commanded angle — the residual's reference point, and the input `gravity_torque` (below) is computed from; other pose-dependent physics (inertia at this pose) still isn't computed, see §7 |
-| `gravity_torque` | `utils.UR10e.gravity(target_q)[joint]` | direct physical driver of static deflection — see below |
+| `gravity_torque` | `utils.UR5e.gravity(target_q)[joint]` | direct physical driver of static deflection — see below |
 | `vel`, `acc` | the raw `movej` register values (not the realized `qd`/`qdd`) | the *commanded profile shape*, independent of what was actually achieved |
 | `bias` | constant 1 | per-joint intercept, see §2 |
 
@@ -353,11 +353,11 @@ gravity discussion) moved only slightly, consistent with a real dynamic
 effect being captured rather than noise. wrist3 stayed at its noise floor
 (§6), as expected. Full current numbers in §6.
 
-**`gravity_torque`** (added 2026-08-19): `utils.UR10e.gravity(q)` returns all
+**`gravity_torque`** (added 2026-08-19): `utils.UR5e.gravity(q)` returns all
 six joints' torques from one full-pose call — a joint's own `pos` alone
 isn't enough, since gravity torque on any joint depends on the whole
 kinematic chain's configuration. Computed once per recording (not once per
-joint) via the new `utils.UR10e.gravity_batch` and sliced per joint;
+joint) via the new `utils.UR5e.gravity_batch` and sliced per joint;
 `_gravity_block` in this file wraps that call. **Performance note**: the
 per-row `gravity()` method is not vectorized and is ~150x too slow to call
 in a loop over the ~1e6 rows a training run covers (verified: would have
@@ -633,6 +633,28 @@ that doesn't have any.
 
 ## Changelog
 
+- **2026-08-19** — Switched from UR10e to UR5e (the user's real robot) on
+  this branch, bringing over the physics fix already applied on
+  `apostolosRLA` (see `UR5eMigration.md`, copied over from that branch, for
+  the full writeup and before/after parameter tables). Renamed `utils.UR10e`→
+  `utils.UR5e`, `dynamics.UR10eDynamics`→`UR5eDynamics`, and this file's
+  `_UR10E`→`_UR5E` singleton (the `gravity_torque` feature's underlying
+  `gravity_batch` call). Replaced `utils.py`'s DH/mass/COM/inertia constants
+  with UR5e's published values (Universal Robots' own DH-parameters page,
+  fetched live, cross-checked against the still-present UR10e numbers before
+  trusting it). Changed `DEFAULT_CSVS` from a hardcoded `range(1,8)` to a
+  glob over `data/test-*.csv`. **This directly affects `gravity_torque`**:
+  that feature is *computed* from `utils.py`'s hardcoded robot geometry
+  (forward kinematics/dynamics), not read from the recording CSV — so even
+  though every other feature (`target_current`, `qd`, `qdd`, `pos`, `vel`,
+  `acc`, the `qdd_lag*` taps) is pulled straight from whatever data you feed
+  `fit()`, `gravity_torque` was silently computed as "what a UR10e-shaped arm
+  would feel at these joint angles" until this fix, even on real UR5
+  recordings. **`data/test-*.csv` still holds UR10e recordings as of this
+  entry** — every result in §6/§8/§0 above still describes the UR10e-trained
+  model; retrain once real UR5 data replaces them (delete the old UR10e
+  files first — the new glob-based `DEFAULT_CSVS` would otherwise pool both
+  robots' data into one fit).
 - **2026-08-19** — Added §0, a plain-language, slide-ready summary of the
   shipped model (trees + gravity + lag) for a non-ML-expert engineering
   audience: the residual trick, why per-joint, why trees over a linear
