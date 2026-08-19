@@ -95,6 +95,13 @@ def profile_figure(distance: float, vel: float, acc: float, dt: float):
     return fig
 
 
+def _defs(*pairs: tuple[str, str]) -> str:
+    """A small ``<p class="defs">`` line of "name: equation" pairs, for the
+    one-line definition under each table/section."""
+    items = "".join(f"<code>{name}</code> = {eq}<br>" for name, eq in pairs)
+    return f'<p class="defs">{items}</p>'
+
+
 def per_joint_table(recs: dict) -> str:
     """One HTML table row per (run, joint): position RMSE/max error,
     current-gap RMS, RMS/peak jerk (diagnostics.per_joint_metrics)."""
@@ -106,10 +113,17 @@ def per_joint_table(recs: dict) -> str:
                         f"<td>{m['pos_rmse']*1e3:.3f}</td><td>{m['pos_max_err']*1e3:.3f}</td>"
                         f"<td>{m['current_gap_rms']:.3f}</td><td>{m['jerk_rms']:.1f}</td>"
                         f"<td>{m['jerk_peak']:.1f}</td></tr>")
-    return ("<table><tr><th>run</th><th>joint</th><th>position RMSE (mrad)</th>"
-            "<th>max position error (mrad)</th><th>current-gap RMS (A)</th>"
-            "<th>RMS jerk (rad/s^3)</th><th>peak jerk (rad/s^3)</th></tr>"
-            + "".join(rows) + "</table>")
+    table = ("<table><tr><th>run</th><th>joint</th><th>position RMSE (mrad)</th>"
+             "<th>max position error (mrad)</th><th>current-gap RMS (A)</th>"
+             "<th>RMS jerk (rad/s^3)</th><th>peak jerk (rad/s^3)</th></tr>"
+             + "".join(rows) + "</table>")
+    defs = _defs(
+        ("position RMSE", "sqrt(mean((actual_q &minus; target_q)&sup2;)), whole run"),
+        ("max position error", "max|actual_q &minus; target_q|, whole run"),
+        ("current-gap RMS", "sqrt(mean((actual_current &minus; target_current)&sup2;)), whole run"),
+        ("jerk", "d&sup2;(actual_qd)/dt&sup2; &mdash; RMS/peak of that, whole run"),
+    )
+    return table + defs
 
 
 def per_run_table(recs: dict) -> str:
@@ -123,11 +137,19 @@ def per_run_table(recs: dict) -> str:
                     f"<td>{m['settling_time_mean']*1e3:.1f} / {m['settling_time_max']*1e3:.1f}</td>"
                     f"<td>{m['residual_vib_rms_mean']*1e3:.3f} / {m['residual_vib_rms_max']*1e3:.3f}"
                     "</td></tr>")
-    return ("<table><tr><th>run</th><th>cycle time (s)</th>"
-            "<th>peak overshoot mean/max (mrad)</th>"
-            "<th>settling time mean/max (ms)</th>"
-            "<th>residual vibration RMS mean/max (mrad)</th></tr>"
-            + "".join(rows) + "</table>")
+    table = ("<table><tr><th>run</th><th>cycle time (s)</th>"
+             "<th>peak overshoot mean/max (mrad)</th>"
+             "<th>settling time mean/max (ms)</th>"
+             "<th>residual vibration RMS mean/max (mrad)</th></tr>"
+             + "".join(rows) + "</table>")
+    defs = _defs(
+        ("cycle time", "t[last] &minus; t[first]"),
+        ("peak overshoot", "max(&plusmn;(actual_q &minus; dest), 0), past the destination, per move"),
+        ("settling time", "time until |actual_q &minus; dest| stays &lt; 0.01 rad, per move"),
+        ("residual vibration RMS", "sqrt(mean((actual_q &minus; dest)&sup2;)) over the post-stop settle window, per move"),
+        ("mean/max", "averaged, and peaked, over every move (segment) in the run"),
+    )
+    return table + defs
 
 
 def reality_gap_section(model, recs: dict) -> str:
@@ -135,9 +157,14 @@ def reality_gap_section(model, recs: dict) -> str:
     (diagnostics.reality_gap_error) -- whether the model predicts the real
     robot, not just how well it fit its own training rows."""
     m = reality_gap_error(model, list(recs.values()))
+    defs = _defs(
+        ("err", "predicted_actual &minus; actual, over every joint &amp; row of every run listed"),
+        ("RMSE", "sqrt(mean(err&sup2;))"),
+        ("R2", "1 &minus; &sum;err&sup2; / &sum;(actual &minus; mean(actual))&sup2;"),
+    )
     return (f"<h2>Reality-gap prediction error</h2>"
             f"<p>Model {model.predicts()} vs {', '.join(recs)}: "
-            f"RMSE {m['rmse']:.3f}, R2 {m['r2']:.3f}</p>")
+            f"RMSE {m['rmse']:.3f}, R2 {m['r2']:.3f}</p>" + defs)
 
 
 HTML = """<!doctype html>
@@ -150,9 +177,13 @@ th, td {{ border: 1px solid #ccc; padding: 4px 10px; text-align: right; font-siz
 th {{ background: #f2f2f2; }}
 td:first-child, td:nth-child(2), th:first-child, th:nth-child(2) {{ text-align: left; }}
 img {{ max-width: 100%; display: block; margin: 0.5rem 0 1.5rem; }}
+p.defs {{ font-size: 0.8rem; color: #666; line-height: 1.5; margin: -0.5rem 0 1.5rem; }}
+p.defs code {{ font-family: ui-monospace, "SF Mono", Consolas, monospace; color: #444; }}
+p.desc {{ color: #444; max-width: 780px; }}
 </style></head>
 <body>
 <h1>Case 2 report</h1>
+{description}
 <p>Runs: {runs}</p>
 <h2>Per-joint metrics</h2>
 {per_joint_table}
@@ -181,6 +212,9 @@ def main():
     ap.add_argument("--distill", default=None,
                     help="a DistillModel pickle; adds a reality-gap prediction-error "
                          "section (RMSE/R2 of the model against these --csvs)")
+    ap.add_argument("--description", default=None,
+                    help="short text shown under the title, explaining what this report's "
+                         "--csvs are and what question it answers")
     args = ap.parse_args()
 
     labels = args.labels or [os.path.splitext(os.path.basename(c))[0] for c in args.csvs]
@@ -201,7 +235,10 @@ def main():
         from train_distillation_model import DistillModel
         gap_section = reality_gap_section(DistillModel.load(args.distill), recs)
 
-    html = HTML.format(runs=", ".join(labels), per_joint_table=per_joint_table(recs),
+    description = f'<p class="desc">{args.description}</p>' if args.description else ""
+
+    html = HTML.format(runs=", ".join(labels), description=description,
+                       per_joint_table=per_joint_table(recs),
                        per_run_table=per_run_table(recs), reality_gap_section=gap_section,
                        current_imgs=current_imgs, profile_section=profile_section)
     with open(args.out, "w") as f:
