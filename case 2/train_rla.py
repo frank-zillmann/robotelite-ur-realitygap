@@ -50,8 +50,9 @@ from utils import ACC_COL, N_JOINTS, SCRIPT_COL, VEL_COL, get_block, set_block
 SIM_TO_REAL = "sim_to_real.csv"
 
 # Action bounds in the URScript units, which are rad/s and rad/s^2 -- NOT deg. A
-# movej speed above the joint limit (MAX_JOINT_SPEED, 2.094 rad/s) is clamped by
-# the controller, so the top of the range stays just under it: an agent that
+# movej speed above the joint limit (MAX_JOINT_SPEED, pi rad/s -- the UR5e's
+# uniform 180 deg/s) is clamped by the controller, so the top of the range stays
+# just under it: an agent that
 # proposes a clamped speed gets no feedback from the extra number, and the script
 # it writes runs at the same speed as every other clamped one.
 VEL_BOUNDS = (0.3, 2.0)
