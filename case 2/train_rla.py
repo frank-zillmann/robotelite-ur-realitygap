@@ -107,6 +107,18 @@ PATH_OBJECTIVE = lambda max_score, cycle_time: \
 PATH_ROWS = 50
 SERVO_DT_BOUNDS = (0.004, 0.02)
 
+# Settling window scored for vibration: seconds of held-still commanded
+# position appended after a candidate's active motion, so the PDF's
+# peak/rms ("for t in the settling window") formulas have a real post-stop
+# window to score, rather than being computed over the motion itself.
+# Measured, not guessed: bronze_tier/segment_stats.csv's real i1->i2 windows
+# (2497 real segments) have median 0.749s -- rounded to 0.75s. That
+# distribution is bimodal (~1/4 of segments are back-to-back moves with an
+# i1->i2 near 0, the rest cluster tightly at ~0.75s, matching scripts that
+# do pause between moves) -- 0.75s reflects the "there is a real settle
+# period" regime, which is the one worth scoring.
+SETTLE_S = 0.75
+
 
 def move_line(rec: Recording, move):
     """Straight joint-space line of a movej: ``(start, travel, distance)``.
@@ -247,15 +259,47 @@ class _MoveEnv(gym.Env):
         u = np.linspace(0.0, 1.0, len(g))
         return np.column_stack([np.interp(s, u, g[:, j]) for j in range(N_JOINTS)])
 
-    def _candidate(self, move, s, dt, vel_deg, acc_deg):
-        """Per-row score of the candidate whose progress is ``s(t)`` at step ``dt``.
+    def _score_settled(self, move, q, s, dt, vel_deg, acc_deg) -> np.ndarray:
+        """Per-row score over the settling window after ``q``'s own motion.
 
-        Places the move's geometry at the given progress, asks ``dynamics`` for the
-        commanded frame, and scores it through the model and metric.
+        Appends ``SETTLE_S`` seconds of the commanded position held still at
+        ``q[-1]`` (the destination), scores the *whole* extended trajectory
+        through the model and metric, and returns only the appended rows'
+        scores -- not the motion's. This is the fix for a real gap: without
+        it, a candidate trajectory ended the instant its commanded motion did,
+        so there was no post-stop window at all for the PDF's peak/rms
+        ("for t in the settling window") to be computed over -- RMS/peak were
+        silently being computed over the motion itself instead, structurally
+        unable to see any post-stop ring even if the model could predict one.
+
+        The held-still portion still goes through ``dynamics.Dynamics.frame``
+        (not skipped) so ``target_qd``/``target_qdd`` come out as a
+        continuous, physically sensible decay through the stop (via
+        ``np.gradient`` over the *combined* array) rather than an abrupt
+        jump to exactly zero, and so ``current()`` gets a real qdd=0 (holding
+        torque = gravity torque, correctly) instead of an arbitrary value.
+        ``s`` is held at its final value for every appended row, so the
+        cached per-move pose terms (``Dynamics.prepare``) are looked up at
+        the destination pose throughout, matching a robot that has arrived
+        and stopped moving.
+        """
+        n_settle = max(1, int(round(SETTLE_S / dt)))
+        q_settled = np.vstack([q, np.tile(q[-1], (n_settle, 1))])
+        s_settled = np.concatenate([np.asarray(s, dtype=float), np.full(n_settle, float(s[-1]))])
+        frame = self.dyn.frame(q_settled, dt, vel_deg, acc_deg, s=s_settled, key=move.i0)
+        scores = evaluate(self.model, self.metric, frame, self.pre)
+        return scores[len(q):]
+
+    def _candidate(self, move, s, dt, vel_deg, acc_deg):
+        """Settle-window score of the candidate whose active-motion progress
+        is ``s(t)`` at step ``dt``.
+
+        Places the move's geometry at the given progress, then scores only
+        the settling window after it (``_score_settled``) -- matching the
+        PDF's peak/rms definitions, not the motion itself.
         """
         q = self._q_at(move, s)
-        frame = self.dyn.frame(q, dt, vel_deg, acc_deg, s=s, key=move.i0)
-        return evaluate(self.model, self.metric, frame, self.pre)
+        return self._score_settled(move, q, s, dt, vel_deg, acc_deg)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -346,18 +390,21 @@ class PathEnv(_MoveEnv):
         return float(self._candidate(move, s, dt, vel, acc).max()), PATH_ROWS * dt
 
     def baseline(self, move) -> tuple[float, float]:
-        """(max per-row score, cycle_time) for the recorded motion, its own timing.
+        """(max settle-window score, cycle_time) for the recorded motion, its own timing.
 
         The recorded trajectory carries the controller's speed profile from the
         move's vel/acc, so this is the fixed baseline the re-timing is compared to.
+        Routed through ``_score_settled`` (same as ``score()``'s ``_candidate``
+        call) so this is a peak-over-settling-window number, not a peak-over-the-
+        motion number -- otherwise baseline vs. optimized would be comparing two
+        different quantities, not the same quantity at two speeds.
         """
         g = self._geo[move.i0]                       # recorded q(i0:i1), full resolution
         n, dt = len(g), self.rec.dt
         s = np.linspace(0.0, 1.0, n)
         vel = float(move.vel) if move.vel is not None else 0.0
         acc = float(move.acc) if move.acc is not None else 0.0
-        frame = self.dyn.frame(g, dt, vel, acc, s=s, key=move.i0)
-        return float(evaluate(self.model, self.metric, frame, self.pre).max()), n * dt
+        return float(self._score_settled(move, g, s, dt, vel, acc).max()), n * dt
 
     def _cost(self, move, action) -> tuple[float, float, float]:
         max_score, cycle = self.score(move, *self.unpack(action))

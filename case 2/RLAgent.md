@@ -24,7 +24,7 @@ Two modes, `--mode params`/`--mode path`:
 |---|---|---|
 | geometry | straight joint-space line, start→dest | the move's *recorded* joint trajectory (path preserved) |
 | action | `(vel, acc)`, deg/s and deg/s² | `(accel_frac, decel_frac, servoj dt)` — re-times the same path |
-| score reduction | RMS over the move's rows | max over the move's rows (peak, not average) |
+| score reduction | RMS over the settling window's rows | max over the settling window's rows (peak, not average) |
 
 Both are **one-step contextual bandits**, not multi-step episodes:
 `reset()` picks a random move from the script(s), `step(action)` scores that
@@ -42,15 +42,81 @@ decision-making across a trajectory — each move is scored independently.
   `ACC_BOUNDS = (40, 600)` deg/s² — the upper end is chosen so a `movej`
   speed above the joint limit (~180 deg/s = π rad/s) clamps anyway, so the
   useful range stays below where clamping would make the action meaningless.
-- **Scoring a candidate** (`_candidate`/`evaluate`): places the move's
-  geometry at the agent's chosen speed profile, asks `dynamics.Dynamics` for
-  the commanded trajectory (target_q/qd/current), asks the **distill model**
-  to predict `actual_q` for it, then the **metric** scores the predicted gap.
-  Nothing here touches a real robot — every score during training is a
-  prediction from the distill model, evaluated on a synthetic candidate
-  trajectory built by `dynamics.py`, not a measurement.
+- **Scoring a candidate** (`_candidate`/`_score_settled`/`evaluate`): places
+  the move's geometry at the agent's chosen speed profile, appends
+  `SETTLE_S` seconds held at the destination (see §2a), asks
+  `dynamics.Dynamics` for the commanded trajectory (target_q/qd/current)
+  over the whole extended array, asks the **distill model** to predict
+  `actual_q`, then the **metric** scores the predicted gap — but only the
+  appended settling-window rows are returned/reduced, matching the case
+  brief's "for t in the settling window" definitions. Nothing here touches
+  a real robot — every score during training is a prediction from the
+  distill model, evaluated on a synthetic candidate trajectory built by
+  `dynamics.py`, not a measurement.
 - **Reward**: `-OBJECTIVE(score, cycle_time)` (params) or
   `-PATH_OBJECTIVE(max_score, cycle_time)` (path) — see §4.
+
+## 2a. The settling window (`_score_settled`) — fixed 2026-08-19
+
+**The gap.** The case brief's peak/RMS formulas are explicit:
+`peak = max(|actual(t) - target(t)|)` and `rms = sqrt(mean(...))`, both **"for
+t in the settling window"** — the period *after* a move arrives, where a real
+robot rings/overshoots before settling. Before this fix, a candidate
+trajectory in `_MoveEnv` ended the instant its commanded motion stopped: the
+last row scored was the destination-arrival row itself, and there was no
+row after it at all. `_aggregate()` (RMS, `GapEnv`) and `.max()` (peak,
+`PathEnv`) were therefore computed **over the motion**, not the settling
+window — a structural gap, not a documentation caveat: even a model that
+could predict a perfect ring had no post-stop rows to show it on.
+
+**The fix.** `_MoveEnv._score_settled(move, q, s, dt, vel_deg, acc_deg)`
+appends `SETTLE_S` seconds of the commanded position held still at the
+move's destination (`q[-1]`) after the candidate's own trajectory, scores
+the *whole* extended array through `dynamics.Dynamics.frame` and
+`evaluate()` as usual, and returns only the appended rows' scores — never
+the motion's. `_candidate()` (called by both `GapEnv.score()` and
+`PathEnv.score()`) now delegates to it, so both envs' `.score()` picked up
+the fix with **no change to `GapEnv.score()`/`PathEnv.score()` themselves**
+— they already just reduce whatever `_candidate()` returns.
+`PathEnv.baseline()` built its frame directly rather than through
+`_candidate()`, so it needed its own one-line fix (call `_score_settled`
+too) — otherwise the "before" number in `baseline_vs_optimized.png` would be
+a peak-over-the-motion number compared against an "after" number that's
+peak-over-the-settling-window, an apples-to-oranges comparison hiding
+inside a chart that looks like a fair one.
+
+The held-still portion is still run through `Dynamics.frame` (not
+hand-set to zero) so `target_qd`/`target_qdd` come out of `np.gradient` as a
+continuous decay through the stop rather than an abrupt jump, giving
+`current()` a physically sensible qdd≈0 (holding torque = gravity torque)
+for those rows; `s` is held at its final value throughout the appended
+rows so the cached per-move pose terms (`Dynamics.prepare`) stay at the
+destination pose, matching a robot that has arrived and stopped.
+
+**`SETTLE_S = 0.75`, measured not guessed**: `bronze_tier/segment_stats.csv`
+has real `i1`→`i2` (motion-stop → next-move-start) windows for 2497 real
+segments; `(i2 - i1) * dt` has median 0.749s. The distribution is bimodal —
+about a quarter of segments are back-to-back moves with an `i1`→`i2` near
+zero, the rest cluster tightly around 0.75s (scripts that pause between
+moves) — 0.75s was chosen to reflect the "there is a real settle period"
+regime, since that's the one actually worth scoring for vibration.
+
+**Verified offline** (`data/test-4.csv`, `models/distill.pkl`, no live
+robot/URSim): `SETTLE_S / dt` produced exactly the expected number of
+settle-window rows (96 at this recording's `dt≈0.00783s`); `cycle_time`
+(computed from `len(s) * dt`, the active-motion length only) was confirmed
+unaffected by the settle-window extension, as it should be — cycle time is
+about how long the move itself takes, not the settle period after it;
+`GapEnv`/`PathEnv` `.step()` and a 200-step `PPO.learn()` both ran without
+exceptions on both envs.
+
+**Not yet done**: no re-run of the real 20,000-step training campaign from
+§5 with this fix — the `best_score=0.000423`/`final_score_mean=0.001356`
+numbers recorded there predate it and are settle-window scores now, not
+motion scores, so they are **not directly comparable** to a future run's
+numbers even though the metric class and objective weights haven't
+changed. A fresh training run is needed before drawing any new
+before/after conclusions.
 
 ## 3. The metric: `PositionGapMetric`, not `CurrentGapMetric`
 
@@ -124,6 +190,12 @@ rolling mean dropped steadily (~3s → ~2s) while score's rolling mean stayed
 roughly flat (~0.0013 rad throughout, noisy, no clear trend)**. The agent
 learned to go faster; it did not learn to reduce predicted vibration.
 
+*(Superseded by §2a as of 2026-08-19: this run predates the settling-window
+fix, so its `score` numbers are peak/RMS over the motion, not the settling
+window the case brief asks for. Kept here as the historical record of the
+"score is flat, cycle time drops" finding, which is still the relevant
+question to re-check once §2a's fix has a fresh training run behind it.)*
+
 This is consistent with, not contrary to, `ModelReview.md`'s documented
 limitation: the distill model has no lag/history features, so it can't
 represent the settle-window ring — the actual thing "vibration" refers to
@@ -163,8 +235,17 @@ asks for. Not yet generated from a real trained agent as of this writing
 
 ## 7. Not yet done, known limitations
 
+- No fresh training run since the settling-window fix (§2a) — the real run
+  recorded in §5 predates it and its `score` numbers are not the settling-
+  window numbers the case brief asks for. Re-running training and
+  `run.py`'s `baseline_vs_optimized.png` is the immediate next step.
 - No lag/history features in the distill model → the agent can't be
-  expected to reduce vibration meaningfully yet (§5). This is the
+  expected to reduce vibration meaningfully yet (§5), and §2a's fix doesn't
+  change this: appending a held-still tail gives the metric real settling-
+  window *rows* to score, but the distill model still predicts each row
+  from that row's own instantaneous features, with no memory of the
+  approach that preceded it — so it still can't represent a decaying ring,
+  it can now just be *asked* about the right time window. This is the
   highest-priority fix, and it lives in `train_distillation_model.py`, not
   here — see `ModelReview.md` §7 item 2.
 - Leave-one-file-out validation of the distill model itself is still
@@ -179,6 +260,20 @@ asks for. Not yet generated from a real trained agent as of this writing
 
 ## Changelog
 
+- **2026-08-19** — Gold-tier gap fix: candidates now score a real
+  post-stop **settling window** (§2a), not the motion itself, matching the
+  case brief's `peak`/`rms` "for t in the settling window" requirement.
+  Added `_MoveEnv._score_settled` (appends `SETTLE_S=0.75s` — measured from
+  `bronze_tier/segment_stats.csv`'s real `i1`→`i2` windows — of held-still
+  destination position, scores only the appended rows) and routed
+  `_candidate()` through it, so `GapEnv.score()`/`PathEnv.score()` picked up
+  the fix with no changes of their own; fixed `PathEnv.baseline()`
+  separately (it built its frame directly, bypassing `_candidate()`) so
+  baseline-vs-optimized stays an apples-to-apples comparison. Verified
+  offline against `data/test-4.csv`: correct settle-row count, `cycle_time`
+  unaffected, both envs step/train without exceptions. The real training
+  run in §5 predates this fix and needs re-running before its numbers are
+  trusted again.
 - **2026-08-19** — Created this file. Documents the `CurrentGapMetric` →
   `PositionGapMetric` wiring, the measured `SCORE_WEIGHT`/`PATH_SCORE_WEIGHT`
   recalibration (including the `PathEnv.baseline()` vs. `.score()`
