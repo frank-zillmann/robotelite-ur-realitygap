@@ -12,7 +12,7 @@ before any training instead of after).
     python collect_data.py --robot-ip 10.54.5.147           # record against real hardware
     python collect_data.py --robot-ip 10.54.5.147 --only T09 T10   # just the held-out pair
 
-Every run is logged to ``data/manifest.csv`` (trajectory, held_out, velocity
+Every run is logged to ``data/ur5e/manifest.csv`` (trajectory, held_out, velocity
 label + rad/s value, rep, output path, sample count, stop reason) so the dataset
 is reproducible and the held-out split is explicit and auditable, not just "the
 files I remembered not to touch".
@@ -40,7 +40,7 @@ from utils import load_script, set_param
 
 SCRIPTS_DIR = "scripts"
 GENERATED_DIR = os.path.join(SCRIPTS_DIR, "_generated")
-DATA_DIR = "data"
+DATA_DIR = "data/ur5e"
 HELDOUT_DIR = os.path.join(DATA_DIR, "heldout")
 MANIFEST = os.path.join(DATA_DIR, "manifest.csv")
 

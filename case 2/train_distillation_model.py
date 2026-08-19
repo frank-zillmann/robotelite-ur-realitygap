@@ -17,14 +17,14 @@ The channels a model fills must be the ones the metric reads (see metrics.py).
 
     from train_distillation_model import LinearModel, augment
     from analysis import Recording
-    m = LinearModel().fit([Recording("data/test-4.csv"), Recording("data/test-6.csv")])
+    m = LinearModel().fit([Recording("data/ur10e/test-4.csv"), Recording("data/ur10e/test-6.csv")])
     m.predicts()                          # ['actual_current']
     m.save("models/distill.pkl")
     augment(m, "sim_to_real.csv")         # overwrite actual_current with predictions
 
 Run as a script to train on the recorded runs, print held-out error, and save:
 
-    python train_distillation_model.py --csvs data/test-*.csv --out models/distill.pkl
+    python train_distillation_model.py --csvs data/ur10e/test-*.csv --out models/distill.pkl
 
 train_rla.py and run.py depend only on the interface, so a custom subclass of
 DistillModel (or LinearModel) can replace the baseline via its pickle.
@@ -224,7 +224,7 @@ def augment(model: DistillModel, csv: str, pre: Preprocess = None):
 
 def main():
     ap = argparse.ArgumentParser(description="Train the distillation model.")
-    ap.add_argument("--csvs", nargs="+", default=sorted(glob.glob("data/test-*.csv")),
+    ap.add_argument("--csvs", nargs="+", default=sorted(glob.glob("data/ur10e/test-*.csv")),
                     help="recorded runs to train on")
     ap.add_argument("--out", default="models/distill.pkl", help="pickle path")
     ap.add_argument("--holdout", type=float, default=0.2,

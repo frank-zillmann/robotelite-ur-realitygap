@@ -29,7 +29,7 @@ pip install -r requirements.txt
 - **Recorded runs** in `data/`, one CSV per run. Use the provided runs or record
   your own:
   ```bash
-  python record.py --robot-ip <ip> --out data/test-1.csv --float-register 1 vel 2 acc
+  python record.py --robot-ip <ip> --out data/ur5e/test-1.csv --float-register 1 vel 2 acc
   ```
   `record.py` reads the controller's RTDE stream and only logs; it never moves the
   robot. RTDE channels: <https://www.universal-robots.com/developer/communication-protocol/rtde/>.
@@ -41,7 +41,7 @@ Distill once, then either mode reuses the model.
 
 ```bash
 # 1. distill the gap model from the recorded real runs
-python train_distillation_model.py --csvs data/test-4.csv data/test-5.csv data/test-6.csv --out models/distill.pkl
+python train_distillation_model.py --csvs data/ur10e/test-4.csv data/ur10e/test-5.csv data/ur10e/test-6.csv --out models/distill.pkl
 
 # 2. train the RL agent on several scripts (--loop repeats each for more moves)
 python train_rla.py --mode params --robot-ip 127.0.0.1 --loop 5 --model models/distill.pkl --steps 20000 \
@@ -74,7 +74,7 @@ distillation.
 
 `record.py`/`send.py` log the URScript `movej(a=acc, v=vel)` numbers straight
 through (see `utils.VEL_COL`/`ACC_COL`): those are **radians**, movej's native
-units, not degrees. Older recordings in `data/legacy_unclamped/` were made
+units, not degrees. Older recordings in `data/ur10e/` were made
 before this was fixed -- their `vel`/`acc` columns hold deg-scale numbers (10,
 100, up to ~990) fed straight into `v=`/`a=`, which is rad/s, so every one of
 those runs saturated at the robot's real joint speed limit regardless of the
@@ -87,7 +87,7 @@ reference.
 file, and that file's header comment says what it moves) x 3 velocities
 (slow/medium/fast, rad/s) x 2 repetitions = 66 runs.
 **T09 and T10 are held out** -- new joint-space combinations no other
-trajectory trains on -- and are written to `data/heldout/` instead of `data/`,
+trajectory trains on -- and are written to `data/ur5e/heldout/` instead of `data/ur5e/`,
 specifically so it's structurally awkward to accidentally train on them. Use
 them only for a final generalization check, after everything else is decided.
 T11 moves wrist1/wrist2/wrist3 together (extending T06's wrist1+wrist2 combo
@@ -107,7 +107,7 @@ wrist1/wrist2 motion, T07/T10/T11's wrist3 motion, and T08/T09/T10's
 extended-reach poses) and refuses to move the
 robot until you pass
 `--yes-i-am-supervising`, confirming you've actually gone through it. Every run
-is logged to `data/manifest.csv`, so a partial batch (e.g. stopped because the
+is logged to `data/ur5e/manifest.csv`, so a partial batch (e.g. stopped because the
 robot wasn't in Remote Control mode) can be resumed with `--only`.
 
 ## Folder contents
