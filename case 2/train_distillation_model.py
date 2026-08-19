@@ -286,6 +286,33 @@ def augment(model: DistillModel, csv: str, pre: Preprocess = None):
     return df
 
 
+def _held_out_mask(recordings, holdout: float) -> np.ndarray:
+    """Row-level held-out mask, aligned with ``LinearModel._design``'s
+    stacking order (per recording, then per joint) but computed from each
+    row's position in one global, joint-independent time sequence -- so the
+    same underlying rows are held out for every joint.
+
+    ``_design`` stacks recording 1's joint-0 rows, then its joint-1 rows,
+    ... then recording 2's joint-0 rows, and so on. Taking
+    ``arange(len(y)) % step`` directly over that stacked array (the original
+    approach) phase-shifts the mask differently for each joint's block,
+    since each block starts at a different offset -- "row 1005" of joint 0's
+    block and "row 1005" of joint 1's block are different underlying moments
+    in time. Here the mask is computed once per recording, from a running
+    global row counter, and reused for every joint's block of that
+    recording, matching train_distillation_model.py's ``_row_split_eval``.
+    """
+    step = max(int(round(1 / holdout)), 2)
+    parts = []
+    offset = 0
+    for rec in recordings:
+        n = len(rec.target_q)
+        row_test = np.arange(offset, offset + n) % step == 0
+        parts.extend([row_test] * N_JOINTS)   # same mask, once per joint block
+        offset += n
+    return np.concatenate(parts)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Train the distillation model.")
     ap.add_argument("--csvs", nargs="+", default=sorted(glob.glob("data/test-*.csv")),
@@ -315,9 +342,9 @@ def main():
     X, y = model._design(recordings)
     print(f"{len(y)} rows from {len(recordings)} runs")
 
-    # Deterministic split (no RNG): every 1/holdout-th row is a test row.
-    step = max(int(round(1 / args.holdout)), 2)
-    is_test = np.arange(len(y)) % step == 0
+    # Deterministic split (no RNG): every 1/holdout-th row is a test row,
+    # aligned across joints (see _held_out_mask).
+    is_test = _held_out_mask(recordings, args.holdout)
     coef, *_ = np.linalg.lstsq(X[~is_test], y[~is_test], rcond=None)
     err = X[is_test] @ coef - y[is_test]
     rmse = float(np.sqrt(np.mean(err ** 2)))
