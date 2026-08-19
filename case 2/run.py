@@ -23,10 +23,14 @@ import os
 import re
 from datetime import datetime
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 from stable_baselines3 import PPO
 
-from metrics import CurrentGapMetric
+import ur_style
+from metrics import PositionGapMetric
 from preprocess import default_preprocess
 from train_distillation_model import DistillModel
 from train_rla import GapEnv, PathEnv, build_dataset, speed_profile
@@ -46,6 +50,48 @@ def script_moves(env):
 def _gain(base, opt) -> float:
     """Percent reduction from baseline mean to optimized mean (positive = lower)."""
     return 100 * (base.mean() - opt.mean()) / base.mean()
+
+
+def plot_baseline_vs_optimized(base: np.ndarray, opt: np.ndarray, mode: str,
+                               out_path: str):
+    """Mean score and cycle time, baseline vs. RL-optimized, side by side.
+
+    ``base``/``opt`` are ``(n_moves, 2)`` arrays (column 0 = score, column 1 =
+    cycle_time) from ``report``/``report_path``. This is the "did it actually
+    work" plot the training curve doesn't cover -- that one shows how
+    training progressed over timesteps, this one shows what the agent's
+    final choice is worth against the script's original fixed vel/acc,
+    which is the number the case brief actually asks for. Score and
+    cycle_time are different units, so they get separate panels rather than
+    one bar chart -- same reasoning as train_distillation_model.py's
+    per-joint RMSE/R² panels.
+    """
+    ur_style.apply()
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    labels = ["baseline\n(script)", "optimized\n(agent)"]
+
+    for ax, col, ylabel, fmt in [
+        (axes[0], 0, "Score (lower = less vibration)", "{:.4f}"),
+        (axes[1], 1, "Cycle time (s)", "{:.3f}"),
+    ]:
+        b, o = float(base[:, col].mean()), float(opt[:, col].mean())
+        bars = ax.bar(labels, [b, o], color=[ur_style.GRAY, ur_style.BLUE],
+                      edgecolor=ur_style.NAVY)
+        span = max(abs(b), abs(o)) or 1.0
+        for bar, v in zip(bars, [b, o]):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.015 * span,
+                    fmt.format(v), ha="center", va="bottom", fontsize=9.5,
+                    color=ur_style.NAVY)
+        gain = 100 * (b - o) / b if b else 0.0
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{gain:+.1f}%", color=(ur_style.BLUE if gain >= 0 else ur_style.NAVY),
+                    fontweight="bold")
+
+    fig.suptitle(f"Baseline vs. RL-optimized — {mode} mode", fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"[results] plot -> {out_path}")
 
 
 def _compare(base, opt):
@@ -71,7 +117,7 @@ def report(env: GapEnv, moves, vel: float, acc: float, label: str) -> np.ndarray
     return res
 
 
-def run_params(args, model, metric, rec, pre) -> dict:
+def run_params(args, model, metric, rec, pre, run_dir: str) -> dict:
     """Optimize the script's vel/acc and write the optimized script."""
     text = load_script(args.script)
     env = GapEnv(model, metric, rec, pre=pre)
@@ -82,6 +128,8 @@ def run_params(args, model, metric, rec, pre) -> dict:
     vel, acc = search_agent(env, moves, args.agent)
     opt = report(env, moves, vel, acc, "optimized")
     _compare(base, opt)
+    plot_baseline_vs_optimized(base, opt, args.mode,
+                               os.path.join(run_dir, "baseline_vs_optimized.png"))
 
     out = re.sub(r"\.script$", ".optimized.script", args.script)
     with open(out, "w") as f:
@@ -137,7 +185,7 @@ def build_full_path(rec, moves, plans):
     return rows
 
 
-def run_path(args, model, metric, rec, pre) -> dict:
+def run_path(args, model, metric, rec, pre, run_dir: str) -> dict:
     """Re-time each move and write the path CSV."""
     env = PathEnv(model, metric, rec, pre=pre)
     moves = script_moves(env)
@@ -148,6 +196,8 @@ def run_path(args, model, metric, rec, pre) -> dict:
     plans = agent_paths(env, moves, args.agent)
     opt = report_path(env, moves, plans, "optimized")
     _compare(base, opt)
+    plot_baseline_vs_optimized(base, opt, args.mode,
+                               os.path.join(run_dir, "baseline_vs_optimized.png"))
 
     rows = build_full_path(rec, moves, plans)
     out = re.sub(r"\.script$", ".path", args.script)
@@ -210,12 +260,12 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
 
     model = DistillModel.load(args.model)
-    metric = CurrentGapMetric()
+    metric = PositionGapMetric()
     pre = default_preprocess()
     sim_csv = os.path.join(run_dir,
                            re.sub(r"\.script$", ".sim_to_real.csv", os.path.basename(args.script)))
     rec = build_dataset(model, metric, [args.script], args.robot_ip, args.loop, pre, sim_csv)
-    metrics = (run_params if args.mode == "params" else run_path)(args, model, metric, rec, pre)
+    metrics = (run_params if args.mode == "params" else run_path)(args, model, metric, rec, pre, run_dir)
     log_run_result(args, metrics, sim_csv, RESULTS_DIR, dt_str)
 
 

@@ -74,12 +74,15 @@ class PositionGapMetric(EvaluationMetric):
 
     Needs ``actual_q``, which real recordings already carry (unlike
     ``actual_current``, URSim's ``actual_q`` isn't a degenerate 0.0 — it tracks
-    the commanded trajectory kinematically). The gap this reads is therefore
-    real on real recordings today; using it inside ``train_rla.py``'s candidate
-    scoring needs the distill model to predict ``actual_q`` first (candidate
-    frames from ``dynamics.Dynamics.frame`` don't emit an ``actual_q`` column
-    yet, only ``actual_current`` — the model has nothing to overwrite until it
-    does).
+    the commanded trajectory kinematically). Used both on real recordings
+    directly (the gap is already real there) and inside ``train_rla.py``'s
+    candidate scoring, where the distill model predicts ``actual_q`` first —
+    candidate frames from ``dynamics.Dynamics.frame`` don't pre-populate an
+    ``actual_q`` column, but they don't need to: ``train_rla.py``'s
+    ``evaluate()`` calls ``model.predict()`` (which only reads ``target_*``
+    columns) before writing the prediction in via ``set_block``, which
+    creates the column. Verified directly; this used to (incorrectly)
+    document that as a blocker.
     """
 
     def needs(self) -> list[str]:

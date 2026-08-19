@@ -44,12 +44,13 @@ from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 
+import ur_style
 from analysis import Recording
 from common import segments
 from dynamics import (DEG2RAD, GRID, MAX_JOINT_ACC, MAX_JOINT_SPEED, Dynamics,
                       default_dynamics, trapezoidal)
 from train_distillation_model import DistillModel, augment
-from metrics import CurrentGapMetric, EvaluationMetric, SCORE_COL, add_score
+from metrics import PositionGapMetric, EvaluationMetric, SCORE_COL, add_score
 from preprocess import Identity, Preprocess, default_preprocess
 from utils import ACC_COL, N_JOINTS, SCRIPT_COL, VEL_COL, get_block, set_block
 
@@ -66,12 +67,37 @@ ACC_BOUNDS = (40.0, 600.0)
 # --- objective the optimizer minimizes ---------------------------------------
 # Cost of one move, weighting the metric ``score`` against ``cycle_time`` (move
 # duration, s). The env uses reward = -cost; run.py scores with the same lambda.
-SCORE_WEIGHT = 1.0
+#
+# These weights are metric-scale-dependent and must be recalibrated whenever
+# the active EvaluationMetric changes (see metrics.py) -- they were originally
+# 1.0/1.0, tuned for CurrentGapMetric, whose amps-scale score (~1-10 after
+# _aggregate) happens to be roughly comparable to cycle_time in seconds.
+# PositionGapMetric's score is in radians and nowhere near that scale.
+# Measured directly against what the env actually calls during a step (not a
+# proxy -- GapEnv.score()/PathEnv.score() with randomly sampled actions, real
+# recordings, models/distill.pkl):
+#   GapEnv  (RMS-aggregated score, GapEnv.score, 40 random-vel/acc samples):
+#       mean score 0.00107 rad, mean cycle_time 2.71 s -> ratio ~2524x
+#   PathEnv (max per-row score, PathEnv.score with sampled path actions --
+#            NOT PathEnv.baseline(), which times the full recorded
+#            trajectory and gave a misleading ~1929x on a first pass; the
+#            actual per-step cycle_time is PATH_ROWS(50) * agent-chosen
+#            servoj dt, a much shorter window):
+#       mean score 0.03002 rad, mean cycle_time 0.6085 s -> ratio ~20x
+# Leaving SCORE_WEIGHT/PATH_SCORE_WEIGHT at 1.0 with PositionGapMetric would
+# make the objective approx= cycle_time alone -- the agent would optimize
+# almost purely for speed, the vibration-minimization term silently
+# negligible. Values below bring both terms to comparable influence,
+# verified directly (case 2/results/../ see ModelReview.md): GapEnv's ratio
+# came out 0.95 (balanced), PathEnv's 79.5 on a first pass with the wrong
+# calibration, ~1 after the fix. CYCLE_WEIGHT/PATH_CYCLE_WEIGHT stay 1.0 as
+# the stable reference the score weight is calibrated against.
+SCORE_WEIGHT = 2500.0
 CYCLE_WEIGHT = 1.0
 OBJECTIVE = lambda score, cycle_time: SCORE_WEIGHT * score + CYCLE_WEIGHT * cycle_time
 
 # Path-mode cost. ``max_score`` is the worst per-row score over the path.
-PATH_SCORE_WEIGHT = 1.0
+PATH_SCORE_WEIGHT = 20.0
 PATH_CYCLE_WEIGHT = 1.0
 PATH_OBJECTIVE = lambda max_score, cycle_time: \
     PATH_SCORE_WEIGHT * max_score + PATH_CYCLE_WEIGHT * cycle_time
@@ -408,6 +434,7 @@ def log_training_run(mode: str, scripts: list, steps: int, agent_path: str,
     print(f"[results] log  -> {log_path}")
 
     # ---- training_curve.png --------------------------------------------------
+    ur_style.apply()
     w = max(1, len(scores) // 20)
     sm_score  = _rolling_mean(scores,      w)
     sm_reward = _rolling_mean(rewards,     w)
@@ -415,33 +442,30 @@ def log_training_run(mode: str, scripts: list, steps: int, agent_path: str,
 
     fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
 
-    axes[0].plot(timesteps, scores,    alpha=0.15, color="steelblue",  linewidth=0.6)
-    axes[0].plot(timesteps, sm_score,  color="steelblue",  linewidth=1.6,
+    axes[0].plot(timesteps, scores,    alpha=0.15, color=ur_style.BLUE, linewidth=0.6)
+    axes[0].plot(timesteps, sm_score,  color=ur_style.BLUE, linewidth=1.6,
                  label=f"rolling mean (w={w})")
-    axes[0].axhline(best_score, color="green", linestyle="--", linewidth=1.0,
+    axes[0].axhline(best_score, color=ur_style.GRAY, linestyle="--", linewidth=1.0,
                     label=f"best = {best_score:.4f}")
-    axes[0].set_ylabel("Score")
+    axes[0].set_ylabel("Score (rad — lower = better)")
     axes[0].set_title(f"Training Curve — {mode} mode | {steps} steps | "
                       f"{len(records)} episodes")
     axes[0].legend(fontsize=8)
-    axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(timesteps, cycle_times, alpha=0.15, color="darkorange", linewidth=0.6)
-    axes[1].plot(timesteps, sm_cycle,    color="darkorange", linewidth=1.6,
+    axes[1].plot(timesteps, cycle_times, alpha=0.15, color=ur_style.MID_BLUE, linewidth=0.6)
+    axes[1].plot(timesteps, sm_cycle,    color=ur_style.MID_BLUE, linewidth=1.6,
                  label=f"rolling mean (w={w})")
-    axes[1].axhline(best_cycle, color="green", linestyle="--", linewidth=1.0,
+    axes[1].axhline(best_cycle, color=ur_style.GRAY, linestyle="--", linewidth=1.0,
                     label=f"best = {best_cycle:.3f} s")
-    axes[1].set_ylabel("Cycle time (s)")
+    axes[1].set_ylabel("Cycle time (s — lower = faster)")
     axes[1].legend(fontsize=8)
-    axes[1].grid(True, alpha=0.3)
 
-    axes[2].plot(timesteps, rewards,    alpha=0.15, color="purple", linewidth=0.6)
-    axes[2].plot(timesteps, sm_reward,  color="purple", linewidth=1.6,
+    axes[2].plot(timesteps, rewards,    alpha=0.15, color=ur_style.DARK_BLUE, linewidth=0.6)
+    axes[2].plot(timesteps, sm_reward,  color=ur_style.DARK_BLUE, linewidth=1.6,
                  label=f"rolling mean (w={w})")
-    axes[2].set_ylabel("Reward (−objective)")
+    axes[2].set_ylabel("Reward (−cost — higher = better)")
     axes[2].set_xlabel("Timestep")
     axes[2].legend(fontsize=8)
-    axes[2].grid(True, alpha=0.3)
 
     fig.tight_layout()
     plot_path = os.path.join(run_dir, "training_curve.png")
@@ -525,7 +549,7 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
 
     model = DistillModel.load(args.model)
-    metric = CurrentGapMetric()
+    metric = PositionGapMetric()
     pre = default_preprocess()
     sim_csv = os.path.join(run_dir, "sim_to_real.csv")
     rec = build_dataset(model, metric, args.scripts, args.robot_ip, args.loop, pre, sim_csv)

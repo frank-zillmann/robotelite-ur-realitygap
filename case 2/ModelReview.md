@@ -16,10 +16,9 @@ interface still hands back an absolute angle like any other `DistillModel`.
 
 Current (`actual_current`) is no longer predicted by anything in this file.
 The old current-predicting `LinearModel` was removed entirely (see
-Changelog). `train_rla.py`/`run.py` still default to
-`metrics.CurrentGapMetric` and expect `actual_current` — they have not been
-updated yet and will not work with a model saved from this file until they
-switch to `metrics.PositionGapMetric`.
+Changelog). `train_rla.py`/`run.py` now default to `metrics.PositionGapMetric`
+and load `models/distill.pkl` (a position-predicting model) — wired up and
+verified 2026-08-19, see §8.
 
 ## 2. Models: `PerJointPositionModel` and `PerJointTreeModel`
 
@@ -410,19 +409,80 @@ that doesn't have any.
   an `actual_q{j} = 0.0` placeholder to `frame()` anyway would make the
   candidate frame's schema match a real recording's before the model runs,
   for readability — but it fixes nothing that's actually broken.
-7. `train_rla.py`/`run.py` still wired to `CurrentGapMetric`/`actual_current`
-  — need to switch to `PositionGapMetric` before they'll run against a model
-  from this file. **Also needs `SCORE_WEIGHT`/`CYCLE_WEIGHT` (and
-  `PATH_SCORE_WEIGHT`/`PATH_CYCLE_WEIGHT`) reconsidered when this happens**:
-  `CurrentGapMetric`'s score is in amps (order ~1-10 after aggregation),
-  comparable to `cycle_time` in seconds — `PositionGapMetric`'s score is in
-  radians (order ~0.01), 100-500x smaller. Swapping the metric class without
-  rescaling/reweighting would make `OBJECTIVE ≈ cycle_time` alone — the
-  agent would optimize almost purely for speed, silently dropping the
-  vibration-minimization term instead of balancing it.
+7. ~~`train_rla.py`/`run.py` still wired to `CurrentGapMetric`/`actual_current`~~
+  — done, see §8.
+
+## 8. Wired into `train_rla.py`/`run.py` (2026-08-19)
+
+Both now default to `metric = PositionGapMetric()` (`train_rla.py:546`,
+`run.py:213`) and load `models/distill.pkl`, a position-predicting model —
+the RL pipeline runs against position, not current.
+
+**The objective weights had to be recalibrated, not just left at 1.0/1.0** —
+`CurrentGapMetric`'s amps-scale score happened to be roughly comparable to
+`cycle_time` in seconds; `PositionGapMetric`'s radians-scale score is not.
+Measured directly (not guessed) against what `GapEnv.score()`/
+`PathEnv.score()` actually compute, using real recordings and
+`models/distill.pkl`:
+
+| env | score (raw) | cycle_time | ratio | weight chosen |
+|---|---|---|---|---|
+| `GapEnv` (RMS-aggregated) | 0.00107 rad | 2.71 s | ~2524x | `SCORE_WEIGHT = 2500.0` |
+| `PathEnv` (max per-row) | 0.03002 rad | 0.6085 s | ~20x | `PATH_SCORE_WEIGHT = 20.0` |
+
+`CYCLE_WEIGHT`/`PATH_CYCLE_WEIGHT` stay at 1.0 as the reference the score
+weight is calibrated against. **A real mistake made and caught while doing
+this**: the first `PathEnv` measurement used `PathEnv.baseline()` (which
+times the *full recorded trajectory* at its own resolution) instead of
+`PathEnv.score()` (which is what `.step()`/training actually call, timed as
+`PATH_ROWS(50) × the agent's chosen servoj dt` — a much shorter window).
+That gave a wrong ~1929x ratio and a `PATH_SCORE_WEIGHT` overshooting the
+real target by ~80x. Caught by verifying against the *actual* call path
+instead of a plausible-looking proxy, not by re-deriving the same number
+twice.
+
+**Verified end to end, offline** (no live robot/URSim reachable here; both
+send.py's `record_run` and `collect_moves` need one):
+- Built `GapEnv`/`PathEnv` directly on a real recording (`data/test-4.csv`,
+  360 real moves) instead of via `collect_moves` — `_MoveEnv` only needs a
+  `Recording`, doesn't care whether it came from a live run or a CSV already
+  on disk.
+- Stepped both envs with random actions and confirmed both objective terms
+  are now comparably influential: `GapEnv` ratio 0.93, `PathEnv` ratio 0.46
+  (both within a 0.2–5x "balanced" band; before the fix, `CYCLE_WEIGHT`'s
+  term would have outweighed `SCORE_WEIGHT`'s by ~2500x and ~80x
+  respectively).
+- Ran a short `PPO.learn()` (200 timesteps) on both envs end to end with no
+  exceptions — confirms the gymnasium/stable-baselines3 integration holds
+  with the new metric, not just that construction succeeds.
+- Also found and fixed, unrelated to the metric wiring: `models/distill.pkl`
+  on disk was a stale `PerJointTreeModel` pickle predating the gravity
+  feature (7 features saved, current code builds 8) — `predict()` raised a
+  scikit-learn feature-count `ValueError`. Retrained fresh
+  (`--model linear_per_joint --out models/distill.pkl`); numbers matched the
+  already-recorded ones exactly (§6), confirming the retrain itself changed
+  nothing. Worth remembering generally: a pickled model's feature
+  compatibility is coupled to the code that built it — regenerate saved
+  models after any `FEATURE_NAMES`/feature-construction change, don't assume
+  an old pickle still matches.
+
+**Still not done, deliberately out of scope for this pass** (per §7's
+remaining items and the original ask): no lag/history features, so any
+resulting RL policy can't account for the settle-window ring it's meant to
+be minimizing — treat as preliminary. Leave-one-file-out validation of the
+distill model itself is still unverified.
 
 ## Changelog
 
+- **2026-08-19** — Wired `PositionGapMetric` into `train_rla.py`/`run.py`
+  (see §8 for full detail): metric swap, `SCORE_WEIGHT`/`PATH_SCORE_WEIGHT`
+  recalibrated from measured score/cycle_time ratios (~2524x, ~20x) rather
+  than left at 1.0, `metrics.py`'s stale `PositionGapMetric` docstring fixed
+  to match the §7-item-6 correction. Verified offline end to end (`GapEnv`/
+  `PathEnv` built directly on a real recording, stepped, and a short PPO run
+  completed on both, no live robot/URSim available here). Also fixed a
+  stale `models/distill.pkl` pickle (predated the gravity feature, wrong
+  feature count) unrelated to this task but found while testing it.
 - **2026-08-19** — Corrected §7: the "`dynamics.Dynamics.frame()` needs an
   `actual_q` placeholder" item had been carried forward unverified since
   early in the session (a version of it was actually checked and ruled out
