@@ -5,8 +5,8 @@
     needs()      -> per-joint channel bases this metric reads
     per_row(df)  -> (n,) score, one value per row
 
-The default ``CurrentGapMetric`` is the current-tracking gap. A subclass can read
-other channels (position error, jerk, a mix); each must be a channel the recording
+The default ``GapMetric("q")`` is the position-tracking gap. A subclass can read
+other channels (currents, jerk, a mix); each must be a channel the recording
 carries or the distill model predicts.
 """
 from __future__ import annotations
@@ -35,15 +35,23 @@ class EvaluationMetric(ABC):
         """Score for every row of ``df``, shape ``(n,)``."""
 
 
-class CurrentGapMetric(EvaluationMetric):
-    """Current-tracking gap: ``|actual_current - target_current|`` summed over joints."""
+class GapMetric(EvaluationMetric):
+    """Tracking gap ``|actual_X - target_X|`` summed over joints, X = ``quantity``.
+
+    ``"q"`` (rad) is the reality gap itself: overshoot and the ring-down after a
+    stop. ``"current"`` (A) scores the torque it took instead. The quantity has to
+    be one the distill model fills in (``DistillModel.predicts``).
+    """
+
+    def __init__(self, quantity: str = "q"):
+        self.quantity = quantity
 
     def needs(self) -> list[str]:
-        return ["target_current", "actual_current"]
+        return [f"target_{self.quantity}", f"actual_{self.quantity}"]
 
     def per_row(self, df) -> np.ndarray:
-        gap = np.abs(get_block(df, "actual_current") - get_block(df, "target_current"))
-        return gap.sum(axis=1)
+        t, a = self.needs()
+        return np.abs(get_block(df, a) - get_block(df, t)).sum(axis=1)
 
 
 def add_score(df, metric: EvaluationMetric):

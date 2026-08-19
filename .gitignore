@@ -1,3 +1,9 @@
+/case 2/*.csv
+/case 2/models/
+/case 2/runs/
+/.vscode/
+CLAUDE.md
+
 # ── OS / editor cruft ───────────────────────────────────────────────────────
 .DS_Store
 **/.DS_Store

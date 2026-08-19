@@ -42,7 +42,7 @@ from common import segments
 from dynamics import (DEG2RAD, GRID, MAX_JOINT_ACC, MAX_JOINT_SPEED, Dynamics,
                       default_dynamics, trapezoidal)
 from train_distillation_model import DistillModel, augment
-from metrics import CurrentGapMetric, EvaluationMetric, SCORE_COL, add_score
+from metrics import GapMetric, EvaluationMetric, SCORE_COL, add_score
 from preprocess import Identity, Preprocess, default_preprocess
 from utils import ACC_COL, N_JOINTS, SCRIPT_COL, VEL_COL, get_block, set_block
 
@@ -138,7 +138,7 @@ def evaluate(model: DistillModel, metric: EvaluationMetric, frame,
     ``augment`` does, so env reward, run.py, and the saved dataset agree.
     """
     frame = pre.transform_distill(frame)
-    preds = model.predict(frame)
+    preds = model.predict(frame)["mean"]
     for base in model.predicts():
         set_block(frame, base, preds[base])
     frame = pre.revert_distill(frame)
@@ -304,11 +304,17 @@ class PathEnv(_MoveEnv):
         return accel_frac, decel_frac, dt
 
     def score(self, move, accel_frac, decel_frac, dt) -> tuple[float, float]:
-        """(max per-row score, cycle_time) for a re-timed path of ``move``."""
-        s = speed_profile(accel_frac, decel_frac, PATH_ROWS)
+        """(max per-row score, cycle_time) for a re-timed path of ``move``.
+
+        The motion lasts ``PATH_ROWS * dt`` whatever the servoj step is, but it is
+        sampled for scoring at the recording's step: DistillModel is a temporal
+        filter and only holds at the rate it was trained on.
+        """
+        cycle = PATH_ROWS * dt
+        s = speed_profile(accel_frac, decel_frac, max(2, round(cycle / self.rec.dt)))
         vel = float(move.vel) if move.vel is not None else 0.0
         acc = float(move.acc) if move.acc is not None else 0.0
-        return float(self._candidate(move, s, dt, vel, acc).max()), PATH_ROWS * dt
+        return float(self._candidate(move, s, self.rec.dt, vel, acc).max()), cycle
 
     def baseline(self, move) -> tuple[float, float]:
         """(max per-row score, cycle_time) for the recorded motion, its own timing.
@@ -372,7 +378,7 @@ def main():
     out = args.out or f"models/agent_{args.mode}.zip"
 
     model = DistillModel.load(args.model)
-    metric = CurrentGapMetric()
+    metric = GapMetric()
     pre = default_preprocess()
     rec = build_dataset(model, metric, args.scripts, args.robot_ip, args.loop, pre)
     dyn = default_dynamics(rec)

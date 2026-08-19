@@ -40,8 +40,9 @@ pip install -r requirements.txt
 Distill once, then either mode reuses the model.
 
 ```bash
-# 1. distill the gap model from the recorded real runs
-python train_distillation_model.py --csvs data/test-4.csv data/test-5.csv data/test-6.csv --out models/distill.pkl
+# 1. distill the gap model (trained and validated on the CSVs in data/;
+#    losses, errors and calibration go to runs/, watch with `tensorboard --logdir runs`)
+python train_distillation_model.py --out models/distill.pkl
 
 # 2. train the RL agent on several scripts (--loop repeats each for more moves)
 python train_rla.py --mode params --robot-ip 127.0.0.1 --loop 5 --model models/distill.pkl --steps 20000 \
@@ -55,11 +56,14 @@ python send.py --robot-ip 127.0.0.1 --script scripts/triangle.script --loop 10 -
 python send.py --robot-ip 127.0.0.1 --script scripts/triangle.optimized.script --loop 10 --out optimized.csv
 
 # 5. run the analysis scripts to compare your results
-python analysis.py --csv baseline.csv --joint 0 --quantity current
-python analysis.py --csv optimized.csv --joint 0 --quantity current
+python analysis.py --csv baseline.csv --joint 0 --quantity "angle q"
+python analysis.py --csv optimized.csv --joint 0 --quantity "angle q"
 
 # 6. inspect the training data and also see what the script implies rebuilt through dynamics.py
-python analysis.py --csv data/test-1.csv --script data/test-1.script --joint 0 --quantity current
+python analysis.py --csv data/test-1.csv --script data/test-1.script --joint 0 --quantity "angle q"
+
+# 6b. add the distilled model's prediction (+-sd band) for both command sources
+python analysis.py --csv data/test-1.csv --script data/test-1.script --model models/distill.pkl --sd-factor 2
 
 # note: you might notice something is off. Is the pipeline not finished?
 ```
@@ -80,11 +84,11 @@ distillation.
 |------|------|
 | `record.py` | passive RTDE logger: stream robot state to a CSV, never moves the robot |
 | `send.py` | send a URScript (or a `servoj` path) to the robot, run it, record it |
-| `analysis.py` | `Recording` (shared CSV loader) + per-joint stats and a current plot |
-| `common.py` | `segments`: split a recording into waypoint-to-waypoint moves |
+| `analysis.py` | `Recording` (shared CSV loader) + a plotly target/actual/script/model viewer |
+| `common.py` | `segments`: split a recording into moves, plus the shared data prep (`features`, `blocks`, and the torch `MoveDataset`/`loaders`) |
 | `dynamics.py` | `Dynamics` interface + `UR10eDynamics`: candidate target torque/current |
-| `train_distillation_model.py` | `DistillModel` interface + `LinearModel`: predict the actual channels |
-| `metrics.py` | `EvaluationMetric` interface + `CurrentGapMetric`: the per-row `score` to minimize |
+| `train_distillation_model.py` | `DistillModel` interface + `CNNModel`: predict the actual channels |
+| `metrics.py` | `EvaluationMetric` interface + `GapMetric`: the per-row `score` to minimize |
 | `preprocess.py` | `Preprocess` interface: reshape data into and out of the learners |
 | `train_rla.py` | Gym envs over the models; trains a PPO agent (`GapEnv` params, `PathEnv` path) |
 | `run.py` | ask the trained agent for a better motion, write the optimized script or path |
@@ -104,16 +108,23 @@ actuals, `EvaluationMetric` scores them.
 
 **What runs now (all of it is yours to change):**
 
-- **`DistillModel`** (`train_distillation_model.py`): a per-row least-squares
-  `LinearModel` predicting `actual_current` from `[target_current, qd, qdd, pos,
-  vel, acc, joint]`. Change the features (`_row_features`), the predicted channel
-  (`predicts`), or the whole model.
+- **`DistillModel`** (`train_distillation_model.py`): `CNNModel`, a causal
+  dilated-convolution net over the last ~1 s of the commanded trajectory,
+  predicting the gap `actual_q - target_q` for all six joints at once, with a per-row
+  uncertainty (`predict` returns `{"mean", "var", "var_aleatoric",
+  "var_epistemic"}`, each `{channel: (n, N_JOINTS)}`). It is a sequence model
+  because the gap is dynamic — the ring-down after a stop is invisible to any
+  per-row model. `CNNModel(targets=("actual_current",))` switches the channel (write the
+  matching `GapMetric` too); `members=K` makes it an ensemble. Its data comes from
+  `common.loaders`, so a different architecture only has to bring its own network
+  and training loop.
 - **`Dynamics`** (`dynamics.py`): `UR10eDynamics`, `tau = M(q)qdd + g(q)`,
   `current = tau/Kt` (Coriolis dropped); `vel`/`acc` deg/s to rad/s. Override
   `current(q, qd, qdd)` for friction, Coriolis, identified parameters.
-- **`EvaluationMetric`** (`metrics.py`): `CurrentGapMetric`, `|actual_current -
-  target_current|` summed over joints. Change `needs`/`per_row` for overshoot,
-  jerk, a weighted mix.
+- **`EvaluationMetric`** (`metrics.py`): `GapMetric("q")`, `|actual_q - target_q|`
+  summed over joints -- the reality gap itself. `GapMetric("current")` scores the
+  torque instead; change `needs`/`per_row` for overshoot, jerk, a weighted mix.
+  The quantity has to be one `DistillModel.predicts()` fills in.
 - **`Preprocess`** (`preprocess.py`): `Identity` (no-op). Subclass to normalize or
   scale features into and out of the learners.
 - **The RLA** (`train_rla.py`): observation = 16 numbers (the move + its distilled
@@ -131,7 +142,7 @@ actuals, `EvaluationMetric` scores them.
   the reality gap, explore the `Preprocess` step, and decide what `EvaluationMetric`
   should measure. Record more runs with `record.py` if you like.
 - **Silver, build the model:** write your own `DistillModel`, choose the features
-  and architecture, and beat the linear baseline on held-out runs.
+  and architecture, and beat `CNNModel` on held-out runs.
 - **Gold, optimize it:** improve the RL agent (observation, `OBJECTIVE`, reward) and
   the `Dynamics` torque model (friction, Coriolis, identified parameters), and beat
   a fixed baseline's score.
