@@ -1,0 +1,57 @@
+# Workspace sweep - one cycle: nine poses spread over the reachable volume.
+#
+# Coverage motion for data collection. The nine poses sit on a 3x3 grid of TCP
+# reach radius (0.35 / 0.70 / 1.05 m) by height (0.20 / 0.70 / 1.15 m), with the
+# base angle and both wrists spread across their ranges, and are visited in an
+# interleaved order so every move crosses the volume instead of stepping around
+# its edge. That spans the two things the gap depends on: gravity torque
+# (29..94 Nm here) and joint-space inertia (M[0,0] varies ~6x).
+#
+# All six joints move on every move. Travel is 2.6..3.4 rad, long enough that a
+# movej reaches cruise speed at the lower `vel` values, so the speed actually
+# shows up in the recording.
+#
+# UNITS: movej `v` is rad/s and `a` is rad/s^2. Anything above the joint limit
+# (~2.09 rad/s for base/shoulder/elbow) is silently clamped by the controller, so
+# every run would come out at the same speed. Keep vel <= 2.0.
+#
+# Collect a speed sweep over this motion with:
+#     python collect.py --scripts scripts/workspace_sweep.script
+#
+# Plain assignments (no `global`): send.py wraps this in a repeat loop, and
+# URScript does not allow a `global` declaration inside a loop.
+
+vel = 1.05
+acc = 1.4
+
+# base    shoulder  elbow    wrist1   wrist2   wrist3          reach / height / gravity
+P1 = [  0.000,  -1.750,   2.600,  -2.421,  -1.570,   0.000]  # r 0.43 m  z 0.24 m   29 Nm
+P2 = [  1.500,  -0.850,  -0.050,  -0.671,  -0.700,   1.400]  # r 0.92 m  z 1.01 m   82 Nm
+P3 = [ -1.500,  -1.600,   1.550,  -1.521,   0.900,  -1.400]  # r 0.72 m  z 0.91 m   43 Nm
+P4 = [  1.900,  -1.050,  -0.750,   0.229,  -1.400,   0.700]  # r 0.35 m  z 1.15 m   35 Nm
+P5 = [ -0.700,  -0.800,   1.350,  -2.121,   1.500,  -0.700]  # r 1.05 m  z 0.44 m   94 Nm
+P6 = [  0.700,  -2.200,   1.950,  -1.321,  -1.100,   1.500]  # r 0.39 m  z 0.71 m   41 Nm
+P7 = [ -1.900,  -1.100,   0.000,  -0.471,   0.500,  -1.500]  # r 0.71 m  z 1.29 m   58 Nm
+P8 = [  1.100,  -1.250,   2.150,  -2.471,  -1.500,   0.400]  # r 0.69 m  z 0.20 m   54 Nm
+P9 = [ -1.100,  -0.950,   0.700,  -1.321,   1.100,  -0.400]  # r 1.05 m  z 0.92 m   89 Nm
+
+write_output_float_register(1, vel)
+write_output_float_register(2, acc)
+movej(P1, a=acc, v=vel)
+sleep(0.6)
+movej(P2, a=acc, v=vel)
+sleep(0.6)
+movej(P3, a=acc, v=vel)
+sleep(0.6)
+movej(P4, a=acc, v=vel)
+sleep(0.6)
+movej(P5, a=acc, v=vel)
+sleep(0.6)
+movej(P6, a=acc, v=vel)
+sleep(0.6)
+movej(P7, a=acc, v=vel)
+sleep(0.6)
+movej(P8, a=acc, v=vel)
+sleep(0.6)
+movej(P9, a=acc, v=vel)
+sleep(0.6)

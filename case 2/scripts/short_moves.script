@@ -1,0 +1,42 @@
+# Short moves - one cycle: five small hops around one extended pose.
+#
+# Coverage motion for data collection. Travel is only 0.08..0.42 rad, short
+# enough that the trapezoidal profile stays triangular: the move never reaches
+# `vel`, so `acc` alone sets the peak speed and the whole move is accelerate-
+# then-decelerate. Long moves cannot separate the two parameters (they cruise at
+# `vel` for most of their length); these can, which is what lets the gap model
+# learn an acceleration term rather than folding it into the speed.
+#
+# The pose is extended (TCP ~1.05 m out, ~103 Nm gravity) so the short hops still
+# carry real load, and the settle window after each one is where the ring lives.
+#
+# UNITS: movej `v` is rad/s and `a` is rad/s^2. Over these distances `vel` is
+# mostly inert, so sweep `acc` widely here (see collect.py --acc).
+#
+#     python collect.py --scripts scripts/short_moves.script
+#
+# Plain assignments (no `global`): send.py wraps this in a repeat loop, and
+# URScript does not allow a `global` declaration inside a loop.
+
+vel = 1.05
+acc = 1.4
+
+# base    shoulder  elbow    wrist1   wrist2   wrist3
+S1 = [  0.000,  -0.400,  -0.500,  -0.670,  -1.570,   0.000]
+S2 = [  0.180,  -0.520,  -0.340,  -0.670,  -1.450,   0.220]
+S3 = [ -0.160,  -0.300,  -0.620,  -0.820,  -1.690,  -0.200]
+S4 = [  0.060,  -0.450,  -0.440,  -0.550,  -1.500,   0.100]
+S5 = [ -0.080,  -0.360,  -0.560,  -0.750,  -1.620,  -0.080]
+
+write_output_float_register(1, vel)
+write_output_float_register(2, acc)
+movej(S1, a=acc, v=vel)
+sleep(0.6)
+movej(S2, a=acc, v=vel)
+sleep(0.6)
+movej(S3, a=acc, v=vel)
+sleep(0.6)
+movej(S4, a=acc, v=vel)
+sleep(0.6)
+movej(S5, a=acc, v=vel)
+sleep(0.6)

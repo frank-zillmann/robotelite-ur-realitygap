@@ -1,0 +1,47 @@
+# Reach and extend - one cycle: alternate an extended arm with a folded one.
+#
+# Coverage motion for data collection. Three extended poses (elbow open, TCP
+# 0.8..1.05 m out) alternate with three folded ones (elbow closed, TCP 0.3..0.6 m
+# in), at three different base angles. Every move therefore swings the arm
+# through a large change in effective inertia and gravity load:
+#
+#     extended  M[0,0] 7.0..8.9   gravity  93..103 Nm
+#     folded    M[0,0] 1.6..2.6   gravity  31.. 46 Nm
+#
+# That is the contrast the linear gap model cannot see from the existing runs,
+# where the arm stays in one configuration. Pair it with workspace_sweep.script.
+#
+# UNITS: movej `v` is rad/s and `a` is rad/s^2; the controller clamps anything
+# above the joint limit (~2.09 rad/s for base/shoulder/elbow), so keep vel <= 2.0
+# or every run records at the same speed.
+#
+#     python collect.py --scripts scripts/reach_extend.script
+#
+# Plain assignments (no `global`): send.py wraps this in a repeat loop, and
+# URScript does not allow a `global` declaration inside a loop.
+
+vel = 1.05
+acc = 1.4
+
+# base    shoulder  elbow    wrist1   wrist2   wrist3          reach / height / gravity
+E1 = [  0.000,  -0.400,  -0.500,  -0.670,  -1.570,   0.000]  # extended  r 1.05 m  103 Nm
+F1 = [  0.000,  -1.300,   2.300,  -2.570,  -1.570,   0.000]  # folded    r 0.62 m   46 Nm
+E2 = [  1.000,  -0.800,  -0.400,  -1.500,  -1.570,   0.000]  # extended  r 0.81 m   74 Nm
+F2 = [  1.000,  -2.300,   2.100,  -1.370,  -1.570,   0.000]  # folded    r 0.32 m   42 Nm
+E3 = [ -1.000,  -0.250,  -1.050,  -0.300,  -1.570,   0.000]  # extended  r 0.89 m   93 Nm
+F3 = [ -1.000,  -1.700,   2.500,  -2.370,  -1.570,   0.000]  # folded    r 0.47 m   31 Nm
+
+write_output_float_register(1, vel)
+write_output_float_register(2, acc)
+movej(E1, a=acc, v=vel)
+sleep(0.6)
+movej(F1, a=acc, v=vel)
+sleep(0.6)
+movej(E2, a=acc, v=vel)
+sleep(0.6)
+movej(F2, a=acc, v=vel)
+sleep(0.6)
+movej(E3, a=acc, v=vel)
+sleep(0.6)
+movej(F3, a=acc, v=vel)
+sleep(0.6)

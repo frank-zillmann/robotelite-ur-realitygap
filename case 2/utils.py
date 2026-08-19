@@ -17,10 +17,13 @@ JOINT_NAMES = ("base", "shoulder", "elbow", "wrist1", "wrist2", "wrist3")
 
 TIME_COL = "t"                                           # seconds since recording started
 # The optimized motion parameters, from the URScript `movej(..., a=acc, v=vel)`,
-# logged by record.py through these output float registers (raw script values,
-# e.g. 100).
-VEL_COL = "vel"                                          # output_double_register_1
-ACC_COL = "acc"                                          # output_double_register_2
+# logged by record.py through these output float registers. URScript movej takes
+# `v` in rad/s and `a` in rad/s^2, so these columns are rad units, NOT deg: the
+# controller clamps `v` above ~2.09 rad/s (120 deg/s on base/shoulder/elbow), and
+# the older recordings in data/ ask for 20..100, i.e. every one of them ran at the
+# joint limit. See collect.py.
+VEL_COL = "vel"                                          # output_double_register_1, rad/s
+ACC_COL = "acc"                                          # output_double_register_2, rad/s^2
 SCL_COL = "script_control_line"                          # URScript line running now
 SCRIPT_COL = "script"                                    # source script of each row
 
@@ -246,5 +249,10 @@ def get_param(text: str, name: str) -> float:
 
 
 def set_param(text: str, name: str, value: float) -> str:
-    """Return the script with `<name>` set to ``value`` (rounded int)."""
-    return re.sub(_PARAM.format(name=name), rf"\g<1>{int(round(value))}", text)
+    """Return the script with `<name>` set to ``value``.
+
+    Written with four decimals, not rounded to an integer: `vel`/`acc` are rad/s
+    and rad/s^2, where the whole useful range is 0..~2, so rounding would collapse
+    every speed onto 0, 1 or 2.
+    """
+    return re.sub(_PARAM.format(name=name), rf"\g<1>{float(value):.4f}", text)

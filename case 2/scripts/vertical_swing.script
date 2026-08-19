@@ -8,8 +8,12 @@
 # Plain assignments (no `global`): send.py wraps this in a repeat loop, and
 # URScript does not allow a `global` declaration inside a loop.
 
-vel = 999
-acc = 999
+# UNITS: movej `v` is rad/s and `a` is rad/s^2. The controller clamps anything
+# above the joint limit (~2.09 rad/s on base/shoulder/elbow), so a big number here
+# means every run records at the same maximum speed. 1.05 / 1.4 are the URScript
+# movej defaults.
+vel = 1.05
+acc = 1.4
 
 # Two poses [rad], arm laid down (elbow straight); the shoulder swings 0 to -180.
 POSE_FLAT_A = [0.0,  0.0,    0.0, -1.5708, -1.5708, 0.0]  # shoulder 0 deg
