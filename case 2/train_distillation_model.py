@@ -1,9 +1,9 @@
 """Distilled model that predicts ``actual_*`` channels for a commanded trajectory.
 
 Trained on recorded real runs, it predicts what an actual channel would be for a
-given commanded trajectory. Applied to the sim's targets (whose ``actual_*``
-columns read 0.0), it overwrites those columns so metrics.py and the RL agent can
-run without hardware.
+given commanded trajectory, so optimize.py can score a candidate motion without
+hardware. It is differentiable end to end, which is what lets the optimizer push a
+trajectory's gradient back through it.
 
 ``DistillModel`` is the interface the pipeline depends on:
 
@@ -11,12 +11,12 @@ run without hardware.
     predicts()       -> which actual_* channels this model fills in
     predict(df)      -> {"mean": {channel: (n, N_JOINTS)}, "var": ..., ...}
 
-The channels must be the ones the metric reads (metrics.py). ``CNNModel``, the one
-implementation here, is a causal temporal CNN over a whole move.
+``CNNModel``, the one implementation here, is a causal temporal CNN over a whole
+move.
 
     m = CNNModel().fit([Recording("data/test-4.csv"), Recording("data/test-6.csv")])
     m.save("models/distill.pkl")
-    augment(m, "sim_to_real.csv")         # overwrite actual_q with predictions
+    m.predict(frame)["mean"]["actual_q"]  # what the robot would really do
 
 As a script: train on every run in ``data/``, log to ``runs/``, save the pickle.
 
@@ -37,15 +37,13 @@ from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
 from common import RESIDUAL, N_FEAT, blocks, features, loaders, standardize
-from preprocess import Identity, Preprocess, default_preprocess
-from utils import N_JOINTS, get_block, set_block
+from utils import N_JOINTS, frame_dt, get_block
 
 
 class DistillModel(ABC):
     """Interface every distilled model must implement.
 
-    Subclasses implement ``fit``, ``predicts``, and ``predict``, and optionally
-    override ``bounds``.
+    Subclasses implement ``fit``, ``predicts`` and ``predict``.
     """
 
     @abstractmethod
@@ -56,8 +54,7 @@ class DistillModel(ABC):
     def predicts(self) -> list[str]:
         """Per-joint channel bases this model predicts, e.g. ``["actual_q"]``.
 
-        These are the ``actual_*`` columns ``predict`` returns and ``augment``
-        overwrites in the recording.
+        These are the ``actual_*`` columns ``predict`` returns.
         """
 
     @abstractmethod
@@ -75,14 +72,6 @@ class DistillModel(ABC):
             var_epistemic   how much the model itself is unsure
 
         A risk-averse objective can score ``mean + k * sqrt(var)``."""
-
-    def bounds(self):
-        """Optional ``((vel_lo, vel_hi), (acc_lo, acc_hi))`` the model trusts.
-
-        Return the raw-number range the training data covered so the optimizer
-        stays in-distribution, or ``None`` to let the caller pick its own.
-        """
-        return None
 
     def save(self, path: str):
         with open(path, "wb") as f:
@@ -256,8 +245,10 @@ class CNNModel(DistillModel):
         out = []
         for sl in blocks(df): # never filter across a script seam
             # ``df`` must be sampled at ``train_dt``: a learned temporal filter only
-            # holds at its training rate (train_rla.py builds its frames that way).
-            x = standardize(features(df.iloc[sl], self.pad), self.stats)
+            # holds at its training rate (optimize.py builds its frames that way).
+            sub = df.iloc[sl]
+            x = standardize(features(get_block(sub, "target_q"), frame_dt(sub),
+                                     self.pad).numpy(), self.stats)
             with torch.inference_mode():
                 mu, lv = self.forward(torch.from_numpy(x.T[None]).float())
                 # Mixture of the members' Gaussians: mean of their variances is the
@@ -274,36 +265,17 @@ class CNNModel(DistillModel):
                 "var_epistemic": split(epi)}
 
 
-def augment(model: DistillModel, csv: str, pre: Preprocess = None):
-    """Overwrite ``csv``'s actual_* columns with the model's predictions, in place.
-
-    ``pre`` wraps the model as in training (``transform_distill`` before predict,
-    ``revert_distill`` after), so the saved columns land back in real units.
-    """
-    pre = pre or Identity()
-    df = pre.transform_distill(pd.read_csv(csv))
-    preds = model.predict(df)["mean"]
-    for base in model.predicts():
-        set_block(df, base, preds[base])
-    df = pre.revert_distill(df)
-    df.to_csv(csv, index=False)
-    print(f"overwrote {model.predicts()} with predictions -> {csv}")
-    return df
-
-
 def main():
     ap = argparse.ArgumentParser(description="Train the distillation model.")
     ap.add_argument("--out", default="models/distill.pkl", help="pickle path")
     args = ap.parse_args()
 
     # Import under the real module name (not "__main__") so the pickle loads
-    # cleanly in train_rla.py and run.py.
+    # cleanly in optimize.py and analysis.py.
     from train_distillation_model import CNNModel
     from analysis import Recording
 
-    pre = default_preprocess() # every run, as the model will see it later
-    recordings = [Recording(p, df=pre.transform_distill(pd.read_csv(p)))
-                  for p in sorted(glob.glob("data/test-*.csv"))]
+    recordings = [Recording(p) for p in sorted(glob.glob("data/test-*.csv"))]
     CNNModel().fit(recordings).save(args.out)
     print(f"saved {args.out}")
 

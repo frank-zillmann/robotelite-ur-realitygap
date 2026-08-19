@@ -20,7 +20,7 @@ per-joint quantities and a Cartesian axis (0..5 = x, y, z, rx, ry, rz) for the
 TCP ones, since those are poses in space and have nothing to do with joints.
 
 ``Recording`` is the shared CSV data loader used across the pipeline
-(``train_distillation_model.py``, ``train_rla.py``); it wraps a run's CSV as
+(``train_distillation_model.py``, ``optimize.py``); it wraps a run's CSV as
 numpy arrays.
 """
 from __future__ import annotations
@@ -54,7 +54,7 @@ class Recording:
 
     def __init__(self, path: str, df=None):
         # Loads ``path``, or wraps an already-loaded table if ``df`` is given
-        # (e.g. one a preprocess.Preprocess transformed).
+        # (e.g. one already transformed by the caller).
         if df is None:
             df = pd.read_csv(path)
         self.path = path
@@ -138,59 +138,28 @@ def _waypoints(text: str) -> list:
     return out
 
 
-def _limits(rec: Recording):
-    """Per-joint speed and acceleration ceilings, measured from the run.
-
-    ``movej``'s ``v=``/``a=`` are rad/s and rad/s^2, and the controller clamps
-    them to its own per-joint ceiling (scaled by the speed slider). In every
-    supplied run the requested values sit far above that ceiling, so the script's
-    numbers say nothing about the motion: ``vel=100, acc=100`` would be a 0.36 s
-    move where the real one takes 2.98 s. And the ceiling is not in the script --
-    the same request gives 59 deg/s in test-4 and 120 deg/s in test-6, because
-    the speed slider is set on the pendant. So it has to be measured.
-    """
-    a = np.gradient(rec.target_qd, rec.dt, axis=0)
-    return np.abs(rec.target_qd).max(axis=0), np.abs(a).max(axis=0)
-
-
-def script_plan(rec: Recording, script_path: str, payload: float = 0.0,
-                fit_duration: bool = False) -> dict:
+def script_plan(rec: Recording, script_path: str) -> dict:
     """What the URScript alone implies, on the recording's clock.
 
     A third source next to ``target_*`` and ``actual_*``: the distance to
-    ``target_*`` is ``dynamics.py``'s error, and to ``actual_*`` that plus the
-    reality gap. Each ``movej`` waypoint is parsed from the script, its speed
-    profile rebuilt with ``dynamics.trapezoidal`` and its current with
-    ``dynamics.UR10eDynamics``. All joints of a movej start and stop together, so
-    the profile is the slowest joint's. Between moves the plan holds the waypoint.
-
-    ``script_control_line`` gives the sample where each move began (via
-    ``common.segments``), and every rebuilt move is laid down there. Its
-    *duration* then comes from ``trapezoidal``, which matches the swing runs to
-    under 1% but is out by ~25% on test-6/7, where the controller eases
-    acceleration in and out rather than switching it. That is a real gap in
-    ``dynamics.py``, left visible on purpose; ``fit_duration=True`` stretches
-    each move onto its recorded window instead, to compare shape without it.
+    ``target_*`` is ``motion.movej``'s error, and to ``actual_*`` that plus the
+    reality gap. Each ``movej`` waypoint is parsed out of the script and rebuilt
+    with ``motion.movej``, laid down where ``script_control_line`` says that move
+    began; between moves the plan holds the waypoint it reached.
 
     Returns ``{base: (n, N_JOINTS)}``, or ``{}`` if no ``movej`` could be parsed.
     """
     from common import segments
-    from dynamics import GRID, MAX_JOINT_ACC, MAX_JOINT_SPEED, UR10eDynamics, trapezoidal
+    from motion import movej
 
     way = _waypoints(load_script(script_path))
     segs = segments(rec)
     if not segs or not any(w is not None for w in way):
         return {}
 
-    dt = rec.dt
-    v_lim, a_lim = _limits(rec)
-    v_lim = np.where(v_lim > 1e-6, v_lim, MAX_JOINT_SPEED)
-    a_lim = np.where(a_lim > 1e-6, a_lim, MAX_JOINT_ACC)
-
-    # Which movej is which: script_control_line is the running movej's line
-    # number, so the distinct values sorted are the movejs in file order -- right
-    # even when nested loops run them out of order (data/test-6-7.script). With
-    # no such column, guess a cyclic offset and score it against the recording.
+    # Which movej is which: script_control_line holds the running movej's line, so
+    # its distinct values in order are the movejs in file order -- right even when a
+    # loop runs them repeatedly. Without that column, guess a cyclic offset.
     lines = sorted({int(rec.scl[s.i0]) for s in segs if rec.scl[s.i0]})
     if len(lines) == len(way):
         index = {ln: i for i, ln in enumerate(lines)}
@@ -204,49 +173,26 @@ def script_plan(rec: Recording, script_path: str, payload: float = 0.0,
 
     n = len(rec.t)
     q = np.repeat(rec.target_q[segs[0].i0][None], n, axis=0)
-    prog = np.ones(n)                     # progress along the current move, for the cache
-    blocks, pos = [], rec.target_q[segs[0].i0].copy()
+    pos = rec.target_q[segs[0].i0].copy()
     for k, seg in enumerate(segs):
-        mid = pick(k, seg)                    # which movej of the script this is
+        mid = pick(k, seg)
         w = way[mid] if mid is not None else None
         # `movej(get_inverse_kin(..., qnear=P.q))` names a pose; qnear is only the
-        # seed for the controller's IK, and for some waypoints the solution it
-        # picks is far from it. Where the script disagrees with what was actually
-        # reached, trust the recording.
+        # seed for the controller's IK, and for some waypoints the solution it picks
+        # is far from it. Where the script disagrees with what was reached, trust
+        # the recording.
         bad = w is None or np.abs(w - rec.target_q[seg.i1]).max() > WAYPOINT_TOL
         dest = rec.target_q[seg.i1] if bad else w
-        vel = seg.vel or np.inf                # requested; the ceiling usually wins
-        acc = seg.acc or np.inf
-        travel = dest - pos
-        # One shared profile per movej, so it is the slowest joint's.
-        s = max((trapezoidal(abs(travel[j]), min(vel, v_lim[j]), min(acc, a_lim[j]), dt)
-                 for j in range(N_JOINTS) if abs(travel[j]) > 1e-4),
-                key=len, default=np.array([0.0, 1.0]))
-        if fit_duration and seg.i1 > seg.i0:   # re-time onto the recorded window
-            s = np.interp(np.linspace(0.0, 1.0, seg.i1 - seg.i0),
-                          np.linspace(0.0, 1.0, len(s)), s)
-        nxt = segs[k + 1].i0 if k + 1 < len(segs) else n  # where the next movej starts
-        stop = min(seg.i0 + len(s), nxt)                  # motion, clipped to the slot
-        q[seg.i0:stop] = pos + s[:stop - seg.i0, None] * travel
-        prog[seg.i0:stop] = s[:stop - seg.i0]
+        built = movej(pos, dest, rec.dt, v=seg.vel, a=seg.acc)
+        nxt = segs[k + 1].i0 if k + 1 < len(segs) else n
+        stop = min(seg.i0 + len(built), nxt)
+        q[seg.i0:stop] = built[:stop - seg.i0]
         q[stop:nxt] = q[stop - 1] if stop > seg.i0 else pos   # hold through the sleep
-        blocks.append((seg.i0 if k else 0, nxt, mid, pos, dest))
-        # Carry the pose the plan reached, not the waypoint: a move clipped short
-        # would otherwise tear a step into the trace.
         pos = q[max(nxt - 1, 0)].copy()
 
-    qd = np.gradient(q, dt, axis=0)
-    qdd = np.gradient(qd, dt, axis=0)
-    dyn = UR10eDynamics(rec, payload=payload)
-    cur = np.zeros_like(q)
-    for a, b, mid, p0, p1 in blocks:
-        # Pose cache keyed by which movej, not by occurrence: a looped script
-        # retraces the same geometry, so this prepares once per movej.
-        if mid not in dyn._cache:
-            dyn.prepare(mid, p0 + np.linspace(0.0, 1.0, GRID)[:, None] * (p1 - p0))
-        cur[a:b] = dyn.current(q[a:b], qd[a:b], qdd[a:b], s=prog[a:b], key=mid)
-    return {"target_q": q, "target_qd": qd, "target_qdd": qdd,
-            "target_current": cur, "target_moment": cur * dyn.kt}
+    qd = np.gradient(q, rec.dt, axis=0)
+    return {"target_q": q, "target_qd": qd,
+            "target_qdd": np.gradient(qd, rec.dt, axis=0)}
 
 
 # --- viewer -------------------------------------------------------------------
@@ -325,11 +271,6 @@ def main():
     ap.add_argument("--joint", type=int, default=1, choices=range(N_JOINTS),
                     help="component 0..5: a joint (base..wrist3), or a Cartesian "
                          "axis (x, y, z, rx, ry, rz) for the TCP quantities")
-    ap.add_argument("--payload", type=float, default=0.0,
-                    help="tool mass at the flange [kg], for the rebuilt plan")
-    ap.add_argument("--fit-duration", action="store_true",
-                    help="re-time each rebuilt move to end when the recorded one "
-                         "did, hiding dynamics.py's duration error")
     ap.add_argument("--model", default=None,
                     help="distilled model pickle; adds its prediction (with an "
                          "uncertainty band) for the recorded and the rebuilt commands")
@@ -341,8 +282,7 @@ def main():
     args = ap.parse_args()
 
     rec = Recording(args.csv)
-    plan = (script_plan(rec, args.script, args.payload, args.fit_duration)
-            if args.script else {})
+    plan = script_plan(rec, args.script) if args.script else {}
     model = None
     if args.model:
         from train_distillation_model import DistillModel      # pulls in torch

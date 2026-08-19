@@ -1,8 +1,8 @@
 """Shared helpers for the case 2 scripts: constants, robot physics, scripts.
 
 - constants: joint count/names and the CSV column names.
-- `UR10e`: numpy-only kinematics and dynamics (FK, Jacobian, gravity, mass
-  matrix, Coriolis) usable as physics features for the gap model.
+- `UR10e`: numpy-only kinematics (FK, Jacobian), which motion.py needs to turn
+  the controller's Cartesian speed cap into joint terms.
 - URScript helpers: load a `.script`, read/replace its `vel`/`acc` parameters.
 """
 from __future__ import annotations
@@ -50,60 +50,26 @@ def frame_dt(df) -> float:
     return float(np.median(np.diff(df[TIME_COL].to_numpy(dtype=float))))
 
 
-# --- UR10e kinematics and dynamics (numpy only) ------------------------------
+# --- UR10e kinematics (numpy only) -------------------------------------------
 # UR10e parameters, from Universal Robots "DH Parameters for calculations of
-# kinematics and dynamics" (universal-robots.com). Standard (classic) DH.
+# kinematics" (universal-robots.com). Standard (classic) DH.
 #   joint i rotates by q[i] about z of the previous frame.
 _A = np.array([0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0])          # link length a [m]
 _D = np.array([0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655])    # link offset d [m]
 _ALPHA = np.array([np.pi / 2, 0.0, 0.0, np.pi / 2, -np.pi / 2, 0.0])  # twist [rad]
 
-_MASS = np.array([7.369, 13.051, 3.989, 2.1, 1.98, 0.615])      # link masses [kg]
-
-# Centre of mass of each link, in that link's DH frame [m].
-_COM = np.array([
-    [0.021, 0.000, 0.027],
-    [0.380, 0.000, 0.158],
-    [0.240, 0.000, 0.068],
-    [0.000, 0.007, 0.018],
-    [0.000, 0.007, 0.018],
-    [0.000, 0.000, -0.026],
-])
-
-# Inertia tensor of each link about its centre of mass, in the link frame [kg m^2].
-_INERTIA = np.array([
-    [[0.0341, 0.0000, -0.0043], [0.0000, 0.0353, 0.0001], [-0.0043, 0.0001, 0.0216]],
-    [[0.0281, 0.0001, -0.0156], [0.0001, 0.7707, 0.0000], [-0.0156, 0.0000, 0.7694]],
-    [[0.0101, 0.0001, 0.0092], [0.0001, 0.3093, 0.0000], [0.0092, 0.0000, 0.3065]],
-    [[0.0030, 0.0000, 0.0000], [0.0000, 0.0022, -0.0002], [0.0000, -0.0002, 0.0026]],
-    [[0.0030, 0.0000, 0.0000], [0.0000, 0.0022, -0.0002], [0.0000, -0.0002, 0.0026]],
-    [[0.0000, 0.0000, 0.0000], [0.0000, 0.0004, 0.0000], [0.0000, 0.0000, 0.0003]],
-])
-
-_G = 9.80665  # gravity [m/s^2]
-
 
 class UR10e:
-    """UR10e kinematics and dynamics. Extend by overriding the parameter arrays.
+    """UR10e kinematics. Extend by overriding the parameter arrays.
 
-        ur = UR10e(payload=0.8)             # 0.8 kg at the tool flange
+        ur = UR10e()
         q  = [0, -1.57, 1.57, -1.57, -1.57, 0]
         ur.fk(q)                            # 4x4 base -> flange pose
         ur.jacobian(q)                      # 6x6 geometric Jacobian (base frame)
-        ur.gravity(q)                       # (6,) gravity torque per joint, Nm
-        ur.mass_matrix(q)                   # 6x6 joint-space inertia, symmetric
-        ur.coriolis(q, qd)                  # (6,) Coriolis + centrifugal torque
 
-    `gravity(q)` and `diag(mass_matrix(q))` are cheap per-pose features for the
-    gap model.
+    Kinematics only: motion.py needs the Jacobian to convert the controller's
+    Cartesian speed cap into joint terms. Nothing models torque any more.
     """
-
-    def __init__(self, payload: float = 0.0):
-        """Args:
-            payload: point mass at the tool flange (TCP) in kg. The recorded
-                runs used the flange as TCP, so this is the tool mass, e.g. 0.8.
-        """
-        self.payload = float(payload)
 
     # --- kinematics -----------------------------------------------------------
 
@@ -159,68 +125,6 @@ class UR10e:
         """
         frames = self._frames(q)
         return self._point_jacobian(frames, frames[6][:3, 3], up_to=6)
-
-    # --- dynamics -------------------------------------------------------------
-
-    def _link_terms(self, q):
-        """Per-link COM Jacobians and base-frame inertias, plus the payload.
-
-        Returns a list of ``(mass, Jv, Jw, I_base)`` where Jv/Jw are the 3x6
-        linear/angular Jacobians of the link COM and I_base is its inertia tensor
-        rotated into the base frame. The payload is appended as a point mass at
-        the flange (Jw and inertia zero).
-        """
-        frames = self._frames(q)
-        terms = []
-        for i in range(6):
-            R = frames[i + 1][:3, :3]                      # base <- link frame
-            com = frames[i + 1] @ np.append(_COM[i], 1.0)  # COM in base frame
-            J = self._point_jacobian(frames, com[:3], up_to=i + 1)
-            I_base = R @ _INERTIA[i] @ R.T
-            terms.append((_MASS[i], J[:3], J[3:], I_base))
-        if self.payload > 0.0:
-            J = self._point_jacobian(frames, frames[6][:3, 3], up_to=6)
-            terms.append((self.payload, J[:3], J[3:], np.zeros((3, 3))))
-        return terms
-
-    def gravity(self, q) -> np.ndarray:
-        """Gravity torque per joint (6,), Nm: the torque to hold against gravity."""
-        g_vec = np.array([0.0, 0.0, -_G])
-        tau = np.zeros(6)
-        for mass, Jv, _Jw, _I in self._link_terms(q):
-            tau -= mass * (Jv.T @ g_vec)
-        return tau
-
-    def mass_matrix(self, q) -> np.ndarray:
-        """Joint-space inertia matrix M(q) (6x6), symmetric positive definite."""
-        M = np.zeros((6, 6))
-        for mass, Jv, Jw, I_base in self._link_terms(q):
-            M += mass * (Jv.T @ Jv) + Jw.T @ I_base @ Jw
-        return 0.5 * (M + M.T)  # symmetrize away tiny numerical asymmetry
-
-    def coriolis(self, q, qd) -> np.ndarray:
-        """Coriolis and centrifugal torque per joint (6,), Nm: the term
-        ``C(q,qd) @ qd`` in ``M(q) qdd + C(q,qd) qd + g(q) = tau``.
-
-        Scales with velocity products (centrifugal ~ qd_i^2, Coriolis
-        ~ qd_i qd_j). Built from the mass matrix via Christoffel symbols, with
-        dM/dq by finite difference.
-        """
-        q = np.asarray(q, dtype=float)
-        qd = np.asarray(qd, dtype=float)
-        eps = 1e-6
-        # dM[i] = dM/dq_i, a 6x6 matrix.
-        dM = np.array([
-            (self.mass_matrix(q + eps * e) - self.mass_matrix(q - eps * e)) / (2 * eps)
-            for e in np.eye(6)
-        ])
-        c = np.zeros(6)
-        for k in range(6):
-            for i in range(6):
-                for j in range(6):
-                    christoffel = 0.5 * (dM[i, k, j] + dM[j, k, i] - dM[k, i, j])
-                    c[k] += christoffel * qd[i] * qd[j]
-        return c
 
 
 # --- URScript helpers --------------------------------------------------------

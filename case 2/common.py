@@ -3,7 +3,7 @@
 ``segments`` is the one shared definition of "a move", used by the distillation and
 the RL stages so both cut a recording the same way:
 
-    for seg in segments(Recording("sim_to_real.csv")):
+    for seg in segments(Recording("data/test-4.csv")):
         print(seg.joint, seg.i0, seg.i1, seg.i2, seg.dist)
 
 The rest is the data preparation the distilled models share, so a new architecture
@@ -22,13 +22,13 @@ import torch
 from torch.utils.data import (DataLoader, Dataset, WeightedRandomSampler,
                               random_split)
 
-from utils import N_JOINTS, SCRIPT_COL, frame_dt, get_block
+from utils import N_JOINTS, SCRIPT_COL, get_block
 
 SETTLE_S = 1.0             # settle kept after a move ends; the rest of a pause is idle
 
 # Each channel is learned as ``actual - target``, the gap itself: more accurate than
-# predicting the channel outright, and GapMetric is |actual - target|, so the
-# score reduces to |predicted gap|, independent of dynamics.py.
+# predicting the channel outright, and the optimizer scores |actual - target|,
+# so its objective is simply |predicted gap|.
 RESIDUAL = {"actual_current": "target_current", "actual_q": "target_q",
             "actual_qd": "target_qd"}
 
@@ -111,27 +111,35 @@ def segments(rec) -> list[Segment]:
 
 # --- data preparation shared by the distilled models -------------------------
 
-def features(df, pad: int = 0):
-    """Per-row model inputs ``(n + pad, N_FEAT)``, from the commanded trajectory only.
+def _diff(x, dt: float):
+    """``np.gradient``'s rule in torch: central inside, one-sided at both ends."""
+    return torch.cat([(x[1:2] - x[:1]) / dt,
+                      (x[2:] - x[:-2]) / (2 * dt),
+                      (x[-1:] - x[-2:-1]) / dt])
+
+
+def features(q, dt: float, pad: int = 0):
+    """Per-row model inputs ``(n + pad, N_FEAT)`` from the commanded angles alone.
 
     - ``sin q``, ``cos q``  pose, wrap-safe, and what gravity and inertia vary with.
     - ``qd``, ``qdd``       the commanded motion.
     - ``qddd``              jerk, what excites the ring (worth ~5% of the error).
 
-    Not ``target_current``: in a recording that column is the controller's, but in
-    a candidate frame it is only dynamics.py's estimate, and the metric already
-    subtracts it. Not the movej ``vel``/``acc`` registers either: they were worth
-    nothing measurable and are absent from a servoj path.
+    Everything is differentiated from ``q`` rather than read from ``target_qd``, so
+    a trajectory the optimizer invents is turned into inputs exactly the way a
+    recording is. Torch throughout, so ``motion.bspline`` can be optimized through
+    it. Not ``target_current``: nothing models torque any more.
     """
-    d = lambda z: np.gradient(z, frame_dt(df), axis=0)
-    q, qd = get_block(df, "target_q"), get_block(df, "target_qd")
-    qdd = d(qd)
-    x = np.column_stack([np.sin(q), np.cos(q), qd, qdd, d(qdd)]).astype(np.float32)
+    q = q if torch.is_tensor(q) else torch.as_tensor(np.asarray(q, np.float32))
+    qd = _diff(q, dt)
+    qdd = _diff(qd, dt)
+    x = torch.cat([torch.sin(q), torch.cos(q), qd, qdd, _diff(qdd, dt)], dim=1)
     if pad:
-        # Padding: the start pose held still
-        rest = x[:1].copy()
-        rest[:, 12:N_FEAT] = 0.0 # feature columns that are zero when the robot stands still
-        x = np.vstack([np.repeat(rest, pad, axis=0), x])
+        # Warm-up: the start pose held still, which is what the robot really does
+        # before a move, so row 0 of a short frame is already meaningful.
+        still = torch.zeros(1, N_FEAT)
+        still[:, :2 * N_JOINTS] = 1.0        # keep the pose, drop the motion
+        x = torch.cat([(x[:1] * still).expand(pad, -1), x])
     return x
 
 
@@ -160,7 +168,7 @@ class MoveDataset(Dataset):
             sub = rec.df.iloc[s.i0:s.i2]      # motion plus the capped settle window
             gap = np.column_stack([get_block(sub, b) - get_block(sub, RESIDUAL[b])
                                    for b in targets]).astype(np.float32)
-            seqs.append((features(sub, pad), gap))
+            seqs.append((features(get_block(sub, "target_q"), rec.dt, pad).numpy(), gap))
 
         X = np.concatenate([x for x, _ in seqs])
         Y = np.concatenate([y for _, y in seqs])
@@ -217,7 +225,7 @@ def loaders(recordings, targets=("actual_q",), pad: int = 0, batch: int = 16,
 def blocks(df):
     """Row slices of ``df`` that are one continuous trajectory each.
 
-    ``sim_to_real.csv`` pools several scripts; a sequence model must not run across
+    A pooled recording holds several scripts; a sequence model must not run across
     the seam, where the joints jump from one script's end pose to the next's start.
     """
     if SCRIPT_COL not in df or df[SCRIPT_COL].nunique() < 2:

@@ -1,21 +1,23 @@
-# Case 2: Reality Gap and Motion Optimization
+# Case 2: Reality Gap and Trajectory Optimization
 
 URSim shows a perfect robot: commanded angle equals measured angle. A real UR
 overshoots and rings down at the end of a move, and each joint behaves a little
 differently. That difference is the **reality gap**.
 
-This case learns the gap from recorded runs, uses the learned model as a fast
-stand-in for the real robot, optimizes a motion against it, and runs the result on
-the robot to check whether the gain holds.
+This case learns the gap from recorded runs, then optimizes a motion *through* the
+learned model: the whole chain from a spline's control points to the predicted
+measured angles is one differentiable graph, so the score's gradient reaches the
+trajectory directly.
 
 ## The task
 
-The pipeline runs end to end with baseline implementations. The work is to replace
-them with better ones so the agent's improvement transfers to hardware. The swap
-points are three models, `DistillModel`, `Dynamics`, `EvaluationMetric`, plus the
-`Preprocess` helper; each is an interface with a working default (what each
-does now and where to change it is in **What runs now** below). Then train the RL
-agent, optimize a held-out motion, and compare baseline vs optimized on the robot.
+The pipeline runs end to end. The work is to make its two models better, so that
+the improvement it predicts survives contact with hardware:
+
+- **`DistillModel`** (`train_distillation_model.py`) — what the robot really does.
+- **`motion.movej`** (`motion.py`) — what the controller commands in the first place.
+
+Then optimize a motion, run baseline and optimized on the robot, and compare.
 
 ## Prerequisites
 
@@ -25,7 +27,7 @@ pip install -r requirements.txt
 
 - **URSim or a UR robot** in **Remote Control** mode, reachable at `--robot-ip`
   (default `127.0.0.1`). Without Remote Control the controller accepts the socket
-  but does not run the script.
+  but does not run the script. See `simulation environment/` for the container.
 - **Recorded runs** in `data/`, one CSV per run. Use the provided runs or record
   your own:
   ```bash
@@ -33,50 +35,30 @@ pip install -r requirements.txt
   ```
   `record.py` reads the controller's RTDE stream and only logs; it never moves the
   robot. RTDE channels: <https://www.universal-robots.com/developer/communication-protocol/rtde/>.
-- `gymnasium` and `stable-baselines3` (in `requirements.txt`) for training.
 
 ## How to run
 
-Distill once, then either mode reuses the model.
-
 ```bash
-# 1. distill the gap model (trained and validated on the CSVs in data/;
-#    losses, errors and calibration go to runs/, watch with `tensorboard --logdir runs`)
+# 1. distill the gap model from every run in data/ (losses, errors and calibration
+#    go to runs/, watch them with `tensorboard --logdir runs`)
 python train_distillation_model.py --out models/distill.pkl
 
-# 2. train the RL agent on several scripts (--loop repeats each for more moves)
-python train_rla.py --mode params --robot-ip 127.0.0.1 --loop 5 --model models/distill.pkl --steps 20000 \
-    --scripts scripts/shoulder_swing.script scripts/vertical_swing.script scripts/horizontal_swing.script
+# 2. optimize a script's moves against it; writes a servoj path next to the script
+python optimize.py --script scripts/triangle.script --model models/distill.pkl
 
-# 3. optimize a held-out script the agent did not train on
-python run.py --mode params --script scripts/triangle.script --model models/distill.pkl --robot-ip 127.0.0.1
-
-# 4. run baseline and optimized on the robot, compare
+# 3. run baseline and optimized on the robot, compare
 python send.py --robot-ip 127.0.0.1 --script scripts/triangle.script --loop 10 --out baseline.csv
-python send.py --robot-ip 127.0.0.1 --script scripts/triangle.optimized.script --loop 10 --out optimized.csv
-
-# 5. run the analysis scripts to compare your results
-python analysis.py --csv baseline.csv --joint 0 --quantity "angle q"
-python analysis.py --csv optimized.csv --joint 0 --quantity "angle q"
-
-# 6. inspect the training data and also see what the script implies rebuilt through dynamics.py
-python analysis.py --csv data/test-1.csv --script data/test-1.script --joint 0 --quantity "angle q"
-
-# 6b. add the distilled model's prediction (+-sd band) for both command sources
-python analysis.py --csv data/test-1.csv --script data/test-1.script --model models/distill.pkl --sd-factor 2
-
-# note: you might notice something is off. Is the pipeline not finished?
-```
-
-For **path** mode, use `--mode path` in steps 2 and 3, then stream the result:
-
-```bash
 python send.py --robot-ip 127.0.0.1 --path scripts/triangle.path --out optimized.csv
+
+# 4. look at both, and at what the script alone implies
+python analysis.py --csv baseline.csv --model models/distill.pkl
+python analysis.py --csv optimized.csv --model models/distill.pkl
+python analysis.py --csv data/test-1.csv --script data/test-1.script --model models/distill.pkl
 ```
 
-Step 3 tests transfer: if the drop the model predicted holds on hardware, the model
-matched the robot; if not, it was missing something, which sends you back to the
-distillation.
+Step 3 is the test that matters: if the drop the model predicted holds on hardware,
+the model matched the robot; if not, it was missing something, which sends you back
+to step 1.
 
 ## Folder contents
 
@@ -85,56 +67,73 @@ distillation.
 | `record.py` | passive RTDE logger: stream robot state to a CSV, never moves the robot |
 | `send.py` | send a URScript (or a `servoj` path) to the robot, run it, record it |
 | `analysis.py` | `Recording` (shared CSV loader) + a plotly target/actual/script/model viewer |
-| `common.py` | `segments`: split a recording into moves, plus the shared data prep (`features`, `blocks`, and the torch `MoveDataset`/`loaders`) |
-| `dynamics.py` | `Dynamics` interface + `UR10eDynamics`: candidate target torque/current |
+| `common.py` | `segments` (split a recording into moves), `features`, and the torch `MoveDataset`/`loaders` |
+| `motion.py` | `movej` (what the controller commands) and `bspline` (what replaces it) |
 | `train_distillation_model.py` | `DistillModel` interface + `CNNModel`: predict the actual channels |
-| `metrics.py` | `EvaluationMetric` interface + `GapMetric`: the per-row `score` to minimize |
-| `preprocess.py` | `Preprocess` interface: reshape data into and out of the learners |
-| `train_rla.py` | Gym envs over the models; trains a PPO agent (`GapEnv` params, `PathEnv` path) |
-| `run.py` | ask the trained agent for a better motion, write the optimized script or path |
-| `utils.py` | constants, UR10e physics (FK, Jacobian, gravity, mass matrix, Coriolis), URScript load/edit |
+| `optimize.py` | differentiate a score through the model down to the spline's control points |
+| `utils.py` | constants, UR10e kinematics (FK, Jacobian), URScript load/edit |
 
 `scripts/` holds the URScript motions, `models/` the trained models, `data/` the
 recordings.
 
-**How it flows.** A recording is a CSV of per-joint channels over time (commanded
-`target_*`, measured `actual_*`, `vel`/`acc`, the running URScript line);
-`analysis.Recording` loads it, `common.segments` splits it into moves (one per
-movej). `build_dataset` runs the scripts on URSim, has `DistillModel` fill the
-`actual_*` columns and `EvaluationMetric` add a `score` column, into
-`sim_to_real.csv`. The PPO agent proposes an action per move; to score it,
-`Dynamics` builds the candidate's commanded trajectory, `DistillModel` predicts the
-actuals, `EvaluationMetric` scores them.
+## How it flows
+
+```
+control points, T ──► motion.bspline ──► commanded q(t)
+                                              │
+                       common.features (sin/cos q, qd, qdd, qddd)
+                                              │
+                        CNNModel ──► predicted actual q, and its uncertainty
+                                              │
+      loss = |actual - commanded|/base + k·sd  +  α·T/base  +  limits  +  straightness
+                                              │
+                                        .backward()
+```
+
+Everything after the control points is torch, so one `backward()` moves both the
+shape of the trajectory and its duration. `T` is a free parameter, so nothing
+fixes how long the move takes — `--alpha` sets what a percent of cycle time is
+worth in percent of tracking error.
 
 **What runs now (all of it is yours to change):**
 
 - **`DistillModel`** (`train_distillation_model.py`): `CNNModel`, a causal
   dilated-convolution net over the last ~1 s of the commanded trajectory,
-  predicting the gap `actual_q - target_q` for all six joints at once, with a per-row
-  uncertainty (`predict` returns `{"mean", "var", "var_aleatoric",
-  "var_epistemic"}`, each `{channel: (n, N_JOINTS)}`). It is a sequence model
-  because the gap is dynamic — the ring-down after a stop is invisible to any
-  per-row model. `CNNModel(targets=("actual_current",))` switches the channel (write the
-  matching `GapMetric` too); `members=K` makes it an ensemble. Its data comes from
-  `common.loaders`, so a different architecture only has to bring its own network
-  and training loop.
-- **`Dynamics`** (`dynamics.py`): `UR10eDynamics`, `tau = M(q)qdd + g(q)`,
-  `current = tau/Kt` (Coriolis dropped); `vel`/`acc` deg/s to rad/s. Override
-  `current(q, qd, qdd)` for friction, Coriolis, identified parameters.
-- **`EvaluationMetric`** (`metrics.py`): `GapMetric("q")`, `|actual_q - target_q|`
-  summed over joints -- the reality gap itself. `GapMetric("current")` scores the
-  torque instead; change `needs`/`per_row` for overshoot, jerk, a weighted mix.
-  The quantity has to be one `DistillModel.predicts()` fills in.
-- **`Preprocess`** (`preprocess.py`): `Identity` (no-op). Subclass to normalize or
-  scale features into and out of the learners.
-- **The RLA** (`train_rla.py`): observation = 16 numbers (the move + its distilled
-  channels + baseline score); objective = `score + cycle_time` (`OBJECTIVE`).
-  `params` action = `[vel, acc]` (deg/s), a trapezoidal speed along the movej line;
-  `path` action = `[accel_frac, decel_frac, speed]`, replaying the recorded
-  trajectory at a trapezoidal speed profile. Change `observe`, the `OBJECTIVE`
-  weights, or the action.
-- `utils.UR10e` supplies the robot physics (FK, Jacobian, gravity, mass matrix,
-  Coriolis) for `Dynamics` and as `DistillModel` features.
+  predicting the gap `actual_q - target_q` for all six joints at once. `predict`
+  returns `{"mean", "var", "var_aleatoric", "var_epistemic"}`. It is a sequence
+  model because the gap is dynamic — the ring-down after a stop is invisible to any
+  per-row model. `members=K` makes it a deep ensemble; the disagreement between the
+  members is what tells the optimizer where the model is guessing.
+- **`motion.movej`** (`motion.py`): a trapezoidal speed profile along the straight
+  joint-space line, smoothed by a fixed 60 ms box. Its ceilings are identified from
+  the recordings, and the binding one is usually Cartesian: the tool runs at exactly
+  1.35 m/s through the middle of every recorded move. It reproduces the recorded
+  `target_q` to ~22 mrad — see **Known gaps**.
+- **The objective** (`optimize.py`): tracking error (with `--k` standard deviations
+  of the model's own uncertainty added, so wandering into trajectories the model has
+  never seen is not free), cycle time, a penalty for exceeding a joint's ceilings,
+  and one for leaving the straight line. Change `error`, `penalty`, or add your own
+  term — anything differentiable.
+
+## Known gaps
+
+- `motion.movej` reproduces the recorded `target_q` to about **22 mrad** peak on
+  runs 1–5 and worse on 6–7, which is larger than the reality gap it is supposed to
+  frame (~1–3 mrad). The controller is closed-source; this is an identification, not
+  its code. So the *absolute* baseline number `optimize.py` prints carries that
+  error — the honest comparison is to run both motions on the robot (step 3).
+- The recorded `target_q` and `target_qd` are not consistent with each other:
+  differentiating `target_q` gives ~2% more speed than the `target_qd` channel says.
+  Everything here differentiates `target_q`, and `motion.py`'s caps are calibrated
+  to match it.
+- Each move is optimized on its own, starting from rest. A script whose moves blend
+  into one another is not modelled that way.
+- **The optimizer only wins for `--alpha` below ~0.1.** A trapezoid is time-optimal
+  under an acceleration limit, and a B-spline is smooth, so it cannot match a
+  `movej`'s duration within the same ceilings — it buys accuracy with time. On
+  `scripts/triangle.script` it reaches −7% tracking error for +50% cycle time.
+  Every move now prints its score against the `movej` it replaces, so you can see
+  which way the trade went.
 
 ## Tiers
 
