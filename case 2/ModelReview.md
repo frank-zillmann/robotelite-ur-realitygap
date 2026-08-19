@@ -21,7 +21,7 @@ Changelog). `train_rla.py`/`run.py` still default to
 updated yet and will not work with a model saved from this file until they
 switch to `metrics.PositionGapMetric`.
 
-## 2. Model: `PerJointPositionModel`
+## 2. Models: `PerJointPositionModel` and `PerJointTreeModel`
 
 One independent least-squares linear fit **per joint** — six separate
 `np.linalg.lstsq` calls, not one shared-slope model with a joint indicator.
@@ -57,6 +57,55 @@ made the evaluation-metric bug in §4 detectable in the first place.
 collinear with, since each joint is now its own independent fit) — gives a
 joint's average static bias (e.g. gravity sag at its typical poses) somewhere
 to go instead of leaking into the other coefficients.
+
+**`PerJointTreeModel`** (added 2026-08-19): a second `DistillModel`,
+`--model tree_per_joint`, one `sklearn.ensemble.HistGradientBoostingRegressor`
+per joint instead of `lstsq`. Same residual target convention as
+`PerJointPositionModel` — matters *more* for a tree than for the linear
+model: a tree approximates functions as piecewise-constant regions, so
+making it reproduce "output ≈ target_q" (a continuous ~±π-range near-identity
+mapping) before it has capacity left for the millirad-scale correction would
+waste most of its splits on the trivial part. **Deliberately uses the
+pre-gravity 7-feature set** (drops `gravity_torque`) — a scope decision, not
+evidence-driven; see §3 and §6 for why this makes the linear/tree comparison
+not fully apples-to-apples on the joints gravity helped.
+
+To support two model shapes without duplicating ~40 lines of feature-building
+logic, `_row_features`/`_design`/`predict` were refactored to key off
+`self.FEATURE_NAMES` (a `{name: array}` dict, then `column_stack` in
+`FEATURE_NAMES` order) rather than a hard-coded column list — `_design` also
+only pays for `_gravity_block`'s FK pass when `"gravity_torque"` is actually
+in `FEATURE_NAMES`, so the tree model doesn't compute a feature it won't use.
+Both classes' `_row_features`/`_design`/`predicts`/`bounds` are now shared
+unconditionally; only `fit`/`predict`/`params`/`coefficients` differ.
+
+**No feature scaling needed for the tree model**: `HistGradientBoostingRegressor`
+splits are threshold-based on one feature at a time and invariant to
+monotonic per-column transforms — this is *not* the same class of model as a
+true gradient-descent-trained one (e.g. an MLP), which would need it. Don't
+conflate "gradient-*boosted*" with "gradient-descent-optimized" — this
+project hasn't used the latter and doesn't need scaling here.
+
+**A real bug the refactor caught and fixed**: `_row_split_eval` (the
+held-out diagnostic) used to hard-code `np.linalg.lstsq` for its throwaway
+fit regardless of `--model` — so before the fix, the tree model's reported
+held-out RMSE/R² would have silently just been a *linear* refit's accuracy
+on the same 7 features, not the tree's. Fixed by extracting a
+`_row_split_fit_predict(X_train, y_train, X_test)` hook onto
+`PerJointPositionModel` (default: the old `lstsq` logic) that
+`PerJointTreeModel` overrides to fit+predict a fresh
+`HistGradientBoostingRegressor` instead. Also fixed in the same pass:
+`bounds()` checked `self.coefs is None` to decide if the model was fit —
+always `True` for the tree model (which never sets `self.coefs`, only
+`self.models`), so `bounds()` would have always incorrectly returned `None`.
+Changed the check to `self.vel_range is None`, the attribute `bounds()`
+actually returns, which both models set identically.
+
+`HistGradientBoostingRegressor(random_state=_RANDOM_STATE)` — a fixed seed
+is necessary, not just tidy: its auto-triggered early stopping (active here,
+n≫10,000) internally carves out its own validation split, which is
+non-deterministic without a seed, undermining this project's otherwise
+deterministic ("no RNG") split methodology (§5).
 
 ## 3. Feature engineering
 
@@ -237,6 +286,34 @@ effect (worth an FFT/autocorrelation check on its residual before spending
 feature-engineering effort there; also consistent with it not moving at all
 when `gravity_torque` was added).
 
+**Tree vs. linear** (`results/2026-08-19_14-31-40/` tree, `.../2026-08-19_14-30-54/`
+linear; both 20% row holdout, same split):
+
+| joint | linear R² (8 feat, w/ gravity) | tree R² (7 feat, no gravity) | linear RMSE (deg) | tree RMSE (deg) |
+|---|---|---|---|---|
+| overall | 0.445 | **0.882** | 0.0242 | **0.0111** |
+| base | 0.725 | 0.734 | 0.0076 | 0.0075 |
+| shoulder | 0.398 | **0.913** | 0.0561 | **0.0213** |
+| elbow | 0.462 | **0.630** | 0.0153 | **0.0127** |
+| wrist1 | **0.914** | 0.833 | **0.0053** | 0.0074 |
+| wrist2 | **0.840** | 0.796 | **0.0035** | 0.0039 |
+| wrist3 | 0.022 | **0.148** | 0.0019 | **0.0017** |
+
+Not a clean sweep, and worth reading honestly: the tree model is a large win
+on base/shoulder/elbow/wrist3 (shoulder R² more than doubles, from 0.40 to
+0.91, without any lag/history features — trees pick up some of the
+instantaneous nonlinear interaction among `qd`/`qdd`/`target_current`/`pos`
+a linear model structurally can't, even though neither model has been given
+the temporal history the ring actually needs), but **linear wins on wrist1
+and wrist2** — the two joints `gravity_torque` measurably helped (§3, §6).
+Since the tree model doesn't have that feature (a scope decision, not
+evidence — see above), this comparison isn't fully apples-to-apples: some or
+all of linear's wrist1/wrist2 edge may just be "linear has a feature tree
+doesn't," not "trees are worse at this relationship." Untested: a tree model
+*with* `gravity_torque` would isolate that question. `models/distill_tree.pkl`
+saved alongside `models/distill.pkl` (still the default/shipped model —
+`--model` default unchanged).
+
 **Plots each run produces** (`results/<datetime>/`), styled with `ur_style.py`:
 
 | file | shows |
@@ -270,9 +347,13 @@ that doesn't have any.
 4. **Leave-one-file-out CV diagnostic** — 7 cheap refits (42 params), gives
   an honest file-level generalization number alongside the row-level holdout
   (§5's caveat); doesn't change what gets shipped.
-5. **A non-linear regressor** (e.g. gradient-boosted trees, per joint) —
-  after, not instead of, 2: it can't see history it isn't given, so swapping
-  the regressor alone just buys a fancier memoryless model.
+5. ~~A non-linear regressor~~ — done, `PerJointTreeModel`, see §2/§6
+  (2026-08-19), **out of this list's stated order** (done before item 2, at
+  the user's explicit direction). The predicted caveat held: the tree model
+  still can't see history it isn't given, so it doesn't fix the settle-
+  window ring — shoulder/elbow both improved a lot over linear but item 2
+  (lag features) is still the more direct fix for the ring specifically, and
+  is untested on top of the tree model.
 6. `dynamics.Dynamics.frame()` doesn't emit an `actual_q` placeholder column
   (only `actual_current`) — relevant once this model needs to run inside
   `train_rla.py`'s candidate scoring, not for offline training/evaluation.
@@ -282,6 +363,26 @@ that doesn't have any.
 
 ## Changelog
 
+- **2026-08-19** — Added `PerJointTreeModel` (`--model tree_per_joint`,
+  `sklearn.ensemble.HistGradientBoostingRegressor` per joint), deliberately
+  using the pre-gravity 7-feature set (user's call, not evidence-driven).
+  Refactored `_row_features`/`_design`/`predict` to key off
+  `self.FEATURE_NAMES` so both models share the same feature-building code
+  without duplication. Fixed two real bugs surfaced by adding a second model
+  class: (1) `_row_split_eval` hard-coded a linear `lstsq` refit for its
+  held-out diagnostic regardless of `--model` — extracted a
+  `_row_split_fit_predict` hook so each model's own fitting method is used;
+  (2) `bounds()` checked `self.coefs is None`, which the tree model never
+  sets, so it always returned `None` post-fit — changed the check to
+  `self.vel_range is None`. Verified: reran the linear model post-refactor
+  and confirmed identical numbers to the pre-refactor run (0.445 R²,
+  bit-for-bit per-joint match); confirmed `model.bounds()` returns real
+  values (not `None`) on the fitted tree model; confirmed `coefficients.png`
+  is skipped (not errored) for the tree model. Results: held-out R² 0.445
+  (linear) vs. 0.882 (tree) overall — but not a clean win, linear is still
+  better on wrist1/wrist2 (the joints `gravity_torque` helped, which the
+  tree model doesn't have) — see §2/§6 for the full per-joint table and the
+  apples-to-apples caveat.
 - **2026-08-19** — Added the `gravity_torque` feature to `PerJointPositionModel`
   (`FEATURE_NAMES` now 8 entries). Added `utils.UR10e.gravity_batch` (and
   its `_dh_batch`/`_frames_batch`/`_point_jacobian_batch` helpers) after

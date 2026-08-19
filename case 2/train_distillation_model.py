@@ -58,6 +58,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import HistGradientBoostingRegressor
 
 import ur_style
 from preprocess import Identity, Preprocess, default_preprocess
@@ -67,6 +68,12 @@ from utils import (JOINT_NAMES, N_JOINTS, VEL_COL, ACC_COL, UR10e, frame_dt,
 # Shared physics instance for the gravity-torque feature (PerJointPositionModel).
 # payload=0.0 (default): recordings don't log a per-run payload to plug in here.
 _UR10E = UR10e()
+
+# Fixed seed for PerJointTreeModel's HistGradientBoostingRegressor: its
+# auto-triggered early stopping carves out its own internal validation split,
+# which is non-deterministic without a fixed seed -- would otherwise break the
+# "no RNG" determinism the row-level split (below) is built around.
+_RANDOM_STATE = 0
 
 
 def _gravity_block(q: np.ndarray) -> np.ndarray:
@@ -214,13 +221,18 @@ class PerJointPositionModel(DistillModel):
     - Override ``_row_features`` (kept with a ``(joint, ...)`` signature even
       though this baseline ignores ``joint``) to feed a joint-specific physics
       term, e.g. a different neighbouring-joint coupling term per joint.
+    - Subclass and override ``FEATURE_NAMES`` to use a different subset of
+      the columns ``_row_features`` knows how to build (see
+      ``PerJointTreeModel``) -- selection is driven entirely by
+      ``self.FEATURE_NAMES``, not a hard-coded column list, specifically so
+      this is possible without duplicating feature-building logic.
     """
 
     FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "gravity_torque",
                      "vel", "acc", "bias"]
 
     def __init__(self):
-        self.coefs = None                    # (N_JOINTS, 8) one row per joint
+        self.coefs = None                    # (N_JOINTS, len(FEATURE_NAMES)) one row per joint
         self.vel_range = None
         self.acc_range = None
 
@@ -229,8 +241,9 @@ class PerJointPositionModel(DistillModel):
 
     # --- features -------------------------------------------------------------
 
-    def _row_features(self, joint: int, tgt_i, pos, qd, qdd, vel, acc, gravity) -> np.ndarray:
-        """Feature rows for one joint over a whole trajectory, shape ``(n, 8)``.
+    def _row_features(self, joint: int, tgt_i, pos, qd, qdd, vel, acc, gravity=None) -> np.ndarray:
+        """Feature row for one joint over a whole trajectory, columns selected
+        by ``self.FEATURE_NAMES``, shape ``(n, len(FEATURE_NAMES))``.
 
         ``joint`` is unused by this baseline (each joint already gets its own
         coefficients from being fit separately) but kept in the signature so a
@@ -238,14 +251,19 @@ class PerJointPositionModel(DistillModel):
         call sites. ``gravity`` is this joint's own column of
         ``_gravity_block(full 6-joint pose)`` -- already sliced to one joint
         by the caller, since computing it needs the whole pose, not just this
-        joint's ``pos``.
+        joint's ``pos`` -- and is only required if ``"gravity_torque"`` is in
+        ``self.FEATURE_NAMES``; a subclass that omits it (e.g.
+        ``PerJointTreeModel``) can leave it ``None``.
         """
         tgt_i, pos = np.asarray(tgt_i), np.asarray(pos)
         qd, qdd = np.asarray(qd), np.asarray(qdd)
         vel, acc = np.asarray(vel), np.asarray(acc)
-        gravity = np.asarray(gravity)
         bias = np.ones(len(pos))
-        return np.column_stack([tgt_i, qd, qdd, pos, gravity, vel, acc, bias])
+        cols = {"target_current": tgt_i, "qd": qd, "qdd": qdd, "pos": pos,
+                "vel": vel, "acc": acc, "bias": bias}
+        if gravity is not None:
+            cols["gravity_torque"] = np.asarray(gravity)
+        return np.column_stack([cols[name] for name in self.FEATURE_NAMES])
 
     # --- fit ------------------------------------------------------------------
 
@@ -254,20 +272,25 @@ class PerJointPositionModel(DistillModel):
 
         Returns ``{joint: (X, y)}``, ``y`` being ``actual_q - target_q`` (the
         residual this model fits). Shared by ``fit`` so joint and pooled
-        evaluation build the feature matrix the same way.
+        evaluation build the feature matrix the same way. Only computes
+        ``_gravity_block`` (the expensive full-pose FK pass) when
+        ``"gravity_torque"`` is actually in ``self.FEATURE_NAMES``, so a
+        subclass that omits it doesn't pay for it.
         """
+        needs_gravity = "gravity_torque" in self.FEATURE_NAMES
         per_joint = {j: ([], []) for j in range(N_JOINTS)}
         for rec in recordings:
             if rec.vel_cmd is None or rec.acc_cmd is None:
                 raise ValueError(f"{rec.path} has no vel/acc registers; record "
                                  "with `--float-register 1 vel 2 acc`")
             qdd = np.gradient(rec.target_qd, rec.dt, axis=0)     # commanded accel
-            grav = _gravity_block(rec.target_q)     # (n, N_JOINTS), full-pose FK once per recording
+            grav = _gravity_block(rec.target_q) if needs_gravity else None
             for j in range(N_JOINTS):
                 Xs, ys = per_joint[j]
                 Xs.append(self._row_features(j, rec.target_current[:, j], rec.target_q[:, j],
                                              rec.target_qd[:, j], qdd[:, j],
-                                             rec.vel_cmd, rec.acc_cmd, grav[:, j]))
+                                             rec.vel_cmd, rec.acc_cmd,
+                                             grav[:, j] if needs_gravity else None))
                 ys.append(rec.actual_q[:, j] - rec.target_q[:, j])
         return {j: (np.vstack(Xs), np.concatenate(ys)) for j, (Xs, ys) in per_joint.items()}
 
@@ -286,6 +309,19 @@ class PerJointPositionModel(DistillModel):
         self.acc_range = (float(np.min(acc_all)), float(np.max(acc_all)))
         return self
 
+    def _row_split_fit_predict(self, X_train, y_train, X_test) -> np.ndarray:
+        """Fit a throwaway model on ``(X_train, y_train)``, predict ``X_test``.
+
+        Returns the *residual* prediction (not the absolute value ``predict``
+        returns) -- the caller (``_row_split_eval``) adds ``target_q`` back
+        itself. Used only for the row-split held-out diagnostic, discarded
+        after; override in a subclass whose real ``fit`` isn't linear so the
+        held-out number reflects that model's actual method rather than a
+        hard-coded ``lstsq`` refit on its features.
+        """
+        coef, *_ = np.linalg.lstsq(X_train, y_train, rcond=None)
+        return X_test @ coef
+
     # --- predict --------------------------------------------------------------
 
     def predict(self, df) -> dict:
@@ -296,15 +332,17 @@ class PerJointPositionModel(DistillModel):
         qdd = np.gradient(qd, dt, axis=0)
         vel = df[VEL_COL].to_numpy(dtype=float)
         acc = df[ACC_COL].to_numpy(dtype=float)
-        grav = _gravity_block(q)
+        needs_gravity = "gravity_torque" in self.FEATURE_NAMES
+        grav = _gravity_block(q) if needs_gravity else None
         out = np.zeros_like(q)
         for j in range(N_JOINTS):
-            feats = self._row_features(j, ti[:, j], q[:, j], qd[:, j], qdd[:, j], vel, acc, grav[:, j])
+            feats = self._row_features(j, ti[:, j], q[:, j], qd[:, j], qdd[:, j], vel, acc,
+                                       grav[:, j] if needs_gravity else None)
             out[:, j] = q[:, j] + feats @ self.coefs[j]     # target_q + predicted error
         return {"actual_q": out}
 
     def bounds(self):
-        if self.coefs is None:
+        if self.vel_range is None:
             return None
         return self.vel_range, self.acc_range
 
@@ -323,9 +361,91 @@ class PerJointPositionModel(DistillModel):
         return {JOINT_NAMES[j]: (self.FEATURE_NAMES, self.coefs[j]) for j in range(N_JOINTS)}
 
 
+class PerJointTreeModel(PerJointPositionModel):
+    """Gradient-boosted-tree position model, one independent regressor per joint.
+
+    Same target convention as ``PerJointPositionModel``: predicts the
+    *residual* ``actual_q - target_q``, not raw ``actual_q``. This matters
+    even more for a tree than for the linear parent: a tree approximates a
+    function as piecewise-constant regions, so making it reproduce
+    "output ≈ target_q" (a continuous, ~±π-range near-identity mapping)
+    before it has any capacity left for the actual millirad-scale correction
+    would waste most of its splits on the trivial part. Predicting the small,
+    near-zero-mean residual instead means every split is doing useful work.
+
+    Deliberately uses the pre-gravity 7-feature set (``target_current``,
+    ``qd``, ``qdd``, ``pos``, ``vel``, ``acc``, ``bias``) rather than the
+    parent's 8 (which adds ``gravity_torque``) -- omitting it here was a
+    scope decision, not an evidence-driven one; see ``ModelReview.md``.
+    Reuses the parent's ``_row_features``/``_design``/``predicts``/``bounds``
+    unchanged (both are driven entirely by ``self.FEATURE_NAMES``, see the
+    parent's docstring) -- only the fitting/prediction mechanism changes.
+
+    No feature scaling needed: ``HistGradientBoostingRegressor``'s splits are
+    threshold-based on one feature at a time and invariant to monotonic
+    per-column transforms, unlike a true gradient-descent-trained model
+    (e.g. an MLP) that this project hasn't used and doesn't need here.
+
+    ``coefficients()`` returns ``None`` -- there's no per-feature linear
+    weight to show, so ``_plot_coefficients`` skips the plot (prints, does
+    not error) rather than displaying something meaningless.
+    """
+
+    FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "vel", "acc", "bias"]
+
+    def __init__(self):
+        super().__init__()
+        self.models = [None] * N_JOINTS      # one fitted HistGradientBoostingRegressor per joint
+
+    def fit(self, recordings) -> "PerJointTreeModel":
+        """Fit one gradient-boosted-tree model per joint, independently."""
+        design = self._design(recordings)
+        vel_col = self.FEATURE_NAMES.index("vel")
+        acc_col = self.FEATURE_NAMES.index("acc")
+        vel_all, acc_all = [], []
+        for j, (X, y) in design.items():
+            self.models[j] = HistGradientBoostingRegressor(
+                random_state=_RANDOM_STATE).fit(X, y)
+            vel_all.append(X[:, vel_col])
+            acc_all.append(X[:, acc_col])
+        self.vel_range = (float(np.min(vel_all)), float(np.max(vel_all)))
+        self.acc_range = (float(np.min(acc_all)), float(np.max(acc_all)))
+        return self
+
+    def _row_split_fit_predict(self, X_train, y_train, X_test) -> np.ndarray:
+        return HistGradientBoostingRegressor(
+            random_state=_RANDOM_STATE).fit(X_train, y_train).predict(X_test)
+
+    def predict(self, df) -> dict:
+        dt = frame_dt(df)
+        ti = get_block(df, "target_current")
+        q = get_block(df, "target_q")
+        qd = get_block(df, "target_qd")
+        qdd = np.gradient(qd, dt, axis=0)
+        vel = df[VEL_COL].to_numpy(dtype=float)
+        acc = df[ACC_COL].to_numpy(dtype=float)
+        out = np.zeros_like(q)
+        for j in range(N_JOINTS):
+            feats = self._row_features(j, ti[:, j], q[:, j], qd[:, j], qdd[:, j], vel, acc)
+            out[:, j] = q[:, j] + self.models[j].predict(feats)
+        return {"actual_q": out}
+
+    def params(self) -> dict:
+        return {
+            "type":         "hist_gradient_boosting_per_joint",
+            "features":     self.FEATURE_NAMES,
+            "random_state": _RANDOM_STATE,
+            "vel_range":    list(self.vel_range) if self.vel_range else None,
+            "acc_range":    list(self.acc_range) if self.acc_range else None,
+        }
+
+    def coefficients(self):
+        return None
+
+
 # Models selectable via --model. Add a new DistillModel subclass here to make
 # it available from the CLI without touching the train/test split logic.
-MODELS = {"linear_per_joint": PerJointPositionModel}
+MODELS = {"linear_per_joint": PerJointPositionModel, "tree_per_joint": PerJointTreeModel}
 
 
 def augment(model: DistillModel, csv: str, pre: Preprocess = None):
@@ -677,8 +797,13 @@ def _row_split_eval(model: DistillModel, recordings, holdout: float) -> dict:
     Matches ``original_train.py``'s split (``step = round(1/holdout)``, every
     step-th row by index, no RNG). Requires ``model._design(recordings)`` ->
     ``{joint: (X, y)}`` with ``y = actual_<channel> - target_<channel>`` (what
-    ``PerJointPositionModel`` provides) -- this is not part of the generic
-    ``DistillModel`` interface, so a model without ``_design`` can't use this.
+    ``PerJointPositionModel`` provides) and ``model._row_split_fit_predict``
+    for the throwaway fit -- neither is part of the generic ``DistillModel``
+    interface, so a model without both can't use this. The throwaway fit
+    itself is delegated to the model (``_row_split_fit_predict``) rather than
+    hard-coded here, so the held-out number reflects each model's own fitting
+    method (e.g. gradient-boosted trees for ``PerJointTreeModel``), not
+    always a linear refit on whatever features ``_design`` builds.
 
     Returns an eval_data dict shaped like ``_evaluate_model``'s output (so it
     feeds ``_compute_metrics`` and the plotting functions unchanged): rebuilds
@@ -698,10 +823,10 @@ def _row_split_eval(model: DistillModel, recordings, holdout: float) -> dict:
 
     eval_data = {ch: {}}
     for j, (X, y) in design.items():
-        coef, *_ = np.linalg.lstsq(X[~is_test], y[~is_test], rcond=None)
+        pred_res = model._row_split_fit_predict(X[~is_test], y[~is_test], X[is_test])
         tgt    = target_by_joint[j][is_test]
         actual = tgt + y[is_test]
-        pred   = tgt + X[is_test] @ coef
+        pred   = tgt + pred_res
         eval_data[ch][j] = {"pred": pred, "actual": actual, "target": tgt,
                             "residuals": pred - actual}
     return eval_data
