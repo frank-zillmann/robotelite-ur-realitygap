@@ -76,8 +76,8 @@ class Recording:
 
     @property
     def dt(self) -> float:
-        """Median sample period (s)."""
-        return float(np.median(np.diff(self.t)))
+        """Sample period (s): elapsed time over the number of steps."""
+        return float((self.t[-1] - self.t[0]) / (len(self.t) - 1))
 
     def channel(self, base: str):
         """A per-joint channel as ``(n, N_JOINTS)``, or ``None`` if not recorded.

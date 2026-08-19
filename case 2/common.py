@@ -22,7 +22,7 @@ import torch
 from torch.utils.data import (DataLoader, Dataset, WeightedRandomSampler,
                               random_split)
 
-from utils import N_JOINTS, SCRIPT_COL, get_block
+from utils import DT, N_JOINTS, SCRIPT_COL, get_block
 
 SETTLE_S = 1.0             # settle kept after a move ends; the rest of a pause is idle
 
@@ -118,7 +118,7 @@ def _diff(x, dt: float):
                       (x[-1:] - x[-2:-1]) / dt])
 
 
-def features(q, dt: float, pad: int = 0):
+def features(q, dt: float = DT, pad: int = 0):
     """Per-row model inputs ``(n + pad, N_FEAT)`` from the commanded angles alone.
 
     - ``sin q``, ``cos q``  pose, wrap-safe, and what gravity and inertia vary with.
@@ -162,18 +162,21 @@ class MoveDataset(Dataset):
     """
 
     def __init__(self, recordings, targets=("actual_q",), pad: int = 0):
+        for rec in recordings:                # everything downstream assumes DT
+            if abs(rec.dt - DT) > 0.05 * DT:
+                raise ValueError(f"{rec.path} runs at {rec.dt * 1000:.2f} ms, not "
+                                 f"{DT * 1000:.2f}; re-record it with --hz {1 / DT:.0f}")
         self.moves = [(rec, s) for rec in recordings for s in segments(rec)]
         seqs = []
         for rec, s in self.moves:
             sub = rec.df.iloc[s.i0:s.i2]      # motion plus the capped settle window
             gap = np.column_stack([get_block(sub, b) - get_block(sub, RESIDUAL[b])
                                    for b in targets]).astype(np.float32)
-            seqs.append((features(get_block(sub, "target_q"), rec.dt, pad).numpy(), gap))
+            seqs.append((features(get_block(sub, "target_q"), DT, pad).numpy(), gap))
 
         X = np.concatenate([x for x, _ in seqs])
         Y = np.concatenate([y for _, y in seqs])
         self.stats = (X.mean(0), X.std(0), Y.mean(0), Y.std(0))
-        self.dt = float(np.median([r.dt for r in recordings]))
         my, sy = self.stats[2], self.stats[3]
         self.data = [(standardize(x, self.stats), (y - my) / sy) for x, y in seqs]
 

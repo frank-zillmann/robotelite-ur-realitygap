@@ -1,9 +1,9 @@
 """Shared helpers for the case 2 scripts: constants, robot physics, scripts.
 
 - constants: joint count/names and the CSV column names.
-- `UR10e`: numpy-only kinematics (FK, Jacobian), plus the speed and acceleration
-  ceilings the controller enforces.
-- URScript helpers: load a `.script`, read/replace its `vel`/`acc` parameters.
+- `Robot`: numpy-only kinematics (FK, Jacobian) and the controller's speed and
+  acceleration ceilings, for a UR10e or a UR5e.
+- `load_script`: read a `.script` file.
 """
 from __future__ import annotations
 
@@ -14,6 +14,12 @@ import numpy as np
 # --- constants ---------------------------------------------------------------
 N_JOINTS = 6                                             # base, shoulder, elbow, wrist1, wrist2, wrist3
 JOINT_NAMES = ("base", "shoulder", "elbow", "wrist1", "wrist2", "wrist3")
+
+# One sample period for everything: what record.py asks the RTDE stream for, what
+# the model is trained on, and what a path is written at. 8 ms divides both control
+# cycles UR ships (2 ms on e-Series, 8 ms on CB3), so it is a rate every box can
+# actually deliver rather than one it has to round.
+DT = 0.008                                               # s (125 Hz)
 
 TIME_COL = "t"                                           # seconds since recording started
 # The optimized motion parameters, from the URScript `movej(..., a=acc, v=vel)`,
@@ -40,91 +46,84 @@ def get_block(df, base: str) -> "np.ndarray":
     return df[joint_cols(base)].to_numpy(dtype=float)
 
 
-def set_block(df, base: str, block) -> None:
-    """Overwrite a per-joint channel in a DataFrame with an ``(n, N_JOINTS)`` array."""
-    df[joint_cols(base)] = np.asarray(block, dtype=float)
+# --- UR kinematics and limits (numpy only) -----------------------------------
 
+class Robot:
+    """One UR arm: kinematics, and the ceilings its controller enforces.
 
-def frame_dt(df) -> float:
-    """Median sample period (s) of a recording DataFrame (from its ``t`` column)."""
-    return float(np.median(np.diff(df[TIME_COL].to_numpy(dtype=float))))
-
-
-# --- UR10e kinematics (numpy only) -------------------------------------------
-# UR10e parameters, from Universal Robots "DH Parameters for calculations of
-# kinematics" (universal-robots.com). Standard (classic) DH.
-#   joint i rotates by q[i] about z of the previous frame.
-_A = np.array([0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0])          # link length a [m]
-_D = np.array([0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655])    # link offset d [m]
-_ALPHA = np.array([np.pi / 2, 0.0, 0.0, np.pi / 2, -np.pi / 2, 0.0])  # twist [rad]
-
-
-class UR10e:
-    """UR10e kinematics. Extend by overriding the parameter arrays.
-
-        ur = UR10e()
-        q  = [0, -1.57, 1.57, -1.57, -1.57, 0]
-        ur.fk(q)                            # 4x4 base -> flange pose
-        ur.jacobian(q)                      # 6x6 geometric Jacobian (base frame)
-
-    Kinematics only: motion.py needs the Jacobian to convert the controller's
-    Cartesian speed cap into joint terms. Nothing models torque any more.
+        r = Robot("UR5e")
+        r.fk(q)                  # 4x4 base -> flange pose
+        r.jacobian(q)            # 6x6 geometric Jacobian, [v; w] = J(q) @ qd
+        r.tcp_speed(q, dt)       # tool speed (m/s) along a trajectory
+        r.v_joint, r.a_joint, r.v_tcp
     """
 
-    # --- kinematics -----------------------------------------------------------
+    ALPHA = np.array([np.pi / 2, 0.0, 0.0, np.pi / 2, -np.pi / 2, 0.0])
+    A_JOINT = np.array([25.0, 65.0, 60.0, 45.0, 35.0, 35.0])      # rad/s^2
+    V_TCP = 1.35                                                  # m/s
+    # The speed ceilings are checked by differencing q, which overshoots by about a
+    # percent at the corners of a profile, so they get that much headroom. Without
+    # it the controller's own paths score as violations and the optimizer only ever
+    # slows down. The recordings sit exactly on the spec: 2.094 and 3.142 rad/s.
+    MARGIN = 1.02
+    MODELS = {
+        "UR10e": dict(a=[0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0],
+                      d=[0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655],
+                      v_deg=[120, 120, 180, 180, 180, 180]),
+        "UR5e": dict(a=[0.0, -0.425, -0.3922, 0.0, 0.0, 0.0],
+                     d=[0.1625, 0.0, 0.0, 0.1333, 0.0997, 0.0996],
+                     v_deg=[180, 180, 180, 180, 180, 180]),
+    }
+
+    def __init__(self, model: str = "UR10e"):
+        if model not in self.MODELS:
+            raise ValueError(f"unknown robot {model!r}, have {list(self.MODELS)}")
+        p = self.MODELS[model]
+        self.model = model
+        self.a, self.d = np.array(p["a"]), np.array(p["d"])
+        self.v_joint = np.deg2rad(p["v_deg"]) * self.MARGIN
+        self.a_joint, self.v_tcp = self.A_JOINT, self.V_TCP * self.MARGIN
 
     @staticmethod
     def _dh(theta: float, a: float, d: float, alpha: float) -> np.ndarray:
         """Standard DH homogeneous transform from one frame to the next."""
         ct, st = np.cos(theta), np.sin(theta)
         ca, sa = np.cos(alpha), np.sin(alpha)
-        return np.array([
-            [ct, -st * ca, st * sa, a * ct],
-            [st, ct * ca, -ct * sa, a * st],
-            [0.0, sa, ca, d],
-            [0.0, 0.0, 0.0, 1.0],
-        ])
+        return np.array([[ct, -st * ca, st * sa, a * ct],
+                         [st, ct * ca, -ct * sa, a * st],
+                         [0.0, sa, ca, d],
+                         [0.0, 0.0, 0.0, 1.0]])
 
     def _frames(self, q) -> list[np.ndarray]:
-        """Cumulative base->frame transforms T[0..6]; T[0] is the base (identity)."""
+        """Cumulative base->frame transforms T[0..6]; T[0] is the base."""
         q = np.asarray(q, dtype=float)
         frames = [np.eye(4)]
-        for i in range(6):
-            frames.append(frames[-1] @ self._dh(q[i], _A[i], _D[i], _ALPHA[i]))
+        for i in range(N_JOINTS):
+            frames.append(frames[-1] @ self._dh(q[i], self.a[i], self.d[i], self.ALPHA[i]))
         return frames
 
     def fk(self, q) -> np.ndarray:
         """Base->flange (TCP) pose as a 4x4 homogeneous transform."""
-        return self._frames(q)[6]
-
-    def tcp_position(self, q) -> np.ndarray:
-        """Flange (TCP) position in the base frame, shape (3,)."""
-        return self.fk(q)[:3, 3]
-
-    def _point_jacobian(self, frames: list[np.ndarray], point: np.ndarray,
-                        up_to: int) -> np.ndarray:
-        """Linear + angular Jacobian (6x6) of a point rigidly on link ``up_to``.
-
-        Only the first ``up_to`` joints move the point; later columns are zero.
-        Columns use the classic revolute-joint form with axis z of the previous
-        frame.
-        """
-        J = np.zeros((6, 6))
-        for j in range(up_to):
-            z = frames[j][:3, 2]           # joint j axis (z of previous frame)
-            p = frames[j][:3, 3]           # origin of previous frame
-            J[:3, j] = np.cross(z, point - p)
-            J[3:, j] = z
-        return J
+        return self._frames(q)[N_JOINTS]
 
     def jacobian(self, q) -> np.ndarray:
-        """Geometric Jacobian (6x6) of the flange in the base frame.
-
-        Rows 0..2 map joint rates to TCP linear velocity, rows 3..5 to angular
-        velocity: ``[v; w] = J(q) @ qd``.
-        """
+        """Geometric Jacobian (6x6) of the flange in the base frame."""
         frames = self._frames(q)
-        return self._point_jacobian(frames, frames[6][:3, 3], up_to=6)
+        point = frames[N_JOINTS][:3, 3]
+        J = np.zeros((6, 6))
+        for j in range(N_JOINTS):
+            z, p = frames[j][:3, 2], frames[j][:3, 3]   # joint axis, and a point on it
+            J[:3, j], J[3:, j] = np.cross(z, point - p), z
+        return J
+
+    def jacobians(self, q) -> np.ndarray:
+        """Linear part of the Jacobian at every pose of a trajectory, (n, 3, 6)."""
+        return np.array([self.jacobian(p)[:3] for p in np.asarray(q, float)])
+
+    def tcp_speed(self, q, dt: float = DT) -> np.ndarray:
+        """Tool speed (m/s) along a commanded trajectory."""
+        qd = np.gradient(np.asarray(q, float), dt, axis=0)
+        return np.linalg.norm(np.einsum("nij,nj->ni", self.jacobians(q), qd), axis=1)
 
 
 # --- URScript helpers --------------------------------------------------------
@@ -132,42 +131,7 @@ class UR10e:
 # prefix that is preserved on replacement. Plain (non-global) assignments let
 # send.py wrap the motion in a repeat loop, since URScript rejects a `global`
 # declaration inside a loop.
-_PARAM = r"((?:global\s+)?{name}\s*=\s*)([0-9]+(?:\.[0-9]+)?)"
-
-
 def load_script(path: str) -> str:
     """Read a URScript file to text."""
     with open(path) as f:
         return f.read()
-
-
-def get_param(text: str, name: str) -> float:
-    """Read a `<name> = <number>` value from URScript text."""
-    m = re.search(_PARAM.format(name=name), text)
-    if not m:
-        raise ValueError(f"no `{name} = ...` line in the script")
-    return float(m.group(2))
-
-
-def set_param(text: str, name: str, value: float) -> str:
-    """Return the script with `<name>` set to ``value`` (rounded int)."""
-    return re.sub(_PARAM.format(name=name), rf"\g<1>{int(round(value))}", text)
-
-
-# What the controller will actually run. Speeds are the UR10e spec sheet (base and
-# shoulder 120 deg/s, the rest 180) and the tool-speed cap the recordings sit on;
-# UR publishes no joint acceleration, so that one is the most the controller was
-# ever seen to command in data/. MARGIN is headroom: these get checked by
-# differentiating target_q, which reads a few percent above the controller's own
-# target_qd channel.
-MARGIN = 1.05
-V_JOINT = np.deg2rad([120, 120, 180, 180, 180, 180]) * MARGIN   # rad/s
-A_JOINT = np.array([25.0, 65.0, 60.0, 45.0, 35.0, 35.0])        # rad/s^2
-V_TCP = 1.35 * MARGIN                                           # m/s
-
-
-def tcp_speed(q, dt: float) -> np.ndarray:
-    """Tool speed (m/s) along a commanded trajectory."""
-    ur = UR10e()
-    qd = np.gradient(np.asarray(q, float), dt, axis=0)
-    return np.array([np.linalg.norm((ur.jacobian(a) @ b)[:3]) for a, b in zip(q, qd)])

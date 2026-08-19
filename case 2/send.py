@@ -35,7 +35,7 @@ import re
 import socket
 
 from record import build_recipe, open_stream, parse_registers, record_stream
-from utils import load_script
+from utils import DT, load_script
 
 SCRIPT_PORT = 30002       # UR secondary client interface: accepts URScript programs
 RUNTIME_PLAYING = 2       # RTDE runtime_state while a program is running
@@ -282,8 +282,8 @@ def main():
                     help="URScript file to run on the robot")
     ap.add_argument("--path", default=None,
                     help="servoj path CSV to stream instead of --script")
-    ap.add_argument("--dt", type=float, default=0.008,
-                    help="servoj time per row for --path (s, default 0.008)")
+    ap.add_argument("--dt", type=float, default=DT,
+                    help="servoj time per row, when the path has no dt column")
     ap.add_argument("--out", default="run.csv",
                     help="output CSV path (default: run.csv in the current folder)")
     ap.add_argument("--hz", type=float, default=125.0, help="sample rate (default 125)")

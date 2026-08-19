@@ -40,7 +40,7 @@ import socket
 import struct
 import time
 
-from utils import N_JOINTS, TIME_COL
+from utils import DT, N_JOINTS, TIME_COL
 
 RTDE_PORT = 30004
 
@@ -224,7 +224,8 @@ def main():
     ap.add_argument("--robot-ip", default=os.environ.get("UR_HOST", "127.0.0.1"),
                     help="UR controller IP (default: $UR_HOST or 127.0.0.1)")
     ap.add_argument("--out", default="run.csv", help="output CSV path")
-    ap.add_argument("--hz", type=float, default=125.0, help="sample rate (default 125)")
+    ap.add_argument("--hz", type=float, default=1 / DT,
+                    help=f"sample rate (default {1 / DT:.0f}, the rate everything assumes)")
     ap.add_argument("--float-register", nargs="+", metavar="IDX NAME",
                     help="log output float registers, e.g. 1 vel 2 acc")
     args = ap.parse_args()

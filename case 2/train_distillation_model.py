@@ -37,7 +37,7 @@ from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
 from common import RESIDUAL, N_FEAT, blocks, features, loaders, standardize
-from utils import N_JOINTS, frame_dt, get_block
+from utils import DT, N_JOINTS, get_block
 
 
 class DistillModel(ABC):
@@ -123,7 +123,7 @@ class CNNModel(DistillModel):
         self.lr, self.seed = lr, seed
         self.pad = (kernel - 1) * sum(dilations) # warm-up rows per sequence
         self.n_out = len(self.targets) * N_JOINTS
-        self.train_dt = self.stats = None
+        self.stats = None
         self.nets = []
         for m in range(members):
             torch.manual_seed(seed + m) # the members' only difference
@@ -208,10 +208,10 @@ class CNNModel(DistillModel):
         train, val = loaders(recordings, self.targets, self.pad, self.batch,
                              self.val_frac, self.seed)
         ds = train.dataset.dataset # the MoveDataset behind the Subset
-        self.stats, self.train_dt = ds.stats, ds.dt
+        self.stats = ds.stats
         run = f"runs/distill/{time.strftime('%Y%m%d-%H%M%S')}"
         print(f"{len(train.dataset)} train / {len(val.dataset)} val moves, receptive "
-              f"field {self.pad + 1} rows ({(self.pad + 1) * self.train_dt:.2f} s)\n"
+              f"field {self.pad + 1} rows ({(self.pad + 1) * DT:.2f} s)\n"
               f"logging to {run}, watch with: tensorboard --logdir runs")
         train_log = SummaryWriter(f"{run}/train")
         val_log = SummaryWriter(f"{run}/val") if len(val.dataset) else None
@@ -246,8 +246,7 @@ class CNNModel(DistillModel):
         for sl in blocks(df): # never filter across a script seam
             # ``df`` must be sampled at ``train_dt``: a learned temporal filter only
             # holds at its training rate (optimize.py builds its frames that way).
-            sub = df.iloc[sl]
-            x = standardize(features(get_block(sub, "target_q"), frame_dt(sub),
+            x = standardize(features(get_block(df.iloc[sl], "target_q"), DT,
                                      self.pad).numpy(), self.stats)
             with torch.inference_mode():
                 mu, lv = self.forward(torch.from_numpy(x.T[None]).float())

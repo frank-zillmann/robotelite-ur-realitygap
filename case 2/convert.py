@@ -21,10 +21,10 @@ import numpy as np
 import send
 from analysis import Recording
 from common import segments
-from utils import N_JOINTS
+from utils import DT, N_JOINTS
 
 
-def convert(script: str, robot_ip: str = "127.0.0.1", hz: float = 125.0):
+def convert(script: str, robot_ip: str):
     """``(q, dt)``: the commanded trajectory of one cycle of ``script``.
 
     The script runs twice and only the second pass is kept: it begins where the
@@ -32,13 +32,14 @@ def convert(script: str, robot_ip: str = "127.0.0.1", hz: float = 125.0):
     independent of where the robot started. A single pass would open with the robot
     travelling in from that pose.
 
-    ``dt`` is the nominal ``1/hz``, not the recorded timestamps: record.py stamps
-    rows with the host clock, which runs long under scheduling jitter, while the
-    controller streams on its own and drops a client that falls behind rather than
-    skipping rows -- so a run that finished has every row.
+    The rate is ``utils.DT`` and the path is written at it, rather than at the
+    recorded timestamps: record.py stamps rows with the host clock, which runs long
+    under scheduling jitter, while the controller streams on its own and drops a
+    client that falls behind rather than skipping rows -- so a run that finished has
+    every row, exactly ``DT`` apart.
     """
     with tempfile.NamedTemporaryFile(suffix=".csv") as tmp:
-        send.record_run(robot_ip, script, tmp.name, hz=hz, loop=2)
+        send.record_run(robot_ip, script, tmp.name, hz=1 / DT, loop=2)
         rec = Recording(tmp.name)
     segs = segments(rec)
     if len(segs) < 2:
@@ -47,10 +48,10 @@ def convert(script: str, robot_ip: str = "127.0.0.1", hz: float = 125.0):
     q = rec.target_q[cycle[0].i0:cycle[-1].i2]
     print(f"  {len(rec.t)} samples over two passes, {len(segs)} moves, keeping the last "
           f"{len(cycle)}; host clock read {rec.dt * 1000:.2f} ms per row against "
-          f"{1000 / hz:.2f} ms")
+          f"{DT * 1000:.2f} ms")
     if np.abs(q[0] - q[-1]).max() > 1e-3:
         print("  note: it does not end where it starts, so streaming it in a loop jumps")
-    return q, 1.0 / hz
+    return q, DT
 
 
 def write_path(path: str, q, dt: float):
@@ -63,9 +64,9 @@ def write_path(path: str, q, dt: float):
 
 def main():
     ap = argparse.ArgumentParser(description="Record what a script commands, as a path.")
-    ap.add_argument("--script", default="scripts/triangle.script", help="URScript to run")
-    ap.add_argument("--out", default=None, help="default: <script>.path")
+    ap.add_argument("--script", required=True, help="URScript to run")
     ap.add_argument("--robot-ip", default="127.0.0.1", help="controller address")
+    ap.add_argument("--out", default=None, help="default: <script>.path")
     args = ap.parse_args()
 
     q, dt = convert(args.script, args.robot_ip)
