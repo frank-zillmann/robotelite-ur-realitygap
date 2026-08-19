@@ -198,20 +198,6 @@ class UR10e:
             M += mass * (Jv.T @ Jv) + Jw.T @ I_base @ Jw
         return 0.5 * (M + M.T)  # symmetrize away tiny numerical asymmetry
 
-    def gravity_and_mass_diag(self, q) -> tuple[np.ndarray, np.ndarray]:
-        """Gravity torque (6,) and the mass matrix's diagonal (6,), from one
-        shared ``_link_terms`` pass -- for callers that want both without
-        paying for ``_link_terms`` twice (``gravity`` and ``mass_matrix`` each
-        compute it separately).
-        """
-        g_vec = np.array([0.0, 0.0, -_G])
-        tau = np.zeros(6)
-        M = np.zeros((6, 6))
-        for mass, Jv, Jw, I_base in self._link_terms(q):
-            tau -= mass * (Jv.T @ g_vec)
-            M += mass * (Jv.T @ Jv) + Jw.T @ I_base @ Jw
-        return tau, np.diag(0.5 * (M + M.T))
-
     def coriolis(self, q, qd) -> np.ndarray:
         """Coriolis and centrifugal torque per joint (6,), Nm: the term
         ``C(q,qd) @ qd`` in ``M(q) qdd + C(q,qd) qd + g(q) = tau``.

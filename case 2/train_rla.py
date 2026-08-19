@@ -40,7 +40,7 @@ from stable_baselines3 import PPO
 from analysis import Recording
 from common import segments
 from dynamics import (DEG2RAD, GRID, MAX_JOINT_ACC, MAX_JOINT_SPEED, Dynamics,
-                      default_dynamics, s_curve, trapezoidal)
+                      default_dynamics, trapezoidal)
 from train_distillation_model import DistillModel, augment
 from metrics import GapMetric, EvaluationMetric, SCORE_COL, add_score
 from preprocess import Identity, Preprocess, default_preprocess
@@ -238,15 +238,12 @@ class GapEnv(_MoveEnv):
     """params mode: one vel/acc per move (a movej).
 
     Geometry is the movej's straight joint line start -> dest; vel/acc set a
-    speed profile along it, either ``s_curve`` (default, jerk-limited) or
-    ``trapezoidal`` -- pass ``profile=trapezoidal`` to compare the two
-    strategies against the same model/metric/recording.
+    trapezoidal speed profile along it.
     """
 
-    def __init__(self, *args, objective=OBJECTIVE, profile=s_curve, **kw):
+    def __init__(self, *args, objective=OBJECTIVE, **kw):
         super().__init__(*args, **kw)
         self.objective = objective
-        self.profile = profile
         self.action_space = spaces.Box(low=np.array([-1.0, -1.0], dtype=np.float32),
                                        high=np.array([1.0, 1.0], dtype=np.float32))
 
@@ -267,7 +264,7 @@ class GapEnv(_MoveEnv):
         vel = min(vel_deg * DEG2RAD, MAX_JOINT_SPEED)
         acc = min(acc_deg * DEG2RAD, MAX_JOINT_ACC)
         dt = self.rec.dt
-        s = self.profile(distance, vel, acc, dt)
+        s = trapezoidal(distance, vel, acc, dt)
         return float(_aggregate(self._candidate(move, s, dt, vel_deg, acc_deg))), len(s) * dt
 
     def _cost(self, move, action) -> tuple[float, float, float]:
