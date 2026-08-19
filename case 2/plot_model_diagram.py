@@ -1,7 +1,7 @@
 """Architecture diagram for the per-joint position model, for the report.
 
 Shows the shared pipeline both PerJointPositionModel and PerJointTreeModel
-use: eight input features -> one regressor per joint -> predicted residual
+use: eleven input features -> one regressor per joint -> predicted residual
 -> added back to the commanded position -> predicted actual_q. The
 regressor box is generic (linear least-squares or gradient-boosted trees)
 since the surrounding architecture is identical either way -- only the
@@ -24,12 +24,23 @@ FEATURES = [
     ("target_current", "A", "commanded current"),
     ("qd", "rad/s", "commanded velocity"),
     ("qdd", "rad/s²", "commanded accel."),
+    ("qdd_lag4", "rad/s²", "qdd, 4 samples (~31ms) ago"),
+    ("qdd_lag16", "rad/s²", "qdd, 16 samples (~125ms) ago"),
+    ("qdd_lag64", "rad/s²", "qdd, 64 samples (~500ms) ago"),
     ("pos", "rad", "= target_q (this joint)"),
     ("gravity_torque", "Nm", "physics feature, § below"),
     ("vel", "raw", "movej register"),
     ("acc", "raw", "movej register"),
     ("bias", "= 1", "per-joint intercept"),
 ]
+
+# Feature names highlighted as "hand-engineered, not raw-logged" -- gravity is
+# a physics feature computed from the full pose, the qdd_lag* taps are this
+# model's only features with memory (causal, per-recording -- see
+# train_distillation_model._lag_array). Distinct colors so a reader can see
+# at a glance these two additions aren't just more of the raw signal.
+_PHYSICS_FEATURE = "gravity_torque"
+_LAG_FEATURES = {"qdd_lag4", "qdd_lag16", "qdd_lag64"}
 
 
 def _box(ax, xy, w, h, text, *, face, edge, text_color=None, fontsize=10.5,
@@ -59,16 +70,24 @@ def plot_model_diagram(out_path: str = "model_architecture.png"):
     ax.axis("off")
 
     # ---- input feature boxes ---------------------------------------------
-    in_x, in_w, in_h = 0.5, 3.35, 0.74
-    ys = [7.5, 6.5, 5.5, 4.5, 3.5, 2.5, 1.5, 0.5]
+    # Packed to fit 11 rows (was 8) into the same vertical band [0.5, 8.24]
+    # the diagram used before the qdd_lag* taps were added, so the frame/
+    # title positions below don't need to move.
+    in_x, in_w = 0.5, 3.35
+    box_top, box_bottom = 7.85, 0.5     # leaves headroom below the "inputs" title at y=8.15
+    in_h = 0.5
+    step = (box_top - in_h - box_bottom) / (len(FEATURES) - 1)
+    ys = [box_top - in_h - i * step for i in range(len(FEATURES))]
     in_boxes = {}
     for (name, unit, note), y in zip(FEATURES, ys):
-        is_gravity = name == "gravity_torque"
+        is_gravity = name == _PHYSICS_FEATURE
+        is_lag = name in _LAG_FEATURES
         is_pos = name == "pos"
-        face = ur_style.LIGHT_BLUE if is_gravity else ur_style.GRID
-        edge = ur_style.NAVY if (is_gravity or is_pos) else ur_style.GRAY
+        face = (ur_style.LIGHT_BLUE if is_gravity else
+               ur_style.MID_BLUE if is_lag else ur_style.GRID)
+        edge = ur_style.NAVY if (is_gravity or is_lag or is_pos) else ur_style.GRAY
         _box(ax, (in_x, y), in_w, in_h,
-            f"{name}  ({unit})\n{note}", face=face, edge=edge, fontsize=9.7)
+            f"{name}  ({unit})\n{note}", face=face, edge=edge, fontsize=8.7)
         in_boxes[name] = (in_x + in_w, y + in_h / 2)
 
     ax.text(in_x + in_w / 2, 8.15, "inputs — per row, per joint $j$",

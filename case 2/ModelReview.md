@@ -6,6 +6,152 @@ entry to the Changelog at the bottom, and edit the sections above it so they
 always describe the *current* state (don't leave the body describing an old
 version — that's what the changelog is for).
 
+## 0. Plain-language summary — for slides
+
+The rest of this document is the working log. This section is the pitch:
+what the shipped model (`models/distill.pkl`, `PerJointTreeModel` with
+gravity + lag, see §6) does and why gravity and history were worth adding,
+without requiring the reader to know what gradient boosting or R² is.
+
+**One sentence**: for each joint, the model predicts how far off the real
+robot's position will end up from what was commanded, as a function of how
+that joint is being driven *right now and a moment ago*, plus how hard
+gravity is pulling on it at the current arm pose — and adds that correction
+on top of the commanded trajectory.
+
+### The basic trick: predict the error, not the position
+
+A commanded trajectory (`target_q`) already tells you almost everything
+about where the joint will be — the real robot follows it closely. So
+instead of asking the model to predict the whole position from scratch, we
+only ask it to predict the small leftover gap:
+
+```
+predicted_position(t) = commanded_position(t) + predicted_error(t)
+```
+
+`predicted_error(t)` is millirad-scale (a small fraction of a degree);
+`commanded_position(t)` can swing over the whole trajectory (radians). This
+is the difference between asking someone to describe a photo from scratch
+versus asking them to mark up what's wrong with a photo that's already 99%
+right — the second question is easier and the answers are more comparable
+across very different joints. (§2 in the sections below calls this the
+*residual*.)
+
+### One model per joint, not one model for the whole arm
+
+The base, shoulder, elbow and the three wrist joints don't behave alike —
+different gearing, different mass driven, different typical speeds. A single
+formula tuned to fit all six at once ends up compromising, dominated by
+whichever joints have the biggest numbers (the base/shoulder/elbow). So the
+model is really six small, independent models — one per joint, each free to
+learn that joint's own sensitivity to the inputs — packaged behind one
+interface (§2).
+
+### Why gradient-boosted trees, not a straight-line formula
+
+The first version of this model was linear — one fixed formula per joint,
+e.g. "position error grows by this much per unit of commanded velocity, plus
+this much per unit of gravity torque, plus …," all added together with fixed
+weights. That's easy to read off as a table of coefficients, but it assumes
+every input affects the error independently and proportionally — no
+"only matters when moving fast *and* against gravity at the same time" kind
+of effect.
+
+Gradient-boosted trees drop that assumption: instead of one formula, the
+model is a sequence of simple decision-tree rules ("if commanded velocity is
+above X *and* gravity torque is above Y, add Z"), each correcting what the
+previous rules got wrong. That lets it pick up on interactions between the
+inputs automatically, without anyone having to guess and hand-write the
+interaction terms. Switching from the straight-line formula to trees, with
+the exact same inputs, nearly doubled the explained error variance (§6) —
+that gain is the regressor picking up nonlinear structure already present in
+the same data, not new information.
+
+### Why gravity torque helps: it's a real, physical, missing input
+
+Holding the arm out against gravity takes real motor torque, and torque
+translates into a small elastic "sag" — the same way a shelf bracket flexes
+more under a heavy load than a light one. That sag *is* part of the position
+error we're trying to predict. The model wasn't being told about it directly
+before — it only saw joint angles and commanded speeds, which correlate with
+gravity loading only loosely.
+
+The physical quantity is the manipulator's **gravity torque vector**, from
+standard rigid-body dynamics:
+
+```
+M(q)·q̈ + C(q, q̇)·q̇ + g(q) = τ
+```
+
+`g(q)` — torque needed at each joint just to hold the current pose `q`
+against gravity, with no motion at all — is exactly the missing input. It
+depends on the whole arm's pose at once (how the elbow is bent changes the
+load felt at the shoulder), not just one joint's own angle, so it's computed
+once from the full 6-joint pose and then split out per joint
+(`utils.UR10e.gravity`, §3). Feeding this in means the model doesn't have to
+*rediscover* gravity's effect from position/velocity data alone — it's
+handed the answer directly, the same way an engineer would rather look up a
+formula than reverse-engineer it from a scatter plot.
+
+**Where it helped, and where it didn't, is itself evidence it's real
+physics and not a lucky correlation**: it moved shoulder and wrist2 (joints
+that visibly sag under load) and left base and wrist3 essentially untouched
+— base rotates about the vertical axis, so gravity does ~zero work turning
+it, exactly as the physics predicts (§3).
+
+### Why "lag" (history) features help: the arm keeps moving after the command stops
+
+After a fast move, a real joint doesn't stop instantly — it overshoots
+slightly and rings, like a diving board settling after someone steps off it,
+for a few tenths of a second. That ringing is *why* the position error at
+this instant depends on what the joint was doing a moment ago, not just what
+it's doing right now. A model that only ever looks at the current instant
+has no way to tell "just started, moving fast" apart from "already stopped,
+still ringing from a moment ago" — both can look identical in an
+instantaneous snapshot.
+
+The fix is to hand the model a short memory: alongside the commanded
+acceleration *right now*, also give it the same signal from a few moments
+earlier:
+
+```
+qdd_lag_k(t) = commanded_acceleration(t − k samples),  k = 4, 16, 64
+             ≈ commanded_acceleration 31 / 125 / 500 ms ago
+```
+
+Three snapshots spread across roughly the ring's decay time (~0.3–0.5s) —
+not a full continuous history, just enough for the model to notice "there
+was a hard stop recently" and how hard. This is the model's *only* source of
+memory; every other input is still a single instant in time.
+
+**Result, and why it's convincing**: this was the single biggest jump in
+the whole project. Shoulder — the joint with the most visible ringing —
+gained the most of any joint on both models, and the gains lined up with
+which joints actually have a visible ring, not a blanket improvement across
+the board (§3/§6).
+
+### Putting it together — the net effect
+
+| step | overall R² (0 = no better than assuming no error, 1 = perfect) |
+|---|---|
+| straight-line formula, no physics inputs | 0.44 |
+| + gradient-boosted trees (same inputs) | 0.88 |
+| + gravity torque | 0.92 |
+| + lag/history features (**shipped model**) | **0.92**, and the *per-joint* numbers shift meaningfully (see §6) |
+
+(R² here specifically measures how much of the *tracking gap* — the
+millirad-scale error, not the whole trajectory — the model explains; see §4
+for why that framing matters and how it differs from a more naive score.)
+
+Read together: trees vs. a straight-line formula was the single biggest
+jump in aggregate; gravity and lag are smaller in the aggregate number but
+each is *targeted* — each closed a specific, physically-understood gap
+(gravity: static sag on the joints that actually carry load against gravity;
+lag: the settle-window ring on the joints that visibly exhibit one) rather
+than moving every joint a little. See §6 for the full per-joint breakdown
+and `model_architecture.png` for a diagram of the whole pipeline.
+
 ## 1. What we predict
 
 **Position**, not current. `PerJointPositionModel.predicts() -> ["actual_q"]`
@@ -390,8 +536,15 @@ less efficiently — while shoulder/elbow/base's residual is nonlinear enough
 that the tree's flexibility wins outright. Different joints may simply want
 different model shapes; not tested here (would mean per-joint model
 selection, not just a per-joint *fit*, which both models already do).
-`models/distill_tree.pkl` saved alongside `models/distill.pkl` (still the
-default/shipped model — `--model` default unchanged).
+`models/distill_tree.pkl` saved alongside `models/distill.pkl`. **Update
+(2026-08-19, later the same day): `PerJointTreeModel` is now the shipped
+default** — retrained with `--model tree_per_joint --out models/distill.pkl`
+(`results/2026-08-19_21-06-24/`, overall R²=0.9195, essentially identical to
+the `distill_tree.pkl` numbers above; the ~0.001 difference is run-to-run/
+environment noise, not a code or feature change). `--model`'s CLI *default*
+flag is still `linear_per_joint` (nothing forces `tree_per_joint` from the
+command line) — this is about which pickle currently sits at the path
+`run.py`/`train_rla.py` load by default, not the CLI flag's default value.
 
 **Caveat on all of the above, not yet resolved**: these are still row-level
 held-out numbers (§5), and the leakage concern applies *more* to the tree
@@ -480,6 +633,25 @@ that doesn't have any.
 
 ## Changelog
 
+- **2026-08-19** — Added §0, a plain-language, slide-ready summary of the
+  shipped model (trees + gravity + lag) for a non-ML-expert engineering
+  audience: the residual trick, why per-joint, why trees over a linear
+  formula, why gravity and lag each help (with the manipulator-dynamics
+  `M(q)q̈ + C(q,q̇)q̇ + g(q) = τ` equation and the `qdd_lag_k` definition),
+  and a step-by-step R² table (0.44 → 0.88 → 0.92 → 0.92) tying each addition
+  to a specific, physically-understood gap it closed. Also corrected a stale
+  claim in §2/§6: `models/distill.pkl` (the path `run.py`/`train_rla.py` load
+  by default) had said "linear model, still the default" but was retrained
+  by the user directly (outside this file's usual training-run trail) with
+  `--model tree_per_joint --out models/distill.pkl` — `PerJointTreeModel`
+  (gravity + lag) is now the shipped default (`results/2026-08-19_21-06-24/`,
+  overall R²=0.9195, matching the session's separate `distill_tree.pkl` run
+  to within run-to-run noise). Also regenerated `model_architecture.png`
+  (`plot_model_diagram.py`) to show all 11 features, including the new
+  `qdd_lag4/16/64` taps (highlighted the same way `gravity_torque` already
+  was, as a hand-engineered addition rather than a raw-logged signal) — the
+  diagram had been left showing the old 8-feature version after the lag
+  features were added earlier the same day.
 - **2026-08-19** — Added `qdd_lag4`/`qdd_lag16`/`qdd_lag64` (causal FIR taps
   of commanded acceleration at 4/16/64 samples in the past, ~31/125/500 ms)
   to `PerJointPositionModel.FEATURE_NAMES` — this project's first feature
