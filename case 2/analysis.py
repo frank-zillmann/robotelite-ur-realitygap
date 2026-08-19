@@ -1,11 +1,23 @@
-"""Per-joint stats and a plot for a recorded UR run.
+"""Interactive plot of a recorded UR run.
 
-Load a CSV from ``record.py``, print per-joint numbers (range of motion, current
-gap, position lag), and plot one joint's target vs actual current.
+Loads a CSV from ``record.py`` and plots up to five sources of one quantity:
 
-    python analysis.py --csv data/test-4.csv --joint 1
+    target          what the controller commanded  (target_* columns)
+    actual          what the robot measured        (actual_* columns)
+    script          what the URScript alone implies, rebuilt through this repo's
+                    own models (``--script``, see ``script_plan``)
+    model(target)   the distilled model's actual_*, from the recorded commands
+    model(script)   the same, from the rebuilt ones (``--model``), each with a
+                    band of ``--sd-factor`` standard deviations, aleatoric and
+                    with the ensemble's disagreement added
 
-``--joint`` selects the joint (0=base ... 5=wrist3).
+    python analysis.py --csv data/test-4.csv --script data/test-4.script --model models/distill.pkl --joint 1
+
+Only the first ``--max-points`` rows are plotted, at the recording's full rate.
+
+``--joint`` picks the component, which is a joint (0..5 = base..wrist3) for the
+per-joint quantities and a Cartesian axis (0..5 = x, y, z, rx, ry, rz) for the
+TCP ones, since those are poses in space and have nothing to do with joints.
 
 ``Recording`` is the shared CSV data loader used across the pipeline
 (``train_distillation_model.py``, ``train_rla.py``); it wraps a run's CSV as
@@ -14,11 +26,27 @@ numpy arrays.
 from __future__ import annotations
 
 import argparse
+import re
 
 import numpy as np
 import pandas as pd
 
-from utils import ACC_COL, JOINT_NAMES, N_JOINTS, SCL_COL, SCRIPT_COL, TIME_COL, VEL_COL
+from utils import (ACC_COL, JOINT_NAMES, N_JOINTS, SCL_COL, SCRIPT_COL, TIME_COL,
+                   VEL_COL, load_script)
+
+TCP_AXES = ("x", "y", "z", "rx", "ry", "rz")
+WAYPOINT_TOL = 0.05       # rad: script waypoint vs the one actually reached
+
+# Quantities the viewer can show: label -> (target base, actual base, unit, component names).
+QUANTITIES = {
+    "current":   ("target_current", "actual_current", "A", JOINT_NAMES),
+    "angle q":   ("target_q", "actual_q", "rad", JOINT_NAMES),
+    "speed qd":  ("target_qd", "actual_qd", "rad/s", JOINT_NAMES),
+    "accel qdd": ("target_qdd", "actual_qdd", "rad/s^2", JOINT_NAMES),
+    "moment":    ("target_moment", "actual_current_as_torque", "Nm", JOINT_NAMES),
+    "TCP pose":  ("target_TCP_pose", "actual_TCP_pose", "m, rad", TCP_AXES),
+    "TCP speed": ("target_TCP_speed", "actual_TCP_speed", "m/s, rad/s", TCP_AXES),
+}
 
 
 class Recording:
@@ -35,7 +63,6 @@ class Recording:
         self.target_q = np.column_stack([df[f"target_q{j}"] for j in range(6)])
         self.actual_q = np.column_stack([df[f"actual_q{j}"] for j in range(6)])
         self.target_qd = np.column_stack([df[f"target_qd{j}"] for j in range(6)])
-        self.actual_qd = np.column_stack([df[f"actual_qd{j}"] for j in range(6)])
         self.target_current = np.column_stack([df[f"target_current{j}"] for j in range(6)])
         self.actual_current = np.column_stack([df[f"actual_current{j}"] for j in range(6)])
         # Commanded movej parameters, if record.py logged them (raw URScript
@@ -57,76 +84,271 @@ class Recording:
         """Median sample period (s)."""
         return float(np.median(np.diff(self.t)))
 
-    def current_gap(self, joint: int) -> np.ndarray:
-        """Actual minus target current for one joint (A), per row."""
-        return self.actual_current[:, joint] - self.target_current[:, joint]
+    def channel(self, base: str):
+        """A per-joint channel as ``(n, N_JOINTS)``, or ``None`` if not recorded.
 
-    def plot(self, joint: int = 1):
-        """Plot one joint's target vs actual current, and the current gap below.
-
-        Top: the two current traces over the run. Bottom: actual minus target
-        current.
+        ``actual_qdd`` is not an RTDE field, so it is differentiated from
+        ``actual_qd`` on demand; everything else is read straight from the CSV.
         """
-        import matplotlib.pyplot as plt
-
-        name = JOINT_NAMES[joint]
-        gap = self.current_gap(joint)
-        fig, (ax_c, ax_g) = plt.subplots(2, 1, figsize=(9, 6), sharex=True)
-
-        ax_c.plot(self.t, self.target_current[:, joint], label="target current", lw=2)
-        ax_c.plot(self.t, self.actual_current[:, joint], label="actual current", lw=1)
-        ax_c.set_ylabel("current (A)")
-        ax_c.set_title(f"{name} joint")
-        ax_c.legend(loc="best")
-
-        ax_g.plot(self.t, gap, color="tab:red", lw=1)
-        ax_g.axhline(0, color="grey", lw=0.8)
-        ax_g.set_ylabel("actual - target (A)")
-        ax_g.set_xlabel("time (s)")
-
-        fig.tight_layout()
-        return fig
+        if base is None:
+            return None
+        cols = [f"{base}{j}" for j in range(N_JOINTS)]
+        if all(c in self.df for c in cols):
+            return self.df[cols].to_numpy(dtype=float)
+        if base == "actual_qdd":
+            qd = self.channel("actual_qd")
+            return None if qd is None else np.gradient(qd, self.dt, axis=0)
+        return None
 
 
-def joint_stats(rec: Recording, joint: int) -> dict:
-    """Range of motion, current-gap RMS/max, and RMS position error for one joint.
+# --- the script as a third data source ---------------------------------------
 
-    Shared by ``main``'s printed table and ``report.py``'s HTML summary, so both
-    read the same numbers.
+_VEC = r"\[\s*([-+\d.eE,\s]+?)\s*\]"
+
+
+def _waypoints(text: str) -> list:
+    """Joint waypoint of every ``movej``, in order; ``None`` where unparsable.
+
+    Covers the three forms here: a literal ``movej([...])``, a named pose
+    (``POSE_A = [...]``, scripts/*.script), and the teach-pendant
+    ``movej(get_inverse_kin(..., qnear=P.q))`` whose joints are the ``q=[...]``
+    of ``global P = struct(...)`` (data/test-*.script).
     """
-    gap = rec.current_gap(joint)
-    return {
-        "moved": float(rec.target_q[:, joint].max() - rec.target_q[:, joint].min()),
-        "gap_rms": float(np.sqrt(np.mean(gap ** 2))),
-        "gap_max": float(np.max(np.abs(gap))),
-        "pos_err": float(np.sqrt(np.mean((rec.actual_q[:, joint] - rec.target_q[:, joint]) ** 2))),
-    }
+    vec = lambda s: np.array([float(v) for v in s.split(",")])
+    named = {}
+    for m in re.finditer(rf"(?:global\s+)?(\w+)\s*=\s*{_VEC}", text):
+        if len(v := vec(m.group(2))) == N_JOINTS:
+            named[m.group(1)] = v
+    for m in re.finditer(rf"(?:global\s+)?(\w+)\s*=\s*struct\([^\n]*?q\s*=\s*{_VEC}", text):
+        if len(v := vec(m.group(2))) == N_JOINTS:
+            named[f"{m.group(1)}.q"] = v
+
+    out = []
+    for m in re.finditer(r"movej\s*\(([^\n]*)", text):
+        arg = m.group(1)
+        if lit := re.match(rf"\s*{_VEC}", arg):
+            out.append(vec(lit.group(1)))
+        elif (nm := re.match(r"\s*([A-Za-z_]\w*)\s*[,)]", arg)) and nm.group(1) in named:
+            out.append(named[nm.group(1)])
+        elif (qn := re.search(r"qnear\s*=\s*([A-Za-z_]\w*)\.q", arg)) \
+                and f"{qn.group(1)}.q" in named:
+            out.append(named[f"{qn.group(1)}.q"])
+        else:
+            out.append(None)
+    return out
+
+
+def _limits(rec: Recording):
+    """Per-joint speed and acceleration ceilings, measured from the run.
+
+    ``movej``'s ``v=``/``a=`` are rad/s and rad/s^2, and the controller clamps
+    them to its own per-joint ceiling (scaled by the speed slider). In every
+    supplied run the requested values sit far above that ceiling, so the script's
+    numbers say nothing about the motion: ``vel=100, acc=100`` would be a 0.36 s
+    move where the real one takes 2.98 s. And the ceiling is not in the script --
+    the same request gives 59 deg/s in test-4 and 120 deg/s in test-6, because
+    the speed slider is set on the pendant. So it has to be measured.
+    """
+    a = np.gradient(rec.target_qd, rec.dt, axis=0)
+    return np.abs(rec.target_qd).max(axis=0), np.abs(a).max(axis=0)
+
+
+def script_plan(rec: Recording, script_path: str, payload: float = 0.0,
+                fit_duration: bool = False) -> dict:
+    """What the URScript alone implies, on the recording's clock.
+
+    A third source next to ``target_*`` and ``actual_*``: the distance to
+    ``target_*`` is ``dynamics.py``'s error, and to ``actual_*`` that plus the
+    reality gap. Each ``movej`` waypoint is parsed from the script, its speed
+    profile rebuilt with ``dynamics.trapezoidal`` and its current with
+    ``dynamics.UR10eDynamics``. All joints of a movej start and stop together, so
+    the profile is the slowest joint's. Between moves the plan holds the waypoint.
+
+    ``script_control_line`` gives the sample where each move began (via
+    ``common.segments``), and every rebuilt move is laid down there. Its
+    *duration* then comes from ``trapezoidal``, which matches the swing runs to
+    under 1% but is out by ~25% on test-6/7, where the controller eases
+    acceleration in and out rather than switching it. That is a real gap in
+    ``dynamics.py``, left visible on purpose; ``fit_duration=True`` stretches
+    each move onto its recorded window instead, to compare shape without it.
+
+    Returns ``{base: (n, N_JOINTS)}``, or ``{}`` if no ``movej`` could be parsed.
+    """
+    from common import segments
+    from dynamics import GRID, MAX_JOINT_ACC, MAX_JOINT_SPEED, UR10eDynamics, trapezoidal
+
+    way = _waypoints(load_script(script_path))
+    segs = segments(rec)
+    if not segs or not any(w is not None for w in way):
+        return {}
+
+    dt = rec.dt
+    v_lim, a_lim = _limits(rec)
+    v_lim = np.where(v_lim > 1e-6, v_lim, MAX_JOINT_SPEED)
+    a_lim = np.where(a_lim > 1e-6, a_lim, MAX_JOINT_ACC)
+
+    # Which movej is which: script_control_line is the running movej's line
+    # number, so the distinct values sorted are the movejs in file order -- right
+    # even when nested loops run them out of order (data/test-6-7.script). With
+    # no such column, guess a cyclic offset and score it against the recording.
+    lines = sorted({int(rec.scl[s.i0]) for s in segs if rec.scl[s.i0]})
+    if len(lines) == len(way):
+        index = {ln: i for i, ln in enumerate(lines)}
+        pick = lambda k, seg: index.get(int(rec.scl[seg.i0]))
+    else:
+        off = min(range(len(way)),
+                  key=lambda o: sum(float(np.abs(w - rec.target_q[s.i1]).max())
+                                    for k, s in enumerate(segs)
+                                    if (w := way[(k + o) % len(way)]) is not None))
+        pick = lambda k, seg: (k + off) % len(way)
+
+    n = len(rec.t)
+    q = np.repeat(rec.target_q[segs[0].i0][None], n, axis=0)
+    prog = np.ones(n)                     # progress along the current move, for the cache
+    blocks, pos = [], rec.target_q[segs[0].i0].copy()
+    for k, seg in enumerate(segs):
+        mid = pick(k, seg)                    # which movej of the script this is
+        w = way[mid] if mid is not None else None
+        # `movej(get_inverse_kin(..., qnear=P.q))` names a pose; qnear is only the
+        # seed for the controller's IK, and for some waypoints the solution it
+        # picks is far from it. Where the script disagrees with what was actually
+        # reached, trust the recording.
+        bad = w is None or np.abs(w - rec.target_q[seg.i1]).max() > WAYPOINT_TOL
+        dest = rec.target_q[seg.i1] if bad else w
+        vel = seg.vel or np.inf                # requested; the ceiling usually wins
+        acc = seg.acc or np.inf
+        travel = dest - pos
+        # One shared profile per movej, so it is the slowest joint's.
+        s = max((trapezoidal(abs(travel[j]), min(vel, v_lim[j]), min(acc, a_lim[j]), dt)
+                 for j in range(N_JOINTS) if abs(travel[j]) > 1e-4),
+                key=len, default=np.array([0.0, 1.0]))
+        if fit_duration and seg.i1 > seg.i0:   # re-time onto the recorded window
+            s = np.interp(np.linspace(0.0, 1.0, seg.i1 - seg.i0),
+                          np.linspace(0.0, 1.0, len(s)), s)
+        nxt = segs[k + 1].i0 if k + 1 < len(segs) else n  # where the next movej starts
+        stop = min(seg.i0 + len(s), nxt)                  # motion, clipped to the slot
+        q[seg.i0:stop] = pos + s[:stop - seg.i0, None] * travel
+        prog[seg.i0:stop] = s[:stop - seg.i0]
+        q[stop:nxt] = q[stop - 1] if stop > seg.i0 else pos   # hold through the sleep
+        blocks.append((seg.i0 if k else 0, nxt, mid, pos, dest))
+        # Carry the pose the plan reached, not the waypoint: a move clipped short
+        # would otherwise tear a step into the trace.
+        pos = q[max(nxt - 1, 0)].copy()
+
+    qd = np.gradient(q, dt, axis=0)
+    qdd = np.gradient(qd, dt, axis=0)
+    dyn = UR10eDynamics(rec, payload=payload)
+    cur = np.zeros_like(q)
+    for a, b, mid, p0, p1 in blocks:
+        # Pose cache keyed by which movej, not by occurrence: a looped script
+        # retraces the same geometry, so this prepares once per movej.
+        if mid not in dyn._cache:
+            dyn.prepare(mid, p0 + np.linspace(0.0, 1.0, GRID)[:, None] * (p1 - p0))
+        cur[a:b] = dyn.current(q[a:b], qd[a:b], qdd[a:b], s=prog[a:b], key=mid)
+    return {"target_q": q, "target_qd": qd, "target_qdd": qdd,
+            "target_current": cur, "target_moment": cur * dyn.kt}
+
+
+# --- viewer -------------------------------------------------------------------
+
+COLORS = {"target": "#636efa", "actual": "#ef553b", "script": "#00cc96",
+          "model(target)": "#ab63fa", "model(script)": "#ffa15a"}
+_rgba = lambda c, a: f"rgba({int(c[1:3], 16)},{int(c[3:5], 16)},{int(c[5:7], 16)},{a})"
+
+
+def _plan_frame(t, plan: dict):
+    """The rebuilt plan as a commanded-trajectory frame a DistillModel can read."""
+    from utils import set_block
+    df = pd.DataFrame({TIME_COL: t})
+    for base, block in plan.items():
+        set_block(df, base, block)
+    return df
+
+
+def view(rec: Recording, plan: dict = None, quantity: str = "angle q", joint: int = 1,
+         model=None, sd_factor: float = 1.0, max_points: int = 5000):
+    """Plotly figure comparing target / actual / script (+ model) for one channel.
+
+    Only the first ``max_points`` rows are shown, at the recording's full rate: a
+    run is ~174k rows, and every trace of it makes a page the browser chokes on.
+    """
+    import plotly.graph_objects as go
+
+    t_base, a_base, unit, comps = QUANTITIES[quantity]
+    keep = slice(None, max_points)
+    t = rec.t[keep]
+    fig = go.Figure()
+    for name, block in (("target", rec.channel(t_base)),
+                        ("actual", rec.channel(a_base)),
+                        ("script", (plan or {}).get(t_base))):
+        if block is not None:
+            fig.add_scattergl(x=t, y=block[keep, joint], name=name,
+                              line=dict(color=COLORS[name], width=1.5))
+
+    # The distilled model run on the recorded commands and on the script's rebuilt
+    # ones: both predict the actual channel, so they belong next to "actual".
+    for name, df in (("model(target)", rec.df),
+                     ("model(script)", _plan_frame(rec.t, plan) if plan else None)):
+        if df is None or model is None or a_base not in model.predicts():
+            continue
+        # Predicting the shown rows only is exact, not an approximation: the model
+        # is causal, so row t never depends on a row after it.
+        p = model.predict(df.iloc[keep])
+        mean, colour = p["mean"][a_base][:, joint], COLORS[name]
+        # Widest band first so the narrower one occludes it: the model's own noise
+        # inside, the ensemble's disagreement added on top.
+        for key, alpha, tag in (("var", 0.12, "+epistemic"),
+                                ("var_aleatoric", 0.22, "aleatoric")):
+            if key in p:
+                half = sd_factor * np.sqrt(p[key][a_base][:, joint])
+                fig.add_scattergl(x=np.concatenate([t, t[::-1]]),
+                                  y=np.concatenate([mean + half, (mean - half)[::-1]]),
+                                  fill="toself", fillcolor=_rgba(colour, alpha),
+                                  line=dict(width=0), hoverinfo="skip",
+                                  name=f"{name} +-{sd_factor:g}sd {tag}")
+        fig.add_scattergl(x=t, y=mean, name=name,
+                          line=dict(color=colour, width=1.5))
+
+    fig.update_layout(title=f"{rec.path} - {quantity} - {comps[joint]}",
+                      xaxis_title="time [s]", yaxis_title=f"{quantity} [{unit}]",
+                      hovermode="x unified", template="plotly_white")
+    return fig
 
 
 def main():
-    # Print per-joint stats, then plot one joint.
-    ap = argparse.ArgumentParser(description="Per-joint stats and a plot for a recorded run.")
+    ap = argparse.ArgumentParser(description="Interactive plot of a recorded UR run.")
     ap.add_argument("--csv", default="data/test-4.csv", help="recorded run CSV")
-    ap.add_argument("--joint", type=int, default=1,
-                    help="joint index 0..5 to plot (default 1 = shoulder)")
-    ap.add_argument("--no-plot", action="store_true", help="print stats only")
+    ap.add_argument("--script", default=None,
+                    help="URScript of the run; adds the rebuilt plan as a third trace")
+    ap.add_argument("--quantity", choices=list(QUANTITIES), default="angle q",
+                    help="which channel to plot")
+    ap.add_argument("--joint", type=int, default=1, choices=range(N_JOINTS),
+                    help="component 0..5: a joint (base..wrist3), or a Cartesian "
+                         "axis (x, y, z, rx, ry, rz) for the TCP quantities")
+    ap.add_argument("--payload", type=float, default=0.0,
+                    help="tool mass at the flange [kg], for the rebuilt plan")
+    ap.add_argument("--fit-duration", action="store_true",
+                    help="re-time each rebuilt move to end when the recorded one "
+                         "did, hiding dynamics.py's duration error")
+    ap.add_argument("--model", default=None,
+                    help="distilled model pickle; adds its prediction (with an "
+                         "uncertainty band) for the recorded and the rebuilt commands")
+    ap.add_argument("--sd-factor", type=float, default=1.0,
+                    help="width of the uncertainty bands, in standard deviations")
+    ap.add_argument("--max-points", type=int, default=10000,
+                    help="rows drawn per trace, from the start of the run; the page "
+                         "grows by ~0.2 MB per 1000 rows and trace")
     args = ap.parse_args()
 
     rec = Recording(args.csv)
-    print(f"{args.csv}  ({len(rec.t)} rows, dt {rec.dt*1e3:.1f} ms)")
-
-    # Per-joint summary: range of motion, current gap (RMS and max magnitude),
-    # and RMS position lag (actual minus target).
-    print(f"{'joint':10s} {'moved':>9s} {'gap RMS':>9s} {'gap max':>9s} {'pos err':>10s}")
-    for j in range(N_JOINTS):
-        st = joint_stats(rec, j)
-        print(f"{JOINT_NAMES[j]:10s} {st['moved']:8.3f}r {st['gap_rms']:8.3f}A "
-              f"{st['gap_max']:8.3f}A {st['pos_err']*1e3:7.2f}mrad")
-
-    if not args.no_plot:
-        import matplotlib.pyplot as plt
-        rec.plot(args.joint)
-        plt.show()
+    plan = (script_plan(rec, args.script, args.payload, args.fit_duration)
+            if args.script else {})
+    model = None
+    if args.model:
+        from train_distillation_model import DistillModel      # pulls in torch
+        model = DistillModel.load(args.model)
+    view(rec, plan, args.quantity, args.joint, model, args.sd_factor,
+         args.max_points).show()
 
 
 if __name__ == "__main__":

@@ -51,12 +51,66 @@ def _is_assignment(line: str) -> bool:
     return re.match(r"\s*[A-Za-z_]\w*\s*=", line) is not None
 
 
+# A `$ N "..."` line is a PolyScope(X) source-listing annotation, not URScript;
+# it must be stripped before the text is sent to the controller.
+_MARKER = re.compile(r"^\s*\$\s+\d")
+
+
+def _is_structured(text: str) -> bool:
+    """True if the text is a real program, not a flat list of statements.
+
+    The flat lesson scripts are only top-level assignments plus motion calls
+    (`movej`/`sleep`/register writes). Anything with block structure --
+    `def`/`sec`/`thread`, a `global` declaration, a block header ending in `:`,
+    an `end`, or a PolyScope `$` marker -- is an exported program and must not
+    be hoisted/looped (that reorders `global`s past their use and flattens the
+    blocks). Comments are ignored.
+    """
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        if (_MARKER.match(ln) or s.endswith(":")
+                or s == "end" or s.startswith("end ")
+                or re.match(r"(def|sec|thread|global)\b", s)):
+            return True
+    return False
+
+
+def _wrap_structured(text: str, loop: int | None) -> str:
+    """Wrap an already-structured program without reordering it.
+
+    Strips `$` markers, preserves the original block structure and indentation,
+    and only adds the done-flag when we own the `def prog(): ... end` wrapper.
+    Hoisting and the repeat loop are intentionally skipped: a structured program
+    carries its own `global`s and control flow, which the flat-script path would
+    corrupt. ``loop`` is not applied here (the program controls its own repeats).
+    """
+    if loop is not None:
+        print("note: --loop ignored for a structured/exported program "
+              "(it controls its own repeats); stop with Ctrl-C.")
+    body = [ln for ln in text.splitlines() if not _MARKER.match(ln)]
+    stripped = "\n".join(body).lstrip()
+    if stripped.startswith("def ") or stripped.startswith("sec "):
+        # Already a complete program: run as-is. No done-flag (we do not own its
+        # `end`), so auto-stop falls back to Ctrl-C / the runtime dropping.
+        print("note: complete program sent as-is; no auto-stop, use Ctrl-C.")
+        return stripped + ("" if stripped.endswith("\n") else "\n")
+    IND = "  "
+    out = ["def prog():", IND + f"write_output_float_register({DONE_REG}, 0)"]
+    out += [(IND + ln if ln.strip() else "") for ln in body]
+    out += [IND + f"write_output_float_register({DONE_REG}, 1)", "end"]
+    return "\n".join(out) + "\n"
+
+
 def wrap_program(text: str, loop: int | None = None) -> str:
     """Wrap the script's statements in a `def prog(): ... end` program.
 
     The UR script interface runs a program, not loose top-level statements. Text
     already starting with `def` is returned unchanged (and does not get the loop
-    or auto-stop below).
+    or auto-stop below). A structured/exported program (functions, `global`s,
+    control-flow blocks, `$` markers) is wrapped without reordering by
+    ``_wrap_structured``; only the flat lesson scripts get the hoist-and-loop.
 
     Variable assignments are hoisted to initialize once, before any loop:
     URScript will not accept a variable first assigned inside a loop, and every
@@ -71,6 +125,8 @@ def wrap_program(text: str, loop: int | None = None) -> str:
     """
     if text.lstrip().startswith("def "):
         return text
+    if _is_structured(text):
+        return _wrap_structured(text, loop)
 
     init, motion, seen_motion = [], [], False
     for ln in text.splitlines():

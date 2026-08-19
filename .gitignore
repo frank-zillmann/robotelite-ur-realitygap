@@ -1,3 +1,9 @@
+/case 2/*.csv
+/case 2/models/
+/case 2/runs/
+/.vscode/
+CLAUDE.md
+
 # ── OS / editor cruft ───────────────────────────────────────────────────────
 .DS_Store
 **/.DS_Store
@@ -23,7 +29,8 @@ tmp
 ai/
 .claude/
 **/.claude/
-
+/.vscode/
+CLAUDE.md
 # ── docs/: ship the built .pptx + tiers doc, not the builders or its assets ───
 docs/build_deck.py
 docs/build_tiers.py

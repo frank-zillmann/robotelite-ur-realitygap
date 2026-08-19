@@ -3,8 +3,11 @@
 numpy>=1.24
 pandas>=2.0
 matplotlib>=3.7
+plotly>=5.0                # analysis.py: the interactive target/actual/script viewer
 scikit-learn>=1.3          # linear-regression baseline (and models to beat it)
 scipy>=1.10                # optional: Butterworth filter for the jerk metric
+torch>=2.0
+tensorboard>=2.10        # train_distillation_model.py logs each run to runs/
 
 # RL stack (Gold tier onward).
 gymnasium>=0.29
