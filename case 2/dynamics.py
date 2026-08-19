@@ -1,10 +1,10 @@
 """Commanded torque and current for a candidate motion, without re-running URSim.
 
 For a move (fixed joint geometry) and a candidate speed profile, produces the
-commanded trajectory (q, qd, qdd) and the commanded joint current, from the UR10e
+commanded trajectory (q, qd, qdd) and the commanded joint current, from the UR5e
 inverse dynamics:
 
-    tau     = M(q) qdd + g(q)          (utils.UR10e; Coriolis dropped by default)
+    tau     = M(q) qdd + g(q)          (utils.UR5e; Coriolis dropped by default)
     current = tau / Kt                 (Kt fit from the recording: moment / current)
 
 Units: rad throughout. The ``vel``/``acc`` registers (and the URScript numbers
@@ -24,13 +24,13 @@ from abc import ABC, abstractmethod
 import numpy as np
 import pandas as pd
 
-from utils import (ACC_COL, N_JOINTS, TIME_COL, VEL_COL, UR10e, get_block,
+from utils import (ACC_COL, N_JOINTS, TIME_COL, VEL_COL, UR5e, get_block,
                    joint_cols)
 
 DEG2RAD = np.pi / 180.0          # kept for subclasses; the pipeline itself is all rad
-MAX_JOINT_SPEED = 2.0944         # rad/s: 120 deg/s, the UR10e limit on base/shoulder/
-                                 # elbow. The wrists reach 180 deg/s, but a movej is
-                                 # paced by its slowest joint, so this is the binding one.
+MAX_JOINT_SPEED = np.pi          # rad/s: 180 deg/s, the UR5e limit on every joint
+                                 # (uniform, unlike the UR10e's 120/180 split), so it
+                                 # is the binding one regardless of which joint moves.
 MAX_JOINT_ACC = 10.0             # rad/s^2: a generous joint acceleration ceiling
 GRID = 50                        # samples along a move's geometry for the M,g cache
 
@@ -122,8 +122,8 @@ class Dynamics(ABC):
         return pd.DataFrame(out)
 
 
-class UR10eDynamics(Dynamics):
-    """Default torque model: ``tau = M(q) qdd + g(q)`` via ``utils.UR10e``.
+class UR5eDynamics(Dynamics):
+    """Default torque model: ``tau = M(q) qdd + g(q)`` via ``utils.UR5e``.
 
     Fast because the pose-dependent terms ``M(q)`` and ``g(q)`` are precomputed on
     a grid along each move's geometry (they do not depend on the speed profile) and
@@ -132,7 +132,7 @@ class UR10eDynamics(Dynamics):
     """
 
     def __init__(self, rec, payload: float = 0.0, grid: int = GRID):
-        self.ur = UR10e(payload=payload)
+        self.ur = UR5e(payload=payload)
         self.kt = fit_kt(rec)
         self.grid = grid
         self._cache = {}          # key -> (s_grid, M_grid, g_grid)
@@ -173,4 +173,4 @@ class UR10eDynamics(Dynamics):
 
 def default_dynamics(rec) -> Dynamics:
     """The dynamics model the pipeline uses. Swap the return to change it globally."""
-    return UR10eDynamics(rec)
+    return UR5eDynamics(rec)

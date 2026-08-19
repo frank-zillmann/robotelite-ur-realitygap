@@ -41,10 +41,12 @@ from record import build_recipe, parse_registers
 from utils import ACC_COL, SCRIPT_COL, VEL_COL, load_script, set_param
 
 # --- sweep grid ---------------------------------------------------------------
-# rad/s and rad/s^2, the units URScript movej actually takes. The top of the vel
-# grid sits just under the 2.094 rad/s joint limit so no run clamps; below it the
-# values are spaced roughly geometrically, because the gap grows non-linearly with
-# speed and an even grid wastes samples at the fast end.
+# rad/s and rad/s^2, the units URScript movej actually takes. The vel grid stays
+# well under the 3.1416 rad/s joint limit so no run clamps (there's more headroom
+# above 1.8 on a UR5e than there was under the UR10e's 2.094 rad/s limit, if you
+# want to widen it); below it the values are spaced roughly geometrically, because
+# the gap grows non-linearly with speed and an even grid wastes samples at the
+# fast end.
 DEFAULT_VEL = (0.3, 0.6, 1.0, 1.4, 1.8)
 DEFAULT_ACC = (0.5, 1.5, 3.0)
 
@@ -55,9 +57,10 @@ DEFAULT_SCRIPTS = (
     "scripts/short_moves.script",       # triangular profiles, acc-dominated
 )
 
-# UR10e joint limits. movej clamps `v` and `a` to these, and a clamped run
+# UR5e joint limits. movej clamps `v` and `a` to these, and a clamped run
 # records the same trajectory as every other clamped run.
-MAX_VEL = 2.0944        # rad/s,   120 deg/s on base/shoulder/elbow (the binding limit)
+MAX_VEL = np.pi         # rad/s,   180 deg/s on every joint (uniform on the UR5e,
+                        # unlike the UR10e's 120/180 split)
 MAX_ACC = 10.0          # rad/s^2, a conservative ceiling for a movej
 
 SETTLE_S = 2.0          # pause between runs, so the arm is at rest before the next
