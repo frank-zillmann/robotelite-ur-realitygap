@@ -373,10 +373,14 @@ class PerJointTreeModel(PerJointPositionModel):
     would waste most of its splits on the trivial part. Predicting the small,
     near-zero-mean residual instead means every split is doing useful work.
 
-    Deliberately uses the pre-gravity 7-feature set (``target_current``,
-    ``qd``, ``qdd``, ``pos``, ``vel``, ``acc``, ``bias``) rather than the
-    parent's 8 (which adds ``gravity_torque``) -- omitting it here was a
-    scope decision, not an evidence-driven one; see ``ModelReview.md``.
+    Uses the same 8 features as the parent (inherits ``FEATURE_NAMES``
+    unchanged, including ``gravity_torque``) -- an earlier version of this
+    class deliberately used the pre-gravity 7-feature set instead (a scope
+    decision, not an evidence-driven one), which meant the first linear-vs-
+    tree comparison wasn't apples-to-apples on the joints gravity helped
+    (wrist1/wrist2). Both models now see the same inputs, so any remaining
+    difference between them is attributable to the regressor, not the
+    features; see ``ModelReview.md`` §2/§6 for the before/after comparison.
     Reuses the parent's ``_row_features``/``_design``/``predicts``/``bounds``
     unchanged (both are driven entirely by ``self.FEATURE_NAMES``, see the
     parent's docstring) -- only the fitting/prediction mechanism changes.
@@ -391,7 +395,8 @@ class PerJointTreeModel(PerJointPositionModel):
     not error) rather than displaying something meaningless.
     """
 
-    FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "vel", "acc", "bias"]
+    # FEATURE_NAMES inherited from PerJointPositionModel (8 features, incl.
+    # gravity_torque) -- deliberately not overridden, see class docstring.
 
     def __init__(self):
         super().__init__()
@@ -424,9 +429,12 @@ class PerJointTreeModel(PerJointPositionModel):
         qdd = np.gradient(qd, dt, axis=0)
         vel = df[VEL_COL].to_numpy(dtype=float)
         acc = df[ACC_COL].to_numpy(dtype=float)
+        needs_gravity = "gravity_torque" in self.FEATURE_NAMES
+        grav = _gravity_block(q) if needs_gravity else None
         out = np.zeros_like(q)
         for j in range(N_JOINTS):
-            feats = self._row_features(j, ti[:, j], q[:, j], qd[:, j], qdd[:, j], vel, acc)
+            feats = self._row_features(j, ti[:, j], q[:, j], qd[:, j], qdd[:, j], vel, acc,
+                                       grav[:, j] if needs_gravity else None)
             out[:, j] = q[:, j] + self.models[j].predict(feats)
         return {"actual_q": out}
 

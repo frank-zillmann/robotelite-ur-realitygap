@@ -65,10 +65,24 @@ per joint instead of `lstsq`. Same residual target convention as
 model: a tree approximates functions as piecewise-constant regions, so
 making it reproduce "output ≈ target_q" (a continuous ~±π-range near-identity
 mapping) before it has capacity left for the millirad-scale correction would
-waste most of its splits on the trivial part. **Deliberately uses the
-pre-gravity 7-feature set** (drops `gravity_torque`) — a scope decision, not
-evidence-driven; see §3 and §6 for why this makes the linear/tree comparison
-not fully apples-to-apples on the joints gravity helped.
+waste most of its splits on the trivial part.
+
+Initially shipped with the pre-gravity 7-feature set (a scope decision, not
+evidence-driven) so the first linear-vs-tree comparison wasn't
+apples-to-apples on the joints gravity helped. **Updated same day** to
+inherit the parent's full 8-feature set (including `gravity_torque`) —
+see §6 for the result, which was not what the missing-feature hypothesis
+predicted: gravity moved the tree model's overall R² by +0.0015 (0.882 →
+0.883), an order of magnitude less than its effect on the linear model
+(+0.008), and did **not** close the wrist1/wrist2 gap to linear. A plausible
+read: the tree can already approximate some of the gravity-driven,
+pose-dependent pattern from the raw `pos`/`qd`/`qdd` features via nonlinear
+splits, without needing to be handed the physics formula explicitly — the
+value of hand-engineering a physics feature is much higher for a model with
+no capacity to discover nonlinear pose-dependence on its own (linear) than
+for one that can partially find it anyway (trees). Worth stating plainly:
+this is exactly why the missing-feature hypothesis needed to be *tested*, not
+assumed — it turned out to be wrong.
 
 To support two model shapes without duplicating ~40 lines of feature-building
 logic, `_row_features`/`_design`/`predict` were refactored to key off
@@ -286,33 +300,52 @@ effect (worth an FFT/autocorrelation check on its residual before spending
 feature-engineering effort there; also consistent with it not moving at all
 when `gravity_torque` was added).
 
-**Tree vs. linear** (`results/2026-08-19_14-31-40/` tree, `.../2026-08-19_14-30-54/`
-linear; both 20% row holdout, same split):
+**Tree vs. linear, both with the same 8 features** (`results/2026-08-19_15-03-35/`
+tree, `.../2026-08-19_14-30-54/` linear; both 20% row holdout, same split).
+The tree column here supersedes the first (no-gravity) comparison — kept
+inline below since the *change* from adding gravity to the tree model is
+itself the interesting result:
 
-| joint | linear R² (8 feat, w/ gravity) | tree R² (7 feat, no gravity) | linear RMSE (deg) | tree RMSE (deg) |
-|---|---|---|---|---|
-| overall | 0.445 | **0.882** | 0.0242 | **0.0111** |
-| base | 0.725 | 0.734 | 0.0076 | 0.0075 |
-| shoulder | 0.398 | **0.913** | 0.0561 | **0.0213** |
-| elbow | 0.462 | **0.630** | 0.0153 | **0.0127** |
-| wrist1 | **0.914** | 0.833 | **0.0053** | 0.0074 |
-| wrist2 | **0.840** | 0.796 | **0.0035** | 0.0039 |
-| wrist3 | 0.022 | **0.148** | 0.0019 | **0.0017** |
+| joint | linear R² | tree R² (no gravity) | tree R² (w/ gravity) | linear RMSE (deg) | tree RMSE (deg) |
+|---|---|---|---|---|---|
+| overall | 0.445 | 0.882 | **0.883** | 0.0242 | **0.0111** |
+| base | 0.725 | 0.734 | 0.734 | 0.0076 | 0.0075 |
+| shoulder | 0.398 | 0.913 | **0.914** | 0.0561 | **0.0213** |
+| elbow | 0.462 | 0.630 | **0.637** | 0.0153 | **0.0127** |
+| wrist1 | **0.914** | 0.833 | 0.834 | **0.0053** | 0.0074 |
+| wrist2 | **0.840** | 0.796 | 0.798 | **0.0035** | 0.0039 |
+| wrist3 | 0.022 | 0.148 | 0.147 | 0.0019 | **0.0017** |
 
 Not a clean sweep, and worth reading honestly: the tree model is a large win
 on base/shoulder/elbow/wrist3 (shoulder R² more than doubles, from 0.40 to
 0.91, without any lag/history features — trees pick up some of the
 instantaneous nonlinear interaction among `qd`/`qdd`/`target_current`/`pos`
 a linear model structurally can't, even though neither model has been given
-the temporal history the ring actually needs), but **linear wins on wrist1
-and wrist2** — the two joints `gravity_torque` measurably helped (§3, §6).
-Since the tree model doesn't have that feature (a scope decision, not
-evidence — see above), this comparison isn't fully apples-to-apples: some or
-all of linear's wrist1/wrist2 edge may just be "linear has a feature tree
-doesn't," not "trees are worse at this relationship." Untested: a tree model
-*with* `gravity_torque` would isolate that question. `models/distill_tree.pkl`
-saved alongside `models/distill.pkl` (still the default/shipped model —
-`--model` default unchanged).
+the temporal history the ring actually needs), but **linear still wins on
+wrist1 and wrist2** even now that both models see identical features — so
+this is a genuine regressor difference on those two joints, not a
+missing-feature artifact (the original, untested hypothesis from before
+gravity was added to the tree model). Read together with how little gravity
+moved the tree overall (+0.0015 vs. linear's +0.008, see §2), the likely
+story: wrist1/wrist2's residual is close to a smooth, near-linear function
+of the inputs, which a linear model represents natively and a
+piecewise-constant tree (with untuned default hyperparameters) approximates
+less efficiently — while shoulder/elbow/base's residual is nonlinear enough
+that the tree's flexibility wins outright. Different joints may simply want
+different model shapes; not tested here (would mean per-joint model
+selection, not just a per-joint *fit*, which both models already do).
+`models/distill_tree.pkl` saved alongside `models/distill.pkl` (still the
+default/shipped model — `--model` default unchanged).
+
+**Caveat on all of the above, not yet resolved**: these are still row-level
+held-out numbers (§5), and the leakage concern applies *more* to the tree
+model than the linear one. `HistGradientBoostingRegressor` has far more
+capacity than a 7-parameter-per-joint linear fit, so it can exploit
+"this held-out row's neighbors are in the training set" more effectively —
+the tree's R²=0.88 could be sitting on more leakage-driven optimism than the
+linear model's (whose row-level-vs-file-level gap was already measured and
+small, §5). Not yet checked for the tree model. The leave-one-file-out CV
+diagnostic (§7) would answer this and is now higher priority than before.
 
 **Plots each run produces** (`results/<datetime>/`), styled with `ur_style.py`:
 
@@ -363,6 +396,17 @@ that doesn't have any.
 
 ## Changelog
 
+- **2026-08-19** — Added `gravity_torque` to `PerJointTreeModel` (removed its
+  `FEATURE_NAMES` override so it inherits the parent's full 8-feature set;
+  fixed its `predict()` override, which had no gravity-conditional logic
+  since it predated the feature, to match the parent's pattern). Tested the
+  hypothesis from the previous entry ("linear's wrist1/wrist2 edge might
+  just be a missing feature") and found it **false**: gravity moved the
+  tree's overall R² by only +0.0015 (0.882→0.883, vs. linear's +0.008) and
+  didn't close the wrist1/wrist2 gap at all. Documented likely explanation
+  in §2/§6: trees can partially approximate pose-dependent nonlinearity from
+  raw features without being handed the physics formula, so the feature is
+  worth much less to them than to a linear model with no such capacity.
 - **2026-08-19** — Added `PerJointTreeModel` (`--model tree_per_joint`,
   `sklearn.ensemble.HistGradientBoostingRegressor` per joint), deliberately
   using the pre-gravity 7-feature set (user's call, not evidence-driven).
