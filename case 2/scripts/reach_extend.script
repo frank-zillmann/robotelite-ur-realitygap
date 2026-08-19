@@ -12,7 +12,7 @@
 # where the arm stays in one configuration. Pair it with workspace_sweep.script.
 #
 # UNITS: movej `v` is rad/s and `a` is rad/s^2; the controller clamps anything
-# above the joint limit (~2.09 rad/s for base/shoulder/elbow), so keep vel <= 2.0
+# above the joint limit (~3.14 rad/s / 180 deg/s, uniform on the UR5e), so keep vel <= 2.0
 # or every run records at the same speed.
 #
 #     python collect.py --scripts scripts/reach_extend.script

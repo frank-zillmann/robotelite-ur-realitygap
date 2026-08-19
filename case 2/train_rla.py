@@ -14,7 +14,7 @@ metric scores them. One step per episode (a contextual bandit): reset returns a
 move, step scores the candidate.
 
     observation : the move + its baseline (built in `observe`)
-    action      : params -> [vel, acc] (rad/s); path -> [accel_frac, decel_frac, speed]
+    action      : params -> [vel, acc] (rad/s, rad/s^2); path -> [accel_frac, decel_frac, speed]
     reward      : -OBJECTIVE(score, cycle_time)
 
 Modes (``--mode``, saved as ``models/agent_<mode>.zip``):
@@ -52,9 +52,9 @@ SIM_TO_REAL = "sim_to_real.csv"
 # Action bounds in the URScript units, which are rad/s and rad/s^2 -- NOT deg. A
 # movej speed above the joint limit (MAX_JOINT_SPEED, pi rad/s -- the UR5e's
 # uniform 180 deg/s) is clamped by the controller, so the top of the range stays
-# just under it: an agent that
-# proposes a clamped speed gets no feedback from the extra number, and the script
-# it writes runs at the same speed as every other clamped one.
+# just under it: an agent that proposes a clamped speed gets no feedback from the
+# extra number, and the script it writes runs at the same speed as every other
+# clamped one.
 VEL_BOUNDS = (0.3, 2.0)
 ACC_BOUNDS = (0.5, 8.0)
 

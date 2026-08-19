@@ -62,7 +62,7 @@ def search_agent(env: GapEnv, moves, path: str) -> tuple[float, float]:
 def report(env: GapEnv, moves, vel: float, acc: float, label: str) -> np.ndarray:
     """Print mean score and cycle time for one (vel, acc); return (score, cycle) per move."""
     res = np.array([env.score(m, vel, acc) for m in moves])
-    print(f"{label}: vel {vel:.3f}  acc {acc:.3f}  score {res[:, 0].mean():.3f}  "
+    print(f"{label}: vel {vel:.3f}rad/s  acc {acc:.3f}rad/s^2  score {res[:, 0].mean():.3f}  "
           f"cycle {res[:, 1].mean():.3f}s (mean over {len(moves)} moves)")
     return res
 

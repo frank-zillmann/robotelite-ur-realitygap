@@ -7,10 +7,16 @@ inverse dynamics:
     tau     = M(q) qdd + g(q)          (utils.UR5e; Coriolis dropped by default)
     current = tau / Kt                 (Kt fit from the recording: moment / current)
 
-Units: rad throughout. The ``vel``/``acc`` registers (and the URScript numbers
-they come from) are rad/s and rad/s^2, because that is what ``movej`` takes, and
-so are the joint speeds in the recording. The speed is clamped to the joint limit,
-as the controller does.
+Units: everything here is radians. The ``vel``/``acc`` registers, the URScript
+`movej(a=acc, v=vel)` numbers, and joint speeds in the recording are all rad/s and
+rad/s^2 -- that is what `movej` takes natively. (A previous version of this
+pipeline treated them as deg/s and multiplied by a stray ``DEG2RAD`` before use;
+that made every "vel" number 57x too large by the time it reached the physics, and
+because the deg-scale number was written into the script unconverted, on the robot
+it saturated at the joint speed limit every time -- so every recorded run ran at
+the same clamped max regardless of the requested speed. Fixed: no conversion, no
+clamping surprises.) The trajectory is built in rad, with the speed clamped to the
+joint limit (URScript clamps a movej speed above the limit).
 
 ``Dynamics`` is an interface; subclass it for a different torque model (friction,
 Coriolis, identified inertial parameters, a learned model). The default is fast

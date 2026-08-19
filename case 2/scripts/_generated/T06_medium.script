@@ -1,0 +1,29 @@
+# T06 wrist_pitch_roll - one cycle: wrist1 and wrist2 swing together, arm fixed.
+#
+# The only script that moves joints 3 and 4 (wrist1, wrist2) -- every other
+# trajectory in this set holds them at -1.5708 (-90deg). Without this script
+# neither joint has ANY commanded velocity/acceleration in the dataset, so the
+# distill model would have nothing to learn their dynamics from. Analyze with
+# --joint 3 or --joint 4.
+#
+# SAFETY: first trajectory to move wrist1/wrist2 -- verify clearance for both
+# axes before running on real hardware (not covered by whatever checks were
+# done for the base/shoulder/elbow-only scripts).
+#
+# Edit vel and acc below (rad/s, rad/s^2), then run it with send.py (--loop N
+# repeats the cycle). Plain assignments (no `global`): send.py wraps this in a
+# repeat loop, and URScript does not allow a `global` declaration inside a loop.
+
+vel = 0.6000
+acc = 1.2000
+
+# Two joint poses [rad]; base/shoulder/elbow/wrist3 fixed, wrist1+wrist2 swing.
+POSE_A = [0.0, -1.3, 1.3, -1.9, -1.9, 0.0]
+POSE_B = [0.0, -1.3, 1.3, -1.2, -1.2, 0.0]
+
+write_output_float_register(1, vel)
+write_output_float_register(2, acc)
+movej(POSE_A, a=acc, v=vel)
+sleep(0.8)
+movej(POSE_B, a=acc, v=vel)
+sleep(0.8)

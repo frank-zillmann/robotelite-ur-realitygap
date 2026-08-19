@@ -7,8 +7,9 @@
 # data on the small joints at all; they are also the ones whose ring is easiest
 # to excite because their inertia is tiny next to the arm they hang off.
 #
-# UNITS: movej `v` is rad/s and `a` is rad/s^2. The wrists clamp at ~3.14 rad/s
-# and the big joints at ~2.09 rad/s; keep vel <= 2.0 so nothing saturates.
+# UNITS: movej `v` is rad/s and `a` is rad/s^2. Every joint clamps at ~3.14 rad/s
+# / 180 deg/s on the UR5e (uniform, not just the wrists); keep vel <= 2.0 so
+# nothing saturates.
 #
 #     python collect.py --scripts scripts/wrist_sweep.script
 #

@@ -12,7 +12,7 @@
 # shows up in the recording.
 #
 # UNITS: movej `v` is rad/s and `a` is rad/s^2. Anything above the joint limit
-# (~2.09 rad/s for base/shoulder/elbow) is silently clamped by the controller, so
+# (~3.14 rad/s / 180 deg/s, uniform on the UR5e) is silently clamped by the controller, so
 # every run would come out at the same speed. Keep vel <= 2.0.
 #
 # Collect a speed sweep over this motion with:

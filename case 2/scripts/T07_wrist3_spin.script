@@ -1,0 +1,25 @@
+# T07 wrist3_spin - one cycle: wrist3 rotates 90 degrees and back, arm otherwise
+# still. The first trajectory to move a wrist joint instead of base/shoulder/
+# elbow -- adds joint diversity without changing reach. Analyze joint 5.
+#
+# SAFETY: verify nothing is within the tool's spin radius before running this
+# on real hardware (a new axis versus the other trajectories -- not covered by
+# whatever clearance checks were done for the base/shoulder/elbow scripts).
+#
+# Edit vel and acc below (rad/s, rad/s^2), then run it with send.py (--loop N
+# repeats the cycle). Plain assignments (no `global`): send.py wraps this in a
+# repeat loop, and URScript does not allow a `global` declaration inside a loop.
+
+vel = 0.6
+acc = 1.2
+
+# Two joint poses [rad]; only wrist3 (last joint) rotates.
+POSE_A = [0.0, -1.4, 1.4, -1.5708, -1.5708, 0.0]
+POSE_B = [0.0, -1.4, 1.4, -1.5708, -1.5708, 1.5708]
+
+write_output_float_register(1, vel)
+write_output_float_register(2, acc)
+movej(POSE_A, a=acc, v=vel)
+sleep(0.8)
+movej(POSE_B, a=acc, v=vel)
+sleep(0.8)

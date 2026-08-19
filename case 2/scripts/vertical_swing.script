@@ -1,17 +1,18 @@
-# Vertical swing - one cycle: over the top and back.
+# T04 vertical_swing - one cycle: over the top and back.
 #
 # The arm starts laid down flat (shoulder 0, elbow straight), and the shoulder
 # (joint 1) rotates from 0 to -180 degrees and back, swinging the arm up and over
 # through vertical in a vertical plane. Optimize it with --joint 1.
 #
-# Edit vel and acc below, then run it with send.py (--loop N repeats the cycle).
-# Plain assignments (no `global`): send.py wraps this in a repeat loop, and
-# URScript does not allow a `global` declaration inside a loop.
+# Edit vel and acc below (rad/s, rad/s^2 -- movej's native units), then run it
+# with send.py (--loop N repeats the cycle). Plain assignments (no `global`):
+# send.py wraps this in a repeat loop, and URScript does not allow a `global`
+# declaration inside a loop.
 
 # UNITS: movej `v` is rad/s and `a` is rad/s^2. The controller clamps anything
-# above the joint limit (~2.09 rad/s on base/shoulder/elbow), so a big number here
-# means every run records at the same maximum speed. 1.05 / 1.4 are the URScript
-# movej defaults.
+# above the joint limit (~3.14 rad/s / 180 deg/s, uniform across every joint on
+# the UR5e), so a big number here means every run records at the same maximum
+# speed. 1.05 / 1.4 are the URScript movej defaults.
 vel = 1.05
 acc = 1.4
 
