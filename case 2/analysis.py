@@ -3,7 +3,7 @@
 Load a CSV from ``record.py``, print per-joint numbers (range of motion, current
 gap, position lag), and plot one joint's target vs actual current.
 
-    python analysis.py --csv data/test-4.csv --joint 1
+    python analysis.py --csv data/ur10e/test-4.csv --joint 1
 
 ``--joint`` selects the joint (0=base ... 5=wrist3).
 
@@ -90,7 +90,7 @@ class Recording:
 def main():
     # Print per-joint stats, then plot one joint.
     ap = argparse.ArgumentParser(description="Per-joint stats and a plot for a recorded run.")
-    ap.add_argument("--csv", default="data/test-4.csv", help="recorded run CSV")
+    ap.add_argument("--csv", default="data/ur10e/test-4.csv", help="recorded run CSV")
     ap.add_argument("--joint", type=int, default=1,
                     help="joint index 0..5 to plot (default 1 = shoulder)")
     ap.add_argument("--no-plot", action="store_true", help="print stats only")

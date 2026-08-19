@@ -212,7 +212,7 @@ def main():
                     help=f"movej accelerations in rad/s^2 (default: {' '.join(map(str, DEFAULT_ACC))})")
     ap.add_argument("--loop", type=int, default=1,
                     help="repeat each motion N times per run (default 1)")
-    ap.add_argument("--out-dir", default="data/sweep", help="where the run CSVs go")
+    ap.add_argument("--out-dir", default="data/ur5e", help="where the run CSVs go")
     ap.add_argument("--pool", default=None,
                     help="also write one pooled CSV (default: <out-dir>/pooled.csv)")
     ap.add_argument("--hz", type=float, default=125.0, help="sample rate (default 125)")

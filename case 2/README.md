@@ -29,7 +29,7 @@ pip install -r requirements.txt
 - **Recorded runs** in `data/`, one CSV per run. Collect your own with
   `collect.py` (see below), or log a program you drive from PolyScope:
   ```bash
-  python record.py --robot-ip <ip> --out data/test-1.csv --float-register 1 vel 2 acc
+  python record.py --robot-ip <ip> --out data/ur5e/test-1.csv --float-register 1 vel 2 acc
   ```
   `record.py` reads the controller's RTDE stream and only logs; it never moves the
   robot. RTDE channels: <https://www.universal-robots.com/developer/communication-protocol/rtde/>.
@@ -41,14 +41,14 @@ pip install -r requirements.txt
 rad/s, and the controller silently clamps anything above the joint limit —
 2.09 rad/s (120 °/s) on base/shoulder/elbow, 3.14 rad/s on the wrists.
 
-The `data/test-*.csv` recordings shipped with the case were taken with programs
+The `data/ur10e/test-*.csv` recordings shipped with the case were taken with programs
 that sweep `vel` from 100 down to 20 and `acc` likewise. Every one of those numbers
 is an order of magnitude above the limit, so **every run was recorded at maximum
 speed**: `target_qd` peaks at exactly 2.094 / 3.142 rad/s in all of them while the
 logged `vel` register reads 20, 50, 100. Check it yourself:
 
 ```bash
-python -c "import pandas as pd,numpy as np; d=pd.read_csv('data/test-4.csv'); \
+python -c "import pandas as pd,numpy as np; d=pd.read_csv('data/ur10e/test-4.csv'); \
 print(sorted(d.vel.unique())); print(np.abs(d[[f'target_qd{j}' for j in range(6)]]).max().values)"
 ```
 
@@ -63,7 +63,7 @@ each combination on four coverage motions:
 
 ```bash
 python collect.py --dry-run                    # the plan and a time estimate, no robot
-python collect.py --robot-ip 127.0.0.1         # ~30 min, 60 runs -> data/sweep/
+python collect.py --robot-ip 127.0.0.1         # ~30 min, 60 runs -> data/ur5e/
 ```
 
 **Point it at hardware, not URSim, for the distillation data.** URSim has no
@@ -72,7 +72,7 @@ reality gap to record: it writes `actual_q == target_q` and
 URSim sweep learns the identity function. Confirm it on any URSim recording:
 
 ```bash
-python -c "import pandas as pd,numpy as np; d=pd.read_csv('data/sweep/pooled.csv'); \
+python -c "import pandas as pd,numpy as np; d=pd.read_csv('data/ur5e/pooled.csv'); \
 c=lambda b:[f'{b}{j}' for j in range(6)]; \
 print(np.array_equal(d[c('actual_current')].values, d[c('target_current')].values))"
 ```
@@ -99,8 +99,8 @@ unless `--overwrite`, so an interrupted sweep resumes.
 Then distill on the sweep recorded **on the robot**, rather than the old runs:
 
 ```bash
-python collect.py --robot-ip <real-robot-ip> --out-dir data/real_sweep
-python train_distillation_model.py --csvs data/real_sweep/pooled.csv --out models/distill.pkl
+python collect.py --robot-ip <real-robot-ip> --out-dir data/ur5e
+python train_distillation_model.py --csvs data/ur5e/pooled.csv --out models/distill.pkl
 ```
 
 ## How to run
@@ -111,10 +111,10 @@ Distill once, then either mode reuses the model.
 # 0. collect runs that actually vary in speed and cover the workspace.
 #    ON THE ROBOT: URSim reports actual_* == target_*, so a sweep recorded there
 #    has no gap in it. Against URSim this is a rehearsal of the motions only.
-python collect.py --robot-ip <real-robot-ip> --out-dir data/real_sweep
+python collect.py --robot-ip <real-robot-ip> --out-dir data/ur5e
 
 # 1. distill the gap model from the recorded real runs
-python train_distillation_model.py --csvs data/real_sweep/pooled.csv --out models/distill.pkl
+python train_distillation_model.py --csvs data/ur5e/pooled.csv --out models/distill.pkl
 
 # 2. train the RL agent on several scripts (--loop repeats each for more moves)
 python train_rla.py --mode params --robot-ip 127.0.0.1 --loop 5 --model models/distill.pkl --steps 20000 \
