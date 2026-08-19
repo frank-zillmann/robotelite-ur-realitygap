@@ -13,32 +13,36 @@ the metric and the RL agent can run without hardware.
                         actual channels, as {channel: (n, N_JOINTS) array}
 
 The channels a model fills must be the ones the metric reads (see metrics.py).
-``LinearModel`` below predicts ``actual_current``.
+``PerJointPositionModel`` below predicts ``actual_q`` (position), one
+independent linear fit per joint -- see its docstring for why per-joint rather
+than a shared fit across joints.
 
-    from train_distillation_model import LinearModel, augment
+    from train_distillation_model import PerJointPositionModel, augment
     from analysis import Recording
-    m = LinearModel().fit([Recording("data/test-4.csv"), Recording("data/test-6.csv")])
-    m.predicts()                          # ['actual_current']
+    m = PerJointPositionModel().fit([Recording("data/test-4.csv"), Recording("data/test-6.csv")])
+    m.predicts()                          # ['actual_q']
     m.save("models/distill.pkl")
-    augment(m, "sim_to_real.csv")         # overwrite actual_current with predictions
+    augment(m, "sim_to_real.csv")         # overwrite actual_q with predictions
 
-Run as a script to fit on a fixed train set, report error on a fixed, disjoint
-test set, and save. The split is fixed by default (data/test-{1,2,3,6}.csv to
-train, data/test-{4,5,7}.csv to test) so numbers stay comparable across runs no
-matter which DistillModel or Preprocess is plugged in:
+Run as a script to fit on every recorded run, report a row-level held-out
+error, then refit on 100% of the rows and save that (see ``DEFAULT_CSVS``/
+``DEFAULT_HOLDOUT`` below for the split methodology and its caveat):
 
     python train_distillation_model.py --out models/distill.pkl
 
-Override either list to use a different split (they must not overlap):
+Override the csvs or the holdout fraction:
 
     python train_distillation_model.py \
-        --train-csvs data/test-1.csv data/test-2.csv \
-        --test-csvs data/test-3.csv \
-        --out models/distill.pkl
+        --csvs data/test-1.csv data/test-2.csv data/test-3.csv \
+        --holdout 0.1 --out models/distill.pkl
 
 train_rla.py and run.py depend only on the interface, so a custom subclass of
-DistillModel (or LinearModel) can replace the baseline via its pickle; add it
-to MODELS below to select it with --model.
+DistillModel (or PerJointPositionModel) can replace the baseline via its
+pickle; add it to MODELS below to select it with --model. train_rla.py and
+run.py still default to ``metrics.CurrentGapMetric``/``actual_current``, which
+this module no longer predicts -- they need to switch to a position metric
+(``metrics.PositionGapMetric``) before they'll work with a model saved from
+here again.
 """
 from __future__ import annotations
 
@@ -55,18 +59,26 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+import ur_style
 from preprocess import Identity, Preprocess, default_preprocess
 from utils import (JOINT_NAMES, N_JOINTS, VEL_COL, ACC_COL, frame_dt,
                    get_block, set_block)
 
-# Fixed file-level train/test split, used regardless of --model or the active
-# Preprocess. data/test-{2,4}.csv are both acc sweeps at vel=100, {3,5} are
-# both vel sweeps at acc=100, and {6,7} are both wide random vel/acc combos
-# (test-1 is a standalone low-range vel/acc grid) — so holding out one file
-# from each pair (4, 5, 7) tests generalization to a new run within a regime
-# the model has seen, rather than extrapolation to an unseen regime.
-DEFAULT_TRAIN_CSVS = ["data/test-1.csv", "data/test-2.csv", "data/test-3.csv", "data/test-6.csv"]
-DEFAULT_TEST_CSVS  = ["data/test-4.csv", "data/test-5.csv", "data/test-7.csv"]
+# Train on every recorded run; holdout is a row-level fraction, not a set of
+# held-out files. Matches original_train.py's methodology: pool every row of
+# every joint of every recording, mark a deterministic fraction of rows as
+# "test" (no RNG), fit on the rest, then refit on 100% of the rows before
+# saving -- the held-out numbers are a diagnostic on a throwaway fit, not a
+# property of the saved model.
+#
+# Caveat worth knowing: because held-out rows sit inside the same continuous
+# trajectories the fit sees (the robot streams at ~128 Hz, so row i and row
+# i+1 are ~7.8 ms apart and highly autocorrelated), this measures
+# interpolation within seen trajectories more than generalization to an
+# unseen run. A file-level split (hold out whole recordings) is the stricter
+# alternative -- see git history for the version of this file that did that.
+DEFAULT_CSVS = [f"data/test-{i}.csv" for i in range(1, 8)]
+DEFAULT_HOLDOUT = 0.2
 
 
 class DistillModel(ABC):
@@ -82,7 +94,7 @@ class DistillModel(ABC):
 
     @abstractmethod
     def predicts(self) -> list[str]:
-        """Per-joint channel bases this model predicts, e.g. ``["actual_current"]``.
+        """Per-joint channel bases this model predicts, e.g. ``["actual_q"]``.
 
         These are the ``actual_*`` columns ``predict`` returns and ``augment``
         overwrites in the recording.
@@ -118,92 +130,117 @@ class DistillModel(ABC):
         """Return model hyperparameters for logging. Override in subclasses."""
         return {}
 
+    def coefficients(self):
+        """Optional ``{joint_name: (feature_names, weights)}`` for a linear
+        model's coefficients bar chart.
 
-class LinearModel(DistillModel):
-    """Least-squares linear baseline that predicts the actual current.
+        Return ``None`` (the default) for a model with no per-feature linear
+        weight to show -- ``_plot_coefficients`` skips the plot rather than
+        erroring, so a non-linear regressor just doesn't get one.
+        """
+        return None
 
-    One linear model per row: for each joint the actual current is
-    ``w . [target_current, qd, qdd, pos, vel, acc, joint one-hot]``, where
-    ``target_current`` is the commanded current the joint is tracking, ``qd`` is
-    the commanded velocity (from ``target_qd``), ``qdd`` its time derivative,
-    ``pos`` the commanded angle, and ``vel``/``acc`` the raw movej numbers the
-    script commanded. Fit against the measured ``actual_current`` of the real
-    runs.
 
-    The one-hot joint block gives each joint its own intercept with shared
-    slopes; there is no separate bias term (it would be collinear with the
-    one-hot). Being linear and smooth in its inputs, it cannot reproduce the ring
-    after a stop (README "Why the optimizer stalls").
+class PerJointPositionModel(DistillModel):
+    """Least-squares linear baseline that predicts actual position, one independent
+    fit per joint.
+
+    One linear model per joint rather than one shared-slope fit pooled across
+    all six (a joint one-hot only shifting the intercept, the shape an earlier
+    version of this baseline used): a held-out comparison on the current
+    channel showed pooling costs the low-current wrist joints a lot of accuracy
+    (R² 0.43 -> 0.60 for wrist2, 0.07 -> 0.26 for wrist3 when fit separately)
+    because their true sensitivity to the inputs differs in scale and even sign
+    from the big joints that dominate a pooled fit. So here each joint gets its
+    own coefficient vector from its own ``lstsq`` call — six independent small
+    regressions rather than one big one with a joint indicator.
+
+    Predicts the *residual* ``actual_q - target_q`` rather than raw ``actual_q``:
+    the target is then near-zero-mean and on a consistent scale across joints
+    (radians of error, not radians of arbitrary joint angle), and ``predict``
+    just adds ``target_q`` back before returning. Each joint's fit also gets a
+    real intercept (no one-hot to be collinear with, since each joint is its own
+    fit), so a joint's average static bias -- e.g. gravity sag at its typical
+    poses -- has somewhere to go instead of leaking into the other slopes.
+
+    Features: ``target_current``, ``qd``, ``qdd``, ``pos``, ``vel``, ``acc``,
+    plus the intercept. Being linear and per-row, it still can't reproduce the
+    settle-window ring (a decaying oscillation after the commanded motion
+    stops -- see ``bronze_tier/trajectories/worst_move_test-4_shoulder.png``),
+    and it doesn't read any physics beyond what's already logged.
 
     Extension points:
 
-    - Fit per joint or add joint-interaction terms; shared slopes leak one
-      joint's behaviour onto another.
-    - Normalize the features: ``pos`` (radians) and ``vel``/``acc`` (raw movej
-      numbers up to ~1000) are on very different scales.
-    - Add physics from ``utils.UR10e`` (gravity torque, mass matrix, Coriolis).
-    - Use a non-linear regressor (MLP, trees) that can capture the ring.
-
-    Override ``_row_features`` to change the inputs, or ``predicts``/``predict``
-    to model a different channel.
+    - Add lag features (recent ``qd``/``qdd``/jerk) or a decaying-oscillation
+      term to capture the ring -- a linear-in-recent-history model still fits
+      with ``lstsq``, a nonlinear one needs a different regressor.
+    - Add ``utils.UR10e.gravity(q)``/``mass_matrix(q)`` at the joint's own pose
+      as features -- direct physical drivers of static/dynamic deflection.
+    - Override ``_row_features`` (kept with a ``(joint, ...)`` signature even
+      though this baseline ignores ``joint``) to feed a joint-specific physics
+      term, e.g. a different neighbouring-joint coupling term per joint.
     """
 
-    FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "vel", "acc"] + \
-        [f"is_{n}" for n in JOINT_NAMES]
+    FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "vel", "acc", "bias"]
 
     def __init__(self):
-        self.coef = None                     # (12,) per-row weights
-        self.vel_range = None                # (lo, hi) commanded vel seen in training
-        self.acc_range = None                # (lo, hi) commanded acc seen in training
+        self.coefs = None                    # (N_JOINTS, 7) one row per joint
+        self.vel_range = None
+        self.acc_range = None
 
     def predicts(self) -> list[str]:
-        return ["actual_current"]
+        return ["actual_q"]
 
     # --- features -------------------------------------------------------------
 
     def _row_features(self, joint: int, tgt_i, pos, qd, qdd, vel, acc) -> np.ndarray:
-        """Feature rows for one joint over a whole trajectory, shape ``(n, 12)``.
+        """Feature rows for one joint over a whole trajectory, shape ``(n, 7)``.
 
-        Every argument except ``joint`` is a length-``n`` array. ``tgt_i`` is the
-        commanded ``target_current`` for this joint. Override to feed the model
-        more inputs (gravity torque, mass, neighbouring joints); keep it a
-        function of the commanded trajectory so it also applies to candidates.
+        ``joint`` is unused by this baseline (each joint already gets its own
+        coefficients from being fit separately) but kept in the signature so a
+        subclass can look up a joint-specific physics term without changing the
+        call sites.
         """
         tgt_i, pos = np.asarray(tgt_i), np.asarray(pos)
         qd, qdd = np.asarray(qd), np.asarray(qdd)
         vel, acc = np.asarray(vel), np.asarray(acc)
-        onehot = np.zeros((len(pos), N_JOINTS))
-        onehot[:, joint] = 1.0
-        return np.column_stack([tgt_i, qd, qdd, pos, vel, acc, onehot])
+        bias = np.ones(len(pos))
+        return np.column_stack([tgt_i, qd, qdd, pos, vel, acc, bias])
 
     # --- fit ------------------------------------------------------------------
 
-    def _design(self, recordings) -> tuple[np.ndarray, np.ndarray]:
-        """Stack (features, measured actual_current) over every joint of every run.
+    def _design(self, recordings) -> dict:
+        """Per-joint (features, position-error target) design matrices.
 
-        Shared by ``fit`` and the script's held-out error report, so both build
-        the feature matrix the same way.
+        Returns ``{joint: (X, y)}``, ``y`` being ``actual_q - target_q`` (the
+        residual this model fits). Shared by ``fit`` so joint and pooled
+        evaluation build the feature matrix the same way.
         """
-        X, y = [], []
+        per_joint = {j: ([], []) for j in range(N_JOINTS)}
         for rec in recordings:
             if rec.vel_cmd is None or rec.acc_cmd is None:
                 raise ValueError(f"{rec.path} has no vel/acc registers; record "
                                  "with `--float-register 1 vel 2 acc`")
             qdd = np.gradient(rec.target_qd, rec.dt, axis=0)     # commanded accel
             for j in range(N_JOINTS):
-                X.append(self._row_features(j, rec.target_current[:, j], rec.target_q[:, j],
-                                            rec.target_qd[:, j], qdd[:, j],
-                                            rec.vel_cmd, rec.acc_cmd))
-                y.append(rec.actual_current[:, j])
-        return np.vstack(X), np.concatenate(y)
+                Xs, ys = per_joint[j]
+                Xs.append(self._row_features(j, rec.target_current[:, j], rec.target_q[:, j],
+                                             rec.target_qd[:, j], qdd[:, j],
+                                             rec.vel_cmd, rec.acc_cmd))
+                ys.append(rec.actual_q[:, j] - rec.target_q[:, j])
+        return {j: (np.vstack(Xs), np.concatenate(ys)) for j, (Xs, ys) in per_joint.items()}
 
-    def fit(self, recordings) -> "LinearModel":
-        """Fit the row model on every row of every joint of every real run."""
-        X, y = self._design(recordings)
-        self.coef, *_ = np.linalg.lstsq(X, y, rcond=None)
-        # Feature columns 4 and 5 are vel and acc: their spans are the bounds.
-        self.vel_range = (float(X[:, 4].min()), float(X[:, 4].max()))
-        self.acc_range = (float(X[:, 5].min()), float(X[:, 5].max()))
+    def fit(self, recordings) -> "PerJointPositionModel":
+        """Fit one row model per joint, independently, on every row of every real run."""
+        design = self._design(recordings)
+        self.coefs = np.zeros((N_JOINTS, len(self.FEATURE_NAMES)))
+        vel_all, acc_all = [], []
+        for j, (X, y) in design.items():
+            self.coefs[j], *_ = np.linalg.lstsq(X, y, rcond=None)
+            vel_all.append(X[:, 4])          # feature columns 4/5 are vel/acc
+            acc_all.append(X[:, 5])
+        self.vel_range = (float(np.min(vel_all)), float(np.max(vel_all)))
+        self.acc_range = (float(np.min(acc_all)), float(np.max(acc_all)))
         return self
 
     # --- predict --------------------------------------------------------------
@@ -218,28 +255,33 @@ class LinearModel(DistillModel):
         acc = df[ACC_COL].to_numpy(dtype=float)
         out = np.zeros_like(q)
         for j in range(N_JOINTS):
-            out[:, j] = self._row_features(j, ti[:, j], q[:, j], qd[:, j],
-                                           qdd[:, j], vel, acc) @ self.coef
-        return {"actual_current": out}
+            feats = self._row_features(j, ti[:, j], q[:, j], qd[:, j], qdd[:, j], vel, acc)
+            out[:, j] = q[:, j] + feats @ self.coefs[j]     # target_q + predicted error
+        return {"actual_q": out}
 
     def bounds(self):
-        if self.coef is None:
+        if self.coefs is None:
             return None
         return self.vel_range, self.acc_range
 
     def params(self) -> dict:
         return {
-            "type":         "least_squares",
+            "type":         "least_squares_per_joint",
             "features":     self.FEATURE_NAMES,
-            "coefficients": self.coef.tolist() if self.coef is not None else None,
+            "coefficients": self.coefs.tolist() if self.coefs is not None else None,
             "vel_range":    list(self.vel_range) if self.vel_range else None,
             "acc_range":    list(self.acc_range) if self.acc_range else None,
         }
 
+    def coefficients(self):
+        if self.coefs is None:
+            return None
+        return {JOINT_NAMES[j]: (self.FEATURE_NAMES, self.coefs[j]) for j in range(N_JOINTS)}
+
 
 # Models selectable via --model. Add a new DistillModel subclass here to make
 # it available from the CLI without touching the train/test split logic.
-MODELS = {"linear": LinearModel}
+MODELS = {"linear_per_joint": PerJointPositionModel}
 
 
 def augment(model: DistillModel, csv: str, pre: Preprocess = None):
@@ -275,45 +317,76 @@ RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results"
 def _evaluate_model(model: DistillModel, recordings) -> dict:
     """Run model.predict on every recording and collect per-channel per-joint arrays.
 
+    Also gathers each channel's ``target_*`` counterpart (e.g. ``target_q`` for
+    ``actual_q``) alongside ``actual``, so ``_compute_metrics`` can score R²
+    against "predict no gap" rather than "predict the mean" -- see its
+    docstring for why that distinction matters for a channel like position.
+
     Returns:
-        {channel: {joint_idx: {"pred": array, "actual": array, "residuals": array}}}
+        {channel: {joint_idx: {"pred": array, "actual": array, "target": array,
+                                "residuals": array}}}
     """
     channels = model.predicts()
-    buckets = {ch: {j: {"pred": [], "actual": []} for j in range(N_JOINTS)}
+    buckets = {ch: {j: {"pred": [], "actual": [], "target": []} for j in range(N_JOINTS)}
                for ch in channels}
     for rec in recordings:
         preds = model.predict(rec.df)
         for ch in channels:
             actual_block = (getattr(rec, ch) if hasattr(rec, ch)
                             else get_block(rec.df, ch))
+            tgt_ch = ch.replace("actual_", "target_")
+            target_block = (getattr(rec, tgt_ch) if hasattr(rec, tgt_ch)
+                            else get_block(rec.df, tgt_ch))
             pred_block = preds[ch]
             for j in range(N_JOINTS):
                 buckets[ch][j]["pred"].append(pred_block[:, j])
                 buckets[ch][j]["actual"].append(actual_block[:, j])
+                buckets[ch][j]["target"].append(target_block[:, j])
     result = {}
     for ch in channels:
         result[ch] = {}
         for j in range(N_JOINTS):
             pred   = np.concatenate(buckets[ch][j]["pred"])
             actual = np.concatenate(buckets[ch][j]["actual"])
-            result[ch][j] = {"pred": pred, "actual": actual, "residuals": pred - actual}
+            target = np.concatenate(buckets[ch][j]["target"])
+            result[ch][j] = {"pred": pred, "actual": actual, "target": target,
+                             "residuals": pred - actual}
     return result
 
 
 def _compute_metrics(eval_data: dict) -> dict:
-    """Compute overall and per-joint RMSE / R² from _evaluate_model output."""
+    """Compute overall and per-joint RMSE / R² from _evaluate_model output.
+
+    R² here is 1 - ss_res/ss_tot with ss_tot measured against **target**, i.e.
+    against the trivial "predict no gap" (``actual = target``) baseline, not
+    the usual "predict the mean of actual" baseline. For a channel like
+    ``actual_q``, the mean-of-actual baseline is nearly worthless: position
+    spans radians over a move while the gap being modeled is millirad-scale,
+    so "predict the mean" and "predict target" score almost identically close
+    to 0 residual either way and R² saturates near 1.0 regardless of whether
+    the model learned anything (verified: a model that just copies target into
+    actual_q scores the same R²=1.0000 the fitted model did). Scoring against
+    target instead measures the thing that's actually being modeled: how much
+    of the *tracking gap* the model explains, relative to assuming there is
+    none. This also applies more mildly to ``actual_current``, where the gap
+    is already a larger share of the signal's variance so the two definitions
+    were closer to agreeing -- but "predict no gap" is the more meaningful
+    null model for a distillation task either way.
+    """
     metrics = {}
     for ch, joints in eval_data.items():
         all_res = np.concatenate([joints[j]["residuals"] for j in range(N_JOINTS)])
         all_act = np.concatenate([joints[j]["actual"]    for j in range(N_JOINTS)])
+        all_tgt = np.concatenate([joints[j]["target"]    for j in range(N_JOINTS)])
         ss_res  = float(np.sum(all_res ** 2))
-        ss_tot  = float(np.sum((all_act - all_act.mean()) ** 2))
+        ss_tot  = float(np.sum((all_act - all_tgt) ** 2))
         per_joint = []
         for j in range(N_JOINTS):
             res_j = joints[j]["residuals"]
             act_j = joints[j]["actual"]
+            tgt_j = joints[j]["target"]
             ss_j  = float(np.sum(res_j ** 2))
-            tot_j = float(np.sum((act_j - act_j.mean()) ** 2))
+            tot_j = float(np.sum((act_j - tgt_j) ** 2))
             per_joint.append({
                 "joint": JOINT_NAMES[j],
                 "rmse":  float(np.sqrt(np.mean(res_j ** 2))),
@@ -329,22 +402,71 @@ def _compute_metrics(eval_data: dict) -> dict:
     return metrics
 
 
+# Channels whose native unit is radians; plots convert these to degrees for
+# readability (a fraction of a radian is hard to eyeball). log.json and
+# runs_summary.csv keep radians -- SI, and what metrics.py/train_rla.py consume.
+_ANGLE_CHANNELS = {"actual_q"}
+
+
+def _plot_units(ch: str) -> tuple[float, str]:
+    """(scale, unit label) to convert a channel's native units for plotting."""
+    if ch in _ANGLE_CHANNELS:
+        return 180.0 / np.pi, "deg"
+    return 1.0, ch.replace("actual_", "")
+
+
+def _annotate_bars(ax, bars, values, fmt: str = "{:.4f}") -> None:
+    """Value labels above (below, for negative bars) each bar.
+
+    Shared by every per-joint bar chart in this file so the annotation offset
+    and font stay identical; the offset scales with the data's own range so it
+    reads right whether the chart is R² (~[-1, 1]) or an RMSE in degrees.
+    """
+    span = max((abs(v) for v in values), default=1.0) or 1.0
+    for bar, val in zip(bars, values):
+        va     = "bottom" if val >= 0 else "top"
+        offset = 0.015 * span * (1 if val >= 0 else -1)
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + offset,
+                fmt.format(val), ha="center", va=va, fontsize=8)
+
+
 def _plot_residuals(eval_data: dict, metrics: dict, channels: list, run_dir: str):
+    """General overview: one pooled histogram plus every joint's residual
+    distribution overlaid on top of it.
+
+    The pooled histogram (grey, behind) is the "how's the model doing overall"
+    number; the overlaid per-joint outlines (density-normalized, so a joint
+    with fewer rows isn't dwarfed) let you spot at a glance whether the overall
+    number is being carried by one joint or is representative of all six. See
+    ``_plot_residuals_per_joint`` for each joint's own x-scale, since a wrist
+    joint's spread can be too small to read here next to the shoulder's.
+    """
+    ur_style.apply()
     for ch in channels:
-        ch_short = ch.replace("actual_", "")
-        all_res  = np.concatenate([eval_data[ch][j]["residuals"] for j in range(N_JOINTS)])
+        scale, unit = _plot_units(ch)
+        all_res  = np.concatenate([eval_data[ch][j]["residuals"] for j in range(N_JOINTS)]) * scale
         ovr      = metrics[ch]["overall"]
-        fig, ax  = plt.subplots(figsize=(8, 5))
-        ax.hist(all_res, bins=60, edgecolor="black", alpha=0.7, color="steelblue")
-        ax.axvline(0, color="red", linestyle="--", linewidth=1.2, label="zero error")
-        ax.set_xlabel(f"Residual ({ch_short})")
-        ax.set_ylabel("Count")
+        fig, ax  = plt.subplots(figsize=(9, 5.5))
+        ax.hist(all_res, bins=60, color=ur_style.GRID, edgecolor=ur_style.GRAY,
+                label="all joints (pooled)")
+        ax2 = ax.twinx()
+        for j in range(N_JOINTS):
+            res_j  = eval_data[ch][j]["residuals"] * scale
+            rmse_j = metrics[ch]["per_joint"][j]["rmse"] * scale
+            ax2.hist(res_j, bins=60, histtype="step", density=True, linewidth=1.4,
+                     label=f"{JOINT_NAMES[j]} (RMSE={rmse_j:.4f})")
+        ax2.set_yticks([])
+        ax.axvline(0, color=ur_style.GRAY, linestyle="--", linewidth=1.2, label="zero error")
+        ax.set_xlabel(f"Residual ({unit})")
+        ax.set_ylabel("Count (pooled)")
         ax.set_title(
             f"Residuals — {ch}\n"
-            f"RMSE={ovr['rmse']:.4f}  R²={ovr['r2']:.4f}  "
+            f"Overall RMSE={ovr['rmse'] * scale:.4f}  R²={ovr['r2']:.4f}  "
             f"mean={float(np.mean(all_res)):.4f}  std={float(np.std(all_res)):.4f}"
         )
-        ax.legend()
+        h1, l1 = ax.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax.legend(h1 + h2, l1 + l2, fontsize=7, loc="upper right")
         fig.tight_layout()
         path = os.path.join(run_dir, f"residuals_{ch}.png")
         fig.savefig(path, dpi=150)
@@ -352,55 +474,105 @@ def _plot_residuals(eval_data: dict, metrics: dict, channels: list, run_dir: str
         print(f"[results] plot -> {path}")
 
 
-def _plot_per_joint_rmse(metrics: dict, channels: list, run_dir: str):
+def _plot_residuals_per_joint(eval_data: dict, metrics: dict, channels: list, run_dir: str):
+    """Per-joint detail: one histogram per joint, each on its own x-scale.
+
+    Complements ``_plot_residuals``'s pooled/overlaid view -- a joint whose
+    residuals are much smaller than the others (e.g. a wrist next to the
+    shoulder) is illegible there but has full resolution here, including
+    whether its distribution is centered on zero or biased.
+    """
+    ur_style.apply()
     for ch in channels:
-        ch_short   = ch.replace("actual_", "")
-        ovr        = metrics[ch]["overall"]
-        joint_rmse = [metrics[ch]["per_joint"][j]["rmse"] for j in range(N_JOINTS)]
-        fig, ax    = plt.subplots(figsize=(9, 5))
-        bars = ax.bar(JOINT_NAMES, joint_rmse, color="steelblue", edgecolor="black")
-        ax.axhline(ovr["rmse"], color="red", linestyle="--", linewidth=1.2,
-                   label=f"Overall RMSE={ovr['rmse']:.4f}")
-        for bar, val in zip(bars, joint_rmse):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1e-4,
-                    f"{val:.4f}", ha="center", va="bottom", fontsize=8)
-        ax.set_xlabel("Joint")
-        ax.set_ylabel(f"RMSE ({ch_short})")
-        ax.set_title(f"Per-joint RMSE — {ch}")
-        ax.tick_params(axis="x", rotation=20)
-        ax.legend()
+        scale, unit = _plot_units(ch)
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+        for j in range(N_JOINTS):
+            ax = axes[j // 3][j % 3]
+            res_j = eval_data[ch][j]["residuals"] * scale
+            pj = metrics[ch]["per_joint"][j]
+            ax.hist(res_j, bins=40, edgecolor=ur_style.NAVY, alpha=0.85, color=ur_style.BLUE)
+            ax.axvline(0, color=ur_style.GRAY, linestyle="--", linewidth=1.0)
+            mean_j, std_j = float(np.mean(res_j)), float(np.std(res_j))
+            ax.set_title(
+                f"{JOINT_NAMES[j]}\nRMSE={pj['rmse'] * scale:.4f}  R²={pj['r2']:.4f}  "
+                f"mean={mean_j:.4f}  std={std_j:.4f}", fontsize=9)
+            ax.set_xlabel(f"Residual ({unit})", fontsize=8)
+        fig.suptitle(f"Residuals by joint — {ch}")
         fig.tight_layout()
-        path = os.path.join(run_dir, f"per_joint_rmse_{ch}.png")
+        path = os.path.join(run_dir, f"residuals_per_joint_{ch}.png")
         fig.savefig(path, dpi=150)
         plt.close(fig)
         print(f"[results] plot -> {path}")
 
 
-def _plot_per_joint_r2(metrics: dict, channels: list, run_dir: str):
+def _plot_per_joint_metrics(metrics: dict, channels: list, run_dir: str):
+    """Held-out RMSE and R² per joint, side by side in one figure.
+
+    One combined figure per channel (RMSE left, R² right) rather than two
+    separate files -- matches the comparison plots from the earlier branch's
+    baseline, so a run from here drops next to one of those for an easy
+    side-by-side look.
+    """
+    ur_style.apply()
     for ch in channels:
-        ch_short = ch.replace("actual_", "")
-        ovr      = metrics[ch]["overall"]
-        joint_r2 = [metrics[ch]["per_joint"][j]["r2"] for j in range(N_JOINTS)]
-        fig, ax  = plt.subplots(figsize=(9, 5))
-        bars = ax.bar(JOINT_NAMES, joint_r2, color="steelblue", edgecolor="black")
-        ax.axhline(ovr["r2"], color="red", linestyle="--", linewidth=1.2,
-                   label=f"Overall R²={ovr['r2']:.4f}")
-        ax.axhline(0, color="black", linewidth=0.8)
-        for bar, val in zip(bars, joint_r2):
-            va = "bottom" if val >= 0 else "top"
-            offset = 0.01 if val >= 0 else -0.01
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + offset,
-                    f"{val:.4f}", ha="center", va=va, fontsize=8)
-        ax.set_xlabel("Joint")
-        ax.set_ylabel(f"R² ({ch_short})")
-        ax.set_title(f"Per-joint R² — {ch}")
-        ax.tick_params(axis="x", rotation=20)
-        ax.legend()
+        scale, unit = _plot_units(ch)
+        joint_rmse = [metrics[ch]["per_joint"][j]["rmse"] * scale for j in range(N_JOINTS)]
+        joint_r2   = [metrics[ch]["per_joint"][j]["r2"] for j in range(N_JOINTS)]
+
+        fig, (ax_rmse, ax_r2) = plt.subplots(1, 2, figsize=(14, 5))
+
+        bars = ax_rmse.bar(JOINT_NAMES, joint_rmse, color=ur_style.BLUE, edgecolor=ur_style.NAVY)
+        _annotate_bars(ax_rmse, bars, joint_rmse)
+        ax_rmse.set_ylabel(f"RMSE ({unit})")
+        ax_rmse.set_title(f"Held-out {ch} RMSE per joint")
+        ax_rmse.tick_params(axis="x", rotation=20)
+
+        bar_colors = [ur_style.BLUE if v >= 0 else ur_style.NAVY for v in joint_r2]
+        bars = ax_r2.bar(JOINT_NAMES, joint_r2, color=bar_colors, edgecolor=ur_style.NAVY)
+        ax_r2.axhline(0, color=ur_style.GRAY, linewidth=0.8)
+        _annotate_bars(ax_r2, bars, joint_r2)
+        ax_r2.set_ylabel("R²")
+        ax_r2.set_title(f"Held-out {ch} R² per joint")
+        ax_r2.tick_params(axis="x", rotation=20)
+
         fig.tight_layout()
-        path = os.path.join(run_dir, f"per_joint_r2_{ch}.png")
+        path = os.path.join(run_dir, f"per_joint_metrics_{ch}.png")
         fig.savefig(path, dpi=150)
         plt.close(fig)
         print(f"[results] plot -> {path}")
+
+
+def _plot_coefficients(model: DistillModel, run_dir: str):
+    """Bar chart of a linear model's fitted weights, one subplot per joint.
+
+    Skipped (with a print, not an error) for a model whose ``coefficients()``
+    returns ``None`` -- e.g. a non-linear regressor has no per-feature weight
+    to show, so there's nothing useful to plot here.
+    """
+    coefs = model.coefficients()
+    if coefs is None:
+        print(f"[results] coefficients plot skipped -- {type(model).__name__} "
+              "has no linear coefficients to show")
+        return
+    ur_style.apply()
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    for j in range(N_JOINTS):
+        joint = JOINT_NAMES[j]
+        feature_names, weights = coefs[joint]
+        ax = axes[j // 3][j % 3]
+        bar_colors = [ur_style.BLUE if w >= 0 else ur_style.NAVY for w in weights]
+        bars = ax.bar(feature_names, weights, color=bar_colors, edgecolor=ur_style.NAVY)
+        ax.axhline(0, color=ur_style.GRAY, linewidth=0.8)
+        _annotate_bars(ax, bars, weights, fmt="{:+.4f}")
+        ax.set_title(joint)
+        ax.set_ylabel("weight")
+        ax.tick_params(axis="x", rotation=35)
+    fig.suptitle(f"{type(model).__name__} coefficients ({model.predicts()[0]})")
+    fig.tight_layout()
+    path = os.path.join(run_dir, "coefficients.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"[results] plot -> {path}")
 
 
 def _update_summary(model: DistillModel, held_out_metrics: dict,
@@ -419,6 +591,7 @@ def _update_summary(model: DistillModel, held_out_metrics: dict,
     print(f"[results] summary -> {summary_path}")
 
     # comparison plot: RMSE and R² per run for each channel
+    ur_style.apply()
     channels  = model.predicts()
     n_ch      = len(channels)
     x         = list(range(len(summary_df)))
@@ -426,18 +599,19 @@ def _update_summary(model: DistillModel, held_out_metrics: dict,
     fig, axes = plt.subplots(2, n_ch, figsize=(max(6, 4 * len(x)), 8 * n_ch // n_ch),
                              squeeze=False)
     for col, ch in enumerate(channels):
+        scale, unit = _plot_units(ch)
         for row_idx, (metric, color, ylabel) in enumerate(
-            [("rmse", "steelblue", "RMSE"), ("r2", "darkorange", "R²")]
+            [("rmse", ur_style.BLUE, f"RMSE ({unit})"), ("r2", ur_style.MID_BLUE, "R²")]
         ):
             col_name = f"{ch}_{metric}"
             ax = axes[row_idx][col]
             if col_name in summary_df.columns:
-                ax.plot(x, summary_df[col_name], marker="o", color=color)
+                y = summary_df[col_name] * scale if metric == "rmse" else summary_df[col_name]
+                ax.plot(x, y, marker="o", color=color)
                 ax.set_xticks(x)
                 ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=7)
             ax.set_ylabel(ylabel)
             ax.set_title(f"{ch} — held-out {ylabel} over runs")
-            ax.grid(True, alpha=0.3)
     fig.tight_layout()
     path = os.path.join(results_dir, "comparison_plot.png")
     fig.savefig(path, dpi=150)
@@ -445,43 +619,82 @@ def _update_summary(model: DistillModel, held_out_metrics: dict,
     print(f"[results] comparison -> {path}")
 
 
-def log_run(model: DistillModel, train_csvs: list, test_csvs: list,
-            train_recordings, test_recordings,
+def _row_split_eval(model: DistillModel, recordings, holdout: float) -> dict:
+    """Row-level held-out evaluation: pool every row of every joint, mark a
+    deterministic fraction as "test", fit a throwaway model on the rest.
+
+    Matches ``original_train.py``'s split (``step = round(1/holdout)``, every
+    step-th row by index, no RNG). Requires ``model._design(recordings)`` ->
+    ``{joint: (X, y)}`` with ``y = actual_<channel> - target_<channel>`` (what
+    ``PerJointPositionModel`` provides) -- this is not part of the generic
+    ``DistillModel`` interface, so a model without ``_design`` can't use this.
+
+    Returns an eval_data dict shaped like ``_evaluate_model``'s output (so it
+    feeds ``_compute_metrics`` and the plotting functions unchanged): rebuilds
+    "actual"/"target" for the held-out rows from ``target_q`` gathered
+    independently (concatenated over ``recordings`` in the same order
+    ``_design`` iterates them), rather than assuming a feature-column index,
+    so it doesn't silently break if the feature layout changes.
+    """
+    ch = model.predicts()[0]
+    design = model._design(recordings)
+    target_by_joint = {j: np.concatenate([rec.target_q[:, j] for rec in recordings])
+                       for j in range(N_JOINTS)}
+
+    n = len(next(iter(design.values()))[1])
+    step = max(int(round(1 / holdout)), 2)
+    is_test = np.arange(n) % step == 0
+
+    eval_data = {ch: {}}
+    for j, (X, y) in design.items():
+        coef, *_ = np.linalg.lstsq(X[~is_test], y[~is_test], rcond=None)
+        tgt    = target_by_joint[j][is_test]
+        actual = tgt + y[is_test]
+        pred   = tgt + X[is_test] @ coef
+        eval_data[ch][j] = {"pred": pred, "actual": actual, "target": tgt,
+                            "residuals": pred - actual}
+    return eval_data
+
+
+def log_run(model: DistillModel, csvs: list, holdout: float,
+            held_out_eval: dict, in_sample_metrics: dict,
             results_dir: str = None, dt_str: str = None):
     """Log a training run: save log.json, residual plot, per-joint RMSE plot,
     update runs_summary.csv and regenerate the comparison plot.
 
-    Metrics that matter are computed on ``test_recordings`` only — files
-    ``model.fit()`` never saw. ``train_recordings`` are evaluated too and
-    logged as ``in_sample_metrics`` purely as a sanity check: it should
-    always look better than the held-out numbers, and if it doesn't, the fit
-    itself is broken (not a generalization problem).
+    ``held_out_eval`` (from ``_row_split_eval``, a throwaway fit on 80% of the
+    rows) is the honest generalization number. ``in_sample_metrics`` is the
+    *saved* model (refit on 100% of the rows) scored on its own training data
+    -- a sanity check, not a generalization measure: it should look at least
+    as good as the held-out numbers, and if it doesn't, the fit itself is
+    broken.
 
     Args:
-        model:             fitted DistillModel (already fit on train_recordings).
-        train_csvs:        paths passed to model.fit(), for the log.
-        test_csvs:         held-out paths, never passed to fit(), for the log.
-        train_recordings:  Recording objects for train_csvs (preprocessed).
-        test_recordings:   Recording objects for test_csvs (preprocessed).
-        results_dir:       override for RESULTS_DIR.
-        dt_str:            override for the run timestamp (default: now).
+        model:              the DistillModel already refit on 100% of ``csvs``.
+        csvs:                every recording used (train and, in this row-level
+                             split, "test" alike -- see module docstring).
+        holdout:             row fraction used for ``held_out_eval``, for the log.
+        held_out_eval:       from ``_row_split_eval``.
+        in_sample_metrics:   from ``_compute_metrics(_evaluate_model(model, recordings))``.
+        results_dir:         override for RESULTS_DIR.
+        dt_str:              override for the run timestamp (default: now).
     """
     results_dir = results_dir or RESULTS_DIR
     dt_str      = dt_str or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_dir     = os.path.join(results_dir, dt_str)
     os.makedirs(run_dir, exist_ok=True)
 
-    held_out_eval    = _evaluate_model(model, test_recordings)
     held_out_metrics = _compute_metrics(held_out_eval)
-    in_sample_metrics = _compute_metrics(_evaluate_model(model, train_recordings))
 
     log = {
         "datetime":          dt_str,
         "model_class":       type(model).__name__,
         "params":            model.params(),
         "training": {
-            "train_csvs": train_csvs,
-            "test_csvs":  test_csvs,
+            "csvs":    csvs,
+            "holdout": holdout,
+            "split":   "row-level (every ~1/holdout-th row, deterministic); "
+                      "saved model refit on 100% of rows after the held-out check",
         },
         "held_out_metrics":  held_out_metrics,
         "in_sample_metrics": in_sample_metrics,
@@ -496,8 +709,9 @@ def log_run(model: DistillModel, train_csvs: list, test_csvs: list,
     print(f"[results] model -> {model_path}")
 
     _plot_residuals(held_out_eval, held_out_metrics, model.predicts(), run_dir)
-    _plot_per_joint_rmse(held_out_metrics, model.predicts(), run_dir)
-    _plot_per_joint_r2(held_out_metrics, model.predicts(), run_dir)
+    _plot_residuals_per_joint(held_out_eval, held_out_metrics, model.predicts(), run_dir)
+    _plot_per_joint_metrics(held_out_metrics, model.predicts(), run_dir)
+    _plot_coefficients(model, run_dir)
     summary_row = {ch: m["overall"] for ch, m in held_out_metrics.items()}
     _update_summary(model, summary_row, results_dir, dt_str)
     print(f"[results] run complete -> {run_dir}")
@@ -505,60 +719,52 @@ def log_run(model: DistillModel, train_csvs: list, test_csvs: list,
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Fit a DistillModel on a fixed train set and report error "
-                    "on a fixed, disjoint test set (see module docstring). The "
-                    "split defaults are the same no matter which --model or "
-                    "Preprocess (preprocess.default_preprocess) is active, so "
-                    "runs stay comparable.")
-    ap.add_argument("--train-csvs", nargs="+", default=DEFAULT_TRAIN_CSVS,
-                    help="recordings model.fit() sees (default: %(default)s)")
-    ap.add_argument("--test-csvs", nargs="+", default=DEFAULT_TEST_CSVS,
-                    help="held-out recordings, never passed to fit(); the "
-                        "printed/plotted/logged metrics come from these "
-                        "(default: %(default)s)")
-    ap.add_argument("--model", choices=sorted(MODELS), default="linear",
+        description="Fit a DistillModel on all recorded runs (original_train.py's "
+                    "methodology): hold out a row-level fraction to report error, "
+                    "then refit on 100% of the rows and save that. See the module "
+                    "docstring for the row-level-split caveat.")
+    ap.add_argument("--csvs", nargs="+", default=DEFAULT_CSVS,
+                    help="recordings to train on (default: all of them)")
+    ap.add_argument("--holdout", type=float, default=DEFAULT_HOLDOUT,
+                    help="row fraction held out for the printed/plotted/logged "
+                        "error report (default: %(default)s); the saved model "
+                        "is refit on 100%% of the rows regardless")
+    ap.add_argument("--model", choices=sorted(MODELS), default="linear_per_joint",
                     help="DistillModel to train (default: %(default)s)")
     ap.add_argument("--out", default="models/distill.pkl", help="pickle path")
     args = ap.parse_args()
-
-    overlap = set(args.train_csvs) & set(args.test_csvs)
-    if overlap:
-        raise SystemExit(f"--train-csvs and --test-csvs overlap, the test set "
-                          f"would not be held out: {sorted(overlap)}")
 
     # Import under the real module name (not "__main__") so the saved pickle
     # loads cleanly in train_rla.py and run.py.
     from train_distillation_model import MODELS as _MODELS
     from analysis import Recording
 
-    # Preprocess train and test the same way the model will see them later.
     pre = default_preprocess()
-    train_recordings = [Recording(r.path, df=pre.transform_distill(r.df))
-                        for r in (Recording(p) for p in args.train_csvs)]
-    test_recordings  = [Recording(r.path, df=pre.transform_distill(r.df))
-                        for r in (Recording(p) for p in args.test_csvs)]
+    recordings = [Recording(r.path, df=pre.transform_distill(r.df))
+                 for r in (Recording(p) for p in args.csvs)]
 
     model = _MODELS[args.model]()
-    model.fit(train_recordings)
-    print(f"trained {type(model).__name__} on {len(train_recordings)} run(s): "
-          f"{[os.path.basename(p) for p in args.train_csvs]}")
 
-    held_out_metrics = _compute_metrics(_evaluate_model(model, test_recordings))
-    print(f"held-out on {len(test_recordings)} run(s) never seen by fit(): "
-          f"{[os.path.basename(p) for p in args.test_csvs]}")
+    held_out_eval    = _row_split_eval(model, recordings, args.holdout)
+    held_out_metrics = _compute_metrics(held_out_eval)
+    n_rows  = len(next(iter(held_out_eval[model.predicts()[0]].values()))["actual"])
+    print(f"row-level held-out ({args.holdout:.0%} of rows, {n_rows} rows/joint) "
+          f"from {len(recordings)} run(s): {[os.path.basename(p) for p in args.csvs]}")
     for ch, m in held_out_metrics.items():
         ovr = m["overall"]
         print(f"  {ch}: RMSE={ovr['rmse']:.4f}  R2={ovr['r2']:.4f}")
         for pj in m["per_joint"]:
             print(f"    {pj['joint']:10s} RMSE={pj['rmse']:.4f}  R2={pj['r2']:.4f}")
 
+    # Refit on 100% of the rows -- this is the model that ships.
+    model.fit(recordings)
+    in_sample_metrics = _compute_metrics(_evaluate_model(model, recordings))
     model.save(args.out)             # models/distill.pkl — "latest" for pipeline defaults
-    print(f"saved {args.out}")
+    print(f"refit on 100% of {len(recordings)} run(s), saved {args.out}")
 
     # Log this run: save results/<datetime>/{log.json, model, plots} and update summary.
     dt_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_run(model, args.train_csvs, args.test_csvs, train_recordings, test_recordings,
-            dt_str=dt_str)
+    log_run(model, args.csvs, args.holdout, held_out_eval, in_sample_metrics, dt_str=dt_str)
 
 
 if __name__ == "__main__":

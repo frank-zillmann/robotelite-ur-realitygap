@@ -73,18 +73,23 @@ class Recording:
         """
         import matplotlib.pyplot as plt
 
+        import ur_style
+        ur_style.apply()
+
         name = JOINT_NAMES[joint]
         gap = self.current_gap(joint)
         fig, (ax_c, ax_g) = plt.subplots(2, 1, figsize=(9, 6), sharex=True)
 
-        ax_c.plot(self.t, self.target_current[:, joint], label="target current", lw=2)
-        ax_c.plot(self.t, self.actual_current[:, joint], label="actual current", lw=1)
+        ax_c.plot(self.t, self.target_current[:, joint], label="target current",
+                 color=ur_style.BLUE, lw=2)
+        ax_c.plot(self.t, self.actual_current[:, joint], label="actual current",
+                 color=ur_style.MID_BLUE, lw=1)
         ax_c.set_ylabel("current (A)")
         ax_c.set_title(f"{name} joint")
         ax_c.legend(loc="best")
 
-        ax_g.plot(self.t, gap, color="tab:red", lw=1)
-        ax_g.axhline(0, color="grey", lw=0.8)
+        ax_g.plot(self.t, gap, color=ur_style.NAVY, lw=1)
+        ax_g.axhline(0, color=ur_style.GRAY, lw=0.8)
         ax_g.set_ylabel("actual - target (A)")
         ax_g.set_xlabel("time (s)")
 
@@ -131,6 +136,9 @@ def log_analysis(rec, joint: int, stats: list, csv_path: str,
         json.dump(log, f, indent=2)
     print(f"[results] log  -> {log_path}")
 
+    import ur_style
+    ur_style.apply()
+
     # ---- single-joint current plot -------------------------------------------
     fig = rec.plot(joint)
     plot_path = os.path.join(run_dir, f"current_{JOINT_NAMES[joint]}.png")
@@ -144,12 +152,12 @@ def log_analysis(rec, joint: int, stats: list, csv_path: str,
     pos_err  = [s["pos_err_mrad"] for s in stats]
 
     fig2, axes = plt.subplots(1, 3, figsize=(14, 4))
-    for ax, vals, title, ylabel, color in [
-        (axes[0], gap_rms, "Current gap RMS",     "A",    "steelblue"),
-        (axes[1], gap_max, "Current gap max |A|", "A",    "darkorange"),
-        (axes[2], pos_err, "Position error RMS",  "mrad", "purple"),
+    for ax, vals, title, ylabel in [
+        (axes[0], gap_rms, "Current gap RMS",     "A"),
+        (axes[1], gap_max, "Current gap max |A|", "A"),
+        (axes[2], pos_err, "Position error RMS",  "mrad"),
     ]:
-        bars = ax.bar(names, vals, color=color, edgecolor="black")
+        bars = ax.bar(names, vals, color=ur_style.BLUE, edgecolor=ur_style.NAVY)
         for bar, v in zip(bars, vals):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
                     f"{v:.3f}", ha="center", va="bottom", fontsize=7)
