@@ -439,8 +439,13 @@ def _rolling_mean(x: list, w: int) -> list:
 
 def log_training_run(mode: str, scripts: list, steps: int, agent_path: str,
                      callback: _TrainCallback, results_dir: str, dt_str: str,
-                     agent_versioned: str = None):
-    """Save log.json, training_curve.png, and update runs_summary_rla.csv."""
+                     agent_versioned: str = None, seed: int = None):
+    """Save log.json, training_curve.png, and update runs_summary_rla.csv.
+
+    ``seed`` is recorded (not just used) so a later run-to-run comparison can
+    tell whether two runs used the same seed (a real model/data diff) or
+    different ones (partly just seed noise, see ``train_ppo``).
+    """
     run_dir = os.path.join(results_dir, f"{dt_str}_rla_{mode}")
     os.makedirs(run_dir, exist_ok=True)
 
@@ -466,6 +471,7 @@ def log_training_run(mode: str, scripts: list, steps: int, agent_path: str,
         "mode":              mode,
         "scripts":           scripts,
         "steps":             steps,
+        "seed":              seed,
         "agent_path_latest": agent_path,
         "agent_path":        agent_versioned or agent_path,
         "summary": {
@@ -526,6 +532,7 @@ def log_training_run(mode: str, scripts: list, steps: int, agent_path: str,
         "datetime":         dt_str,
         "mode":             mode,
         "steps":            steps,
+        "seed":             seed,
         "n_episodes":       len(records),
         "best_score":       best_score,
         "final_score_mean": final_score,
@@ -540,14 +547,28 @@ def log_training_run(mode: str, scripts: list, steps: int, agent_path: str,
     print(f"[results] run complete -> {run_dir}")
 
 
-def train_ppo(env, steps: int, out: str, versioned_out: str = None) -> tuple:
+def train_ppo(env, steps: int, out: str, versioned_out: str = None,
+             seed: int = None) -> tuple:
     """Train a PPO agent on an env, save it, and return (agent, callback).
 
     ``out`` is the standard "latest" path (e.g. models/agent_params.zip).
     ``versioned_out`` is an optional second save path for the timestamped copy.
+
+    ``seed`` makes the run reproducible: SB3's ``PPO(seed=...)`` seeds the
+    policy's weight init and its own RNG *and* seeds ``env`` (python/numpy/
+    torch RNG plus the env's own ``np_random``, via
+    ``set_random_seed``->``env.seed``) before the first ``reset()`` --
+    without it, ``_MoveEnv.reset``'s ``self.np_random.integers(...)`` move
+    pick is auto-seeded from OS entropy, so two "identical" runs pick a
+    different sequence of moves and PPO initializes different weights, both
+    contributing unseeded noise on top of whatever a real model change is
+    supposed to show. Comparing two distill models' effect on the trained
+    policy is only meaningful if this noise source is pinned down first --
+    e.g. by rerunning the *same* model/seed pair to see how much the curve
+    naturally wobbles run-to-run before trusting a model-to-model diff.
     """
     cb    = _TrainCallback()
-    agent = PPO("MlpPolicy", env, verbose=0)
+    agent = PPO("MlpPolicy", env, verbose=0, seed=seed)
     agent.learn(total_timesteps=steps, callback=cb)
     agent.save(out)
     if versioned_out:
@@ -584,6 +605,11 @@ def main():
     ap.add_argument("--loop", type=int, default=None,
                     help="repeat each script N times when collecting moves")
     ap.add_argument("--steps", type=int, default=20000, help="PPO timesteps")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="PPO/env RNG seed (default: %(default)s); fix this and "
+                        "everything else to compare two distill models' effect "
+                        "on the trained policy without seed noise confounding "
+                        "it -- see train_ppo's docstring")
     ap.add_argument("--out", default=None,
                     help="agent save path (default: models/agent_<mode>.zip)")
     args = ap.parse_args()
@@ -605,14 +631,14 @@ def main():
     env = Env(model, metric, rec, dyn=dyn, pre=pre)
 
     agent_versioned = os.path.join(run_dir, f"agent_{args.mode}.zip")
-    print(f"mode: {args.mode}   training on {len(env.targets)} segments")
-    _, cb = train_ppo(env, args.steps, out, versioned_out=agent_versioned)
+    print(f"mode: {args.mode}   training on {len(env.targets)} segments   seed: {args.seed}")
+    _, cb = train_ppo(env, args.steps, out, versioned_out=agent_versioned, seed=args.seed)
     print(f"trained PPO ({args.mode}) for {args.steps} steps")
     print(f"  latest   -> {out}")
     print(f"  versioned -> {agent_versioned}")
 
     log_training_run(args.mode, args.scripts, args.steps, out, cb, RESULTS_DIR, dt_str,
-                     agent_versioned=agent_versioned)
+                     agent_versioned=agent_versioned, seed=args.seed)
 
 
 if __name__ == "__main__":
