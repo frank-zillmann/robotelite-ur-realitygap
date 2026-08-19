@@ -1,8 +1,8 @@
 """Shared helpers for the case 2 scripts: constants, robot physics, scripts.
 
 - constants: joint count/names and the CSV column names.
-- `UR10e`: numpy-only kinematics (FK, Jacobian), which motion.py needs to turn
-  the controller's Cartesian speed cap into joint terms.
+- `UR10e`: numpy-only kinematics (FK, Jacobian), plus the speed and acceleration
+  ceilings the controller enforces.
 - URScript helpers: load a `.script`, read/replace its `vel`/`acc` parameters.
 """
 from __future__ import annotations
@@ -152,3 +152,22 @@ def get_param(text: str, name: str) -> float:
 def set_param(text: str, name: str, value: float) -> str:
     """Return the script with `<name>` set to ``value`` (rounded int)."""
     return re.sub(_PARAM.format(name=name), rf"\g<1>{int(round(value))}", text)
+
+
+# What the controller will actually run. Speeds are the UR10e spec sheet (base and
+# shoulder 120 deg/s, the rest 180) and the tool-speed cap the recordings sit on;
+# UR publishes no joint acceleration, so that one is the most the controller was
+# ever seen to command in data/. MARGIN is headroom: these get checked by
+# differentiating target_q, which reads a few percent above the controller's own
+# target_qd channel.
+MARGIN = 1.05
+V_JOINT = np.deg2rad([120, 120, 180, 180, 180, 180]) * MARGIN   # rad/s
+A_JOINT = np.array([25.0, 65.0, 60.0, 45.0, 35.0, 35.0])        # rad/s^2
+V_TCP = 1.35 * MARGIN                                           # m/s
+
+
+def tcp_speed(q, dt: float) -> np.ndarray:
+    """Tool speed (m/s) along a commanded trajectory."""
+    ur = UR10e()
+    qd = np.gradient(np.asarray(q, float), dt, axis=0)
+    return np.array([np.linalg.norm((ur.jacobian(a) @ b)[:3]) for a, b in zip(q, qd)])

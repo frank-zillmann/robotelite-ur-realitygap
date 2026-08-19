@@ -18,7 +18,7 @@ move.
     m.save("models/distill.pkl")
     m.predict(frame)["mean"]["actual_q"]  # what the robot would really do
 
-As a script: train on every run in ``data/``, log to ``runs/``, save the pickle.
+As a script: train on every run in ``data/``, log to ``runs/distill/``, save the pickle.
 
     python train_distillation_model.py --out models/distill.pkl
 """
@@ -209,7 +209,7 @@ class CNNModel(DistillModel):
                              self.val_frac, self.seed)
         ds = train.dataset.dataset # the MoveDataset behind the Subset
         self.stats, self.train_dt = ds.stats, ds.dt
-        run = f"runs/{time.strftime('%Y%m%d-%H%M%S')}"
+        run = f"runs/distill/{time.strftime('%Y%m%d-%H%M%S')}"
         print(f"{len(train.dataset)} train / {len(val.dataset)} val moves, receptive "
               f"field {self.pad + 1} rows ({(self.pad + 1) * self.train_dt:.2f} s)\n"
               f"logging to {run}, watch with: tensorboard --logdir runs")
