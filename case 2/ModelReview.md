@@ -134,24 +134,78 @@ model's behavior.
 
 ## 3. Feature engineering
 
-`FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "gravity_torque", "vel", "acc", "bias"]`
-— eight features per joint per row:
+`FEATURE_NAMES = ["target_current", "qd", "qdd", "qdd_lag4", "qdd_lag16", "qdd_lag64", "pos", "gravity_torque", "vel", "acc", "bias"]`
+— eleven features per joint per row:
 
 | feature | source | why it's here |
 |---|---|---|
 | `target_current` | recorded/commanded current | proxy for commanded torque — the physical driver of elastic deflection (torque -> position error), already logged so free to use |
 | `qd` | `target_qd` (commanded velocity) | tracking lag and settle-window ring both scale with how fast the joint is being driven |
 | `qdd` | `np.gradient(qd, dt)` | commanded acceleration — same reasoning, and a proxy for the torque term `M(q)qdd` |
+| `qdd_lag4`, `qdd_lag16`, `qdd_lag64` | `qdd` held 4/16/64 samples in the past (~31/125/500 ms at ~128 Hz), causal, per-recording — see below | history taps aimed at the settle-window ring — see below |
 | `pos` | `target_q` | commanded angle — the residual's reference point, and the input `gravity_torque` (below) is computed from; other pose-dependent physics (inertia at this pose) still isn't computed, see §7 |
 | `gravity_torque` | `utils.UR10e.gravity(target_q)[joint]` | direct physical driver of static deflection — see below |
 | `vel`, `acc` | the raw `movej` register values (not the realized `qd`/`qdd`) | the *commanded profile shape*, independent of what was actually achieved |
 | `bias` | constant 1 | per-joint intercept, see §2 |
 
 This is the same feature basis the old current-predicting baseline used
-(plus `gravity_torque`), carried over for the position target largely
-unchanged — it has **not** been re-justified from scratch for position the
-way the split/metric/model-shape decisions above were. That re-justification
-is open work; see §6.
+(plus `gravity_torque` and the `qdd_lag*` taps), carried over for the
+position target largely unchanged — it has **not** been re-justified from
+scratch for position the way the split/metric/model-shape decisions above
+were. That re-justification is open work; see §6.
+
+**`qdd_lag4`/`qdd_lag16`/`qdd_lag64`** (added 2026-08-19): three FIR-style
+taps of the commanded acceleration `qdd`, held 4/16/64 samples in the past
+(`train_distillation_model._lag_array`, `PerJointPositionModel.LAG_SAMPLES`).
+This is this project's first per-row feature with *memory* — the settle-
+window ring (a damped oscillation after the commanded motion stops, ~0.3-0.5s
+to decay, `bronze_tier/trajectories/worst_move_test-4_shoulder.png`) is a
+dynamic, history-dependent effect that no purely instantaneous feature
+(static pose, current velocity/acceleration/current) can explain, no matter
+how many of those are added — see the "not yet done" item this replaces,
+carried in this file's §7 since gravity was added.
+
+Design constraints, both load-bearing (see `_lag_array`/`_lag_block`
+docstrings):
+
+- **Causal only.** Row `i`'s lag features look only at rows before `i`.
+- **Per-recording, computed before pooling.** Lagging must happen on one
+  recording's own `(n, N_JOINTS)` `qdd` array, *before* `_design` stacks rows
+  across recordings — lagging the pooled/concatenated array would leak the
+  tail of one file into the start of the next.
+- **Commanded signal only, never `actual_q`.** `predict()` runs on sim
+  trajectories where `actual_*` reads 0.0/is unknown ahead of time, so the
+  history has to come from the same `target_qd`-derived quantities every
+  other feature already uses, or the feature would be unusable at inference
+  time (this is also why `qdd`, not `actual_q`'s derivative, is what gets
+  lagged).
+- **3 log-spaced taps, not one per sample.** Covering the ring's ~0.3-0.5s
+  decay at ~128 Hz densely (one tap per sample) would mean ~40-64 nearly
+  collinear columns for a smooth signal; 3 taps log-spaced across that range
+  (4/16/64 samples) is a coarse, cheap first cut, not a fitted model of the
+  oscillation itself — see below for what a fitted decaying-oscillation term
+  would look like instead.
+
+**Result** (held-out row-level, `results/2026-08-19_20-53-55/` linear,
+`results/2026-08-19_20-55-23/` tree; both vs. the previous gravity-only run):
+
+| joint | linear R² (w/o lag) | linear R² (w/ lag) | tree R² (w/o lag) | tree R² (w/ lag) |
+|---|---|---|---|---|
+| overall | 0.445 | **0.613** | 0.883 | **0.921** |
+| base | 0.725 | 0.737 | 0.734 | 0.787 |
+| shoulder | 0.398 | **0.597** | 0.914 | **0.951** |
+| elbow | 0.462 | 0.487 | 0.637 | **0.704** |
+| wrist1 | 0.914 | 0.917 | 0.834 | 0.840 |
+| wrist2 | 0.840 | 0.841 | 0.798 | 0.807 |
+| wrist3 | 0.022 | 0.028 | 0.147 | 0.171 |
+
+Moved almost exactly where the hypothesis predicted: **shoulder — the joint
+with the biggest observed ring — gained the most** on both models (linear
++0.20, tree +0.04, already near its ceiling), elbow gained meaningfully on
+the tree (+0.07), and wrist1/wrist2/base (small rings, per §3's earlier
+gravity discussion) moved only slightly, consistent with a real dynamic
+effect being captured rather than noise. wrist3 stayed at its noise floor
+(§6), as expected. Full current numbers in §6.
 
 **`gravity_torque`** (added 2026-08-19): `utils.UR10e.gravity(q)` returns all
 six joints' torques from one full-pose call — a joint's own `pos` alone
@@ -191,17 +245,8 @@ is the concrete case for showing *standardized* coefficients
 (`coef_j × std(feature_j)`, comparable across features regardless of native
 units) instead of raw ones — proposed, not yet implemented; see §7.
 
-**Still not in here, with the evidence for adding it:**
+~~Lag/history features~~ — done, see the `qdd_lag*` writeup above (2026-08-19).
 
-- **Lag/history features.** The settle-window "ring" (a damped oscillation
-  after the commanded motion stops, ~0.3-0.5 s to decay,
-  `bronze_tier/trajectories/worst_move_test-4_shoulder.png`) has memory — a
-  memoryless per-row linear model structurally cannot reproduce it, no
-  matter what pose-dependent (static) feature you add. Recent `qd`/`qdd`/
-  jerk history, or a decaying-oscillation term, is the fix — this is also
-  why shoulder/elbow's R² is still the weakest among the "real" (non-noise-
-  floor) joints even after `gravity_torque`: gravity is a static term and
-  has nothing to say about a dynamic, history-dependent effect.
 ~~Feature scaling~~ — checked and it's a non-issue for this model: plain OLS
 (`lstsq`, no regularization) is invariant to per-column rescaling, it just
 rescales the corresponding coefficient — RMSE/R² come out identical either
@@ -281,62 +326,62 @@ an unseen run. Measured effect on this data: row-level held-out R²=0.437 vs.
 the stricter file-level split's 0.432 — a small optimistic bias in this case,
 but worth stating whenever these numbers are reported.
 
-## 6. Current results (last run: 2026-08-19, `results/2026-08-19_13-59-27/`)
+## 6. Current results (last run: 2026-08-19, `results/2026-08-19_20-53-55/` linear,
+`results/2026-08-19_20-55-23/` tree)
 
 7 files, 20% row holdout (216,099 held-out rows/joint). With `gravity_torque`
-(previous run without it in parentheses):
++ the `qdd_lag4/16/64` history taps (previous gravity-only run without lag in
+parentheses):
 
 | joint | held-out RMSE (deg) | held-out R² |
 |---|---|---|
-| overall | 0.0242 | 0.445 (was 0.437) |
-| base | 0.0076 | 0.725 (unchanged) |
-| shoulder | 0.0561 | 0.398 (was 0.388) |
-| elbow | 0.0153 | 0.462 (was 0.462) |
-| wrist1 | 0.0053 | 0.914 (was 0.913) |
-| wrist2 | 0.0035 | 0.840 (was 0.833) |
-| wrist3 | 0.0019 | 0.022 (unchanged) |
+| overall | 0.0201 | **0.613** (was 0.445) |
+| base | 0.0075 | 0.737 (was 0.725) |
+| shoulder | 0.0460 | **0.597** (was 0.398) |
+| elbow | 0.0150 | 0.487 (was 0.462) |
+| wrist1 | 0.0052 | 0.917 (was 0.914) |
+| wrist2 | 0.0035 | 0.841 (was 0.840) |
+| wrist3 | 0.0019 | 0.028 (was 0.022) |
 
 In-sample (100%-refit model, scored on its own training data) matches the
-held-out numbers almost exactly (e.g. overall R²=0.445 vs 0.445) — the
-expected sanity check for this much data, not evidence of good
-generalization (see §5's caveat).
+held-out numbers almost exactly, as before (see §5's caveat).
 
-Reading these: shoulder and elbow — the joints with the largest settle-window
-ring — are still the weakest of the non-noise-floor joints even after adding
-the (static) gravity feature, exactly as §3 predicts: the ring is a dynamic,
-history-dependent effect a static pose feature can't touch. wrist3's R²≈0.02
-is likely near the noise floor — its gap is tiny (RMSE 0.002°) and may be
-dominated by encoder/measurement noise rather than a systematic, learnable
-effect (worth an FFT/autocorrelation check on its residual before spending
-feature-engineering effort there; also consistent with it not moving at all
-when `gravity_torque` was added).
+Reading these: shoulder — the joint with the largest observed settle-window
+ring — gained the most of any joint (R² 0.398→0.597, the biggest single-joint
+jump this file has recorded), exactly what §3's lag-feature hypothesis
+predicted. elbow gained more modestly (0.462→0.487); wrist1/wrist2/base
+(small rings) barely moved, and wrist3 stayed at its noise floor — all
+consistent with the taps capturing a real dynamic effect rather than fitting
+noise. Shoulder and elbow are still the weakest non-noise-floor joints,
+though: 3 coarse FIR taps are a first cut, not a fitted model of the ring
+(see §3's design-constraints note) — a decaying-oscillation basis term is the
+likely next step if more of this gap is worth closing.
 
-**Tree vs. linear, both with the same 8 features** (`results/2026-08-19_15-03-35/`
-tree, `.../2026-08-19_14-30-54/` linear; both 20% row holdout, same split).
-The tree column here supersedes the first (no-gravity) comparison — kept
-inline below since the *change* from adding gravity to the tree model is
-itself the interesting result:
+**Tree vs. linear, both with the same 11 features** (`results/2026-08-19_20-55-23/`
+tree, `results/2026-08-19_20-53-55/` linear; both 20% row holdout, same split).
+Previous (pre-lag, gravity-only) numbers in parentheses:
 
-| joint | linear R² | tree R² (no gravity) | tree R² (w/ gravity) | linear RMSE (deg) | tree RMSE (deg) |
-|---|---|---|---|---|---|
-| overall | 0.445 | 0.882 | **0.883** | 0.0242 | **0.0111** |
-| base | 0.725 | 0.734 | 0.734 | 0.0076 | 0.0075 |
-| shoulder | 0.398 | 0.913 | **0.914** | 0.0561 | **0.0213** |
-| elbow | 0.462 | 0.630 | **0.637** | 0.0153 | **0.0127** |
-| wrist1 | **0.914** | 0.833 | 0.834 | **0.0053** | 0.0074 |
-| wrist2 | **0.840** | 0.796 | 0.798 | **0.0035** | 0.0039 |
-| wrist3 | 0.022 | 0.148 | 0.147 | 0.0019 | **0.0017** |
+| joint | linear R² | tree R² | linear RMSE (deg) | tree RMSE (deg) |
+|---|---|---|---|---|
+| overall | 0.613 (0.445) | **0.921** (0.883) | 0.0201 (0.0242) | **0.0091** (0.0111) |
+| base | 0.737 (0.725) | **0.787** (0.734) | 0.0075 (0.0076) | 0.0067 (0.0075) |
+| shoulder | 0.597 (0.398) | **0.951** (0.914) | 0.0460 (0.0561) | **0.0160** (0.0213) |
+| elbow | 0.487 (0.462) | **0.704** (0.637) | 0.0150 (0.0153) | **0.0114** (0.0127) |
+| wrist1 | **0.917** (0.914) | 0.840 (0.834) | **0.0052** (0.0053) | 0.0072 (0.0074) |
+| wrist2 | **0.841** (0.840) | 0.807 (0.798) | **0.0035** (0.0035) | 0.0038 (0.0039) |
+| wrist3 | 0.028 (0.022) | 0.171 (0.147) | 0.0019 (0.0019) | **0.0017** (0.0017) |
 
-Not a clean sweep, and worth reading honestly: the tree model is a large win
-on base/shoulder/elbow/wrist3 (shoulder R² more than doubles, from 0.40 to
-0.91, without any lag/history features — trees pick up some of the
-instantaneous nonlinear interaction among `qd`/`qdd`/`target_current`/`pos`
-a linear model structurally can't, even though neither model has been given
-the temporal history the ring actually needs), but **linear still wins on
-wrist1 and wrist2** even now that both models see identical features — so
-this is a genuine regressor difference on those two joints, not a
-missing-feature artifact (the original, untested hypothesis from before
-gravity was added to the tree model). Read together with how little gravity
+Both models improved on every joint after adding the lag taps — the tree's
+overall R² is now 0.921, and its gains are concentrated on the same joints
+the linear model's are (shoulder +0.037, elbow +0.067, base +0.053), which is
+itself evidence the taps carry real signal rather than the tree just having
+more capacity to overfit them: if the taps were noise, a
+`HistGradientBoostingRegressor` would be the model most likely to exploit
+that, and it wouldn't move in the same joint-specific pattern the physically-
+motivated hypothesis predicted. **Linear still wins on wrist1 and wrist2**
+even with identical features on both models — a genuine regressor difference
+on those two joints, not a missing-feature artifact (as already established
+before lag was added, see the entry below). Read together with how little gravity
 moved the tree overall (+0.0015 vs. linear's +0.008, see §2), the likely
 story: wrist1/wrist2's residual is close to a smooth, near-linear function
 of the inputs, which a linear model represents natively and a
@@ -351,9 +396,9 @@ default/shipped model — `--model` default unchanged).
 **Caveat on all of the above, not yet resolved**: these are still row-level
 held-out numbers (§5), and the leakage concern applies *more* to the tree
 model than the linear one. `HistGradientBoostingRegressor` has far more
-capacity than a 7-parameter-per-joint linear fit, so it can exploit
+capacity than an 11-parameter-per-joint linear fit, so it can exploit
 "this held-out row's neighbors are in the training set" more effectively —
-the tree's R²=0.88 could be sitting on more leakage-driven optimism than the
+the tree's R²=0.92 could be sitting on more leakage-driven optimism than the
 linear model's (whose row-level-vs-file-level gap was already measured and
 small, §5). Not yet checked for the tree model. The leave-one-file-out CV
 diagnostic (§7) would answer this and is now higher priority than before.
@@ -377,11 +422,14 @@ that doesn't have any.
 ## 7. Not yet done, in priority order
 
 1. ~~Gravity torque feature~~ — done, see §3/§6 (2026-08-19).
-2. **Lag/history features for the settle-window ring** — shoulder (R²=0.40)
-  and elbow (R²=0.46) are the weakest joints that aren't just noise, and
-  they're exactly the joints with the biggest ring. No per-row feature fixes
-  this; needs recent `qd`/`qdd`/jerk at a few lags, or a decaying-oscillation
-  term. Still fits with plain `lstsq`.
+2. ~~Lag/history features for the settle-window ring~~ — done, `qdd_lag4/16/64`
+  FIR taps, see §3/§6 (2026-08-19). Closed most of the gap on shoulder
+  (R² 0.40→0.60 linear, 0.91→0.95 tree) and some on elbow (0.46→0.49 linear,
+  0.64→0.70 tree); shoulder/elbow are still the weakest non-noise-floor
+  joints, so a fitted decaying-oscillation term (rather than 3 fixed FIR
+  taps) is the natural next step if more of this gap is worth closing —
+  demoted to a new item 8 below rather than reopening this one, since the
+  cheap version is done and shipped.
 3. **Standardized coefficients in `coefficients.png`** — cheap, and now
   demonstrated as a real gap (§3): `gravity_torque`'s raw weight rounds to
   `0.0000` in the plot despite measurably improving R², because it's in
@@ -393,11 +441,11 @@ that doesn't have any.
   (§5's caveat); doesn't change what gets shipped.
 5. ~~A non-linear regressor~~ — done, `PerJointTreeModel`, see §2/§6
   (2026-08-19), **out of this list's stated order** (done before item 2, at
-  the user's explicit direction). The predicted caveat held: the tree model
-  still can't see history it isn't given, so it doesn't fix the settle-
-  window ring — shoulder/elbow both improved a lot over linear but item 2
-  (lag features) is still the more direct fix for the ring specifically, and
-  is untested on top of the tree model.
+  the user's explicit direction). The predicted caveat held at the time: the
+  tree model couldn't see history it wasn't given, so gravity alone didn't
+  fix the settle-window ring. Since resolved by item 2 above — the lag taps
+  were added on top of the tree model too (both models share
+  `FEATURE_NAMES`), and both improved together (§6).
 6. ~~`dynamics.Dynamics.frame()` doesn't emit an `actual_q` placeholder
   column~~ — checked (2026-08-19) and it's **not actually needed**: verified
   directly that `utils.set_block` creates brand-new columns correctly (not
@@ -420,9 +468,41 @@ that doesn't have any.
   rescaling/reweighting would make `OBJECTIVE ≈ cycle_time` alone — the
   agent would optimize almost purely for speed, silently dropping the
   vibration-minimization term instead of balancing it.
+8. **A fitted decaying-oscillation term for the ring**, in place of (or
+  alongside) the fixed `qdd_lag*` FIR taps — item 2's taps closed most, not
+  all, of shoulder/elbow's gap to the other joints (§6). Would need the
+  ring's natural frequency/decay estimated first (FFT or autocorrelation on
+  the residual, already useful for confirming wrist3 is noise-floor per §6),
+  then a feature like `e^-t'/τ · sin(ωt')` keyed off time since the commanded
+  move stopped. Still fits with plain `lstsq` if linear-in-the-fitted-basis;
+  lower priority than items 3/4/7 since the FIR taps already captured most of
+  the effect cheaply.
 
 ## Changelog
 
+- **2026-08-19** — Added `qdd_lag4`/`qdd_lag16`/`qdd_lag64` (causal FIR taps
+  of commanded acceleration at 4/16/64 samples in the past, ~31/125/500 ms)
+  to `PerJointPositionModel.FEATURE_NAMES` — this project's first feature
+  with memory, aimed at the settle-window ring a purely instantaneous
+  per-row model structurally can't reproduce (§3). Added `_lag_array` (causal,
+  edge-holds the first `k` rows) and `PerJointPositionModel._lag_block`/
+  `_lag_cols_for_joint` (mirrors `_gravity_block`'s "only pay for what's
+  used" pattern), computed per-recording *before* `_design` pools rows across
+  recordings so lags never cross a file boundary, and built only from
+  `target_qd`-derived history (never `actual_q`, unavailable at `predict()`
+  time on a sim trajectory). `PerJointTreeModel` inherits the new features
+  unchanged (deliberately not overridden, same reasoning as gravity).
+  `PerJointPositionModelNoGravity` deliberately does **not** get them — it's
+  pinned to the historical pre-gravity 7-feature baseline; reran it and
+  confirmed its numbers are bit-for-bit unchanged (R²=0.4368 overall),
+  confirming the lag-feature plumbing doesn't leak into models that don't
+  request it. Results (held-out row-level, `results/2026-08-19_20-53-55/`
+  linear, `results/2026-08-19_20-55-23/` tree): overall R² 0.445→0.613
+  (linear), 0.883→0.921 (tree); shoulder — the joint with the biggest
+  observed ring — gained the most on both (0.398→0.597 linear,
+  0.914→0.951 tree), matching the hypothesis. Added item 8 to §7 (a fitted
+  decaying-oscillation term) as the natural next step if more of
+  shoulder/elbow's remaining gap is worth closing.
 - **2026-08-19** — Corrected §7: the "`dynamics.Dynamics.frame()` needs an
   `actual_q` placeholder" item had been carried forward unverified since
   early in the session (a version of it was actually checked and ruled out

@@ -1,0 +1,122 @@
+{
+  "datetime": "2026-08-19_21-06-24",
+  "model_class": "PerJointTreeModel",
+  "params": {
+    "type": "hist_gradient_boosting_per_joint",
+    "features": [
+      "target_current",
+      "qd",
+      "qdd",
+      "qdd_lag4",
+      "qdd_lag16",
+      "qdd_lag64",
+      "pos",
+      "gravity_torque",
+      "vel",
+      "acc",
+      "bias"
+    ],
+    "random_state": 0,
+    "vel_range": [
+      10.0,
+      939.0
+    ],
+    "acc_range": [
+      0.0,
+      989.0
+    ]
+  },
+  "training": {
+    "csvs": [
+      "data/test-1.csv",
+      "data/test-2.csv",
+      "data/test-3.csv",
+      "data/test-4.csv",
+      "data/test-5.csv",
+      "data/test-6.csv",
+      "data/test-7.csv"
+    ],
+    "holdout": 0.2,
+    "split": "row-level (every ~1/holdout-th row, deterministic); saved model refit on 100% of rows after the held-out check"
+  },
+  "held_out_metrics": {
+    "actual_q": {
+      "overall": {
+        "rmse": 0.00016027799219571668,
+        "r2": 0.9194751974589633
+      },
+      "per_joint": [
+        {
+          "joint": "base",
+          "rmse": 0.0001175332780212179,
+          "r2": 0.7850912342844162
+        },
+        {
+          "joint": "shoulder",
+          "rmse": 0.00028288799519768577,
+          "r2": 0.9498055874731708
+        },
+        {
+          "joint": "elbow",
+          "rmse": 0.00019808450525061233,
+          "r2": 0.70486555966911
+        },
+        {
+          "joint": "wrist1",
+          "rmse": 0.00012553201287097363,
+          "r2": 0.8402853980007917
+        },
+        {
+          "joint": "wrist2",
+          "rmse": 6.63439652698455e-05,
+          "r2": 0.8072449937027311
+        },
+        {
+          "joint": "wrist3",
+          "rmse": 2.995396836510911e-05,
+          "r2": 0.16999574670581563
+        }
+      ]
+    }
+  },
+  "in_sample_metrics": {
+    "actual_q": {
+      "overall": {
+        "rmse": 0.00016129827912571013,
+        "r2": 0.9184517565838668
+      },
+      "per_joint": [
+        {
+          "joint": "base",
+          "rmse": 0.00011625850835768446,
+          "r2": 0.7897221084187921
+        },
+        {
+          "joint": "shoulder",
+          "rmse": 0.0002866797668086925,
+          "r2": 0.9484505141896546
+        },
+        {
+          "joint": "elbow",
+          "rmse": 0.00019824612059041766,
+          "r2": 0.7047248738690445
+        },
+        {
+          "joint": "wrist1",
+          "rmse": 0.00012565346809972474,
+          "r2": 0.8399599965442854
+        },
+        {
+          "joint": "wrist2",
+          "rmse": 6.6435544244944e-05,
+          "r2": 0.8066479409142959
+        },
+        {
+          "joint": "wrist3",
+          "rmse": 2.995796583034136e-05,
+          "r2": 0.16821412784358936
+        }
+      ]
+    }
+  }
+}
