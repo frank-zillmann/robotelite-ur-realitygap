@@ -93,15 +93,14 @@ class DistillModel(ABC):
 
 
 class LinearModel(DistillModel):
-    """Least-squares linear baseline that predicts the actual current.
+    """Least-squares linear baseline that predicts the actual position.
 
-    One linear model per row: for each joint the actual current is
+    One linear model per row: for each joint the actual position (rad) is
     ``w . [target_current, qd, qdd, pos, vel, acc, joint one-hot]``, where
     ``target_current`` is the commanded current the joint is tracking, ``qd`` is
     the commanded velocity (from ``target_qd``), ``qdd`` its time derivative,
     ``pos`` the commanded angle, and ``vel``/``acc`` the raw movej numbers the
-    script commanded. Fit against the measured ``actual_current`` of the real
-    runs.
+    script commanded. Fit against the measured ``actual_q`` of the real runs.
 
     The one-hot joint block gives each joint its own intercept with shared
     slopes; there is no separate bias term (it would be collinear with the
@@ -130,7 +129,7 @@ class LinearModel(DistillModel):
         self.acc_range = None                # (lo, hi) commanded acc seen in training
 
     def predicts(self) -> list[str]:
-        return ["actual_current"]
+        return ["actual_q"]
 
     # --- features -------------------------------------------------------------
 
@@ -152,7 +151,7 @@ class LinearModel(DistillModel):
     # --- fit ------------------------------------------------------------------
 
     def _design(self, recordings) -> tuple[np.ndarray, np.ndarray]:
-        """Stack (features, measured actual_current) over every joint of every run.
+        """Stack (features, measured actual_q) over every joint of every run.
 
         Shared by ``fit`` and the script's held-out error report, so both build
         the feature matrix the same way.
@@ -167,7 +166,7 @@ class LinearModel(DistillModel):
                 X.append(self._row_features(j, rec.target_current[:, j], rec.target_q[:, j],
                                             rec.target_qd[:, j], qdd[:, j],
                                             rec.vel_cmd, rec.acc_cmd))
-                y.append(rec.actual_current[:, j])
+                y.append(rec.actual_q[:, j])
         return np.vstack(X), np.concatenate(y)
 
     def fit(self, recordings) -> "LinearModel":
@@ -193,7 +192,7 @@ class LinearModel(DistillModel):
         for j in range(N_JOINTS):
             out[:, j] = self._row_features(j, ti[:, j], q[:, j], qd[:, j],
                                            qdd[:, j], vel, acc) @ self.coef
-        return {"actual_current": out}
+        return {"actual_q": out}
 
     def bounds(self):
         if self.coef is None:
@@ -211,22 +210,28 @@ def _annotate_bars(ax, bars, values, fmt="{:.3f}"):
 
 
 def plot_per_joint_metrics(rmse: np.ndarray, r2: np.ndarray):
-    """RMSE and R2 of held-out ``actual_current`` predictions, one bar per joint."""
+    """RMSE and R2 of held-out ``actual_q`` predictions, one bar per joint.
+
+    ``rmse`` is taken in radians (as computed in ``main()``) and shown in
+    degrees here -- easier to read than radians, and R2 is already unitless
+    so it needs no conversion.
+    """
     import matplotlib.pyplot as plt
     import ur_style
     ur_style.apply()
 
+    rmse_deg = np.degrees(rmse)
     fig, (ax_rmse, ax_r2) = plt.subplots(1, 2, figsize=(12, 5))
 
-    bars = ax_rmse.bar(JOINT_NAMES, rmse, color=ur_style.BLUE)
-    _annotate_bars(ax_rmse, bars, rmse, "{:.3f} A")
-    ax_rmse.set_ylabel("RMSE (A)")
-    ax_rmse.set_title("Held-out actual_current RMSE per joint")
+    bars = ax_rmse.bar(JOINT_NAMES, rmse_deg, color=ur_style.BLUE)
+    _annotate_bars(ax_rmse, bars, rmse_deg, "{:.3f}°")
+    ax_rmse.set_ylabel("RMSE (deg)")
+    ax_rmse.set_title("Held-out actual_q RMSE per joint")
 
     bars = ax_r2.bar(JOINT_NAMES, r2, color=ur_style.MID_BLUE)
     _annotate_bars(ax_r2, bars, r2, "{:.3f}")
     ax_r2.set_ylabel(r"$R^2$")
-    ax_r2.set_title(r"Held-out actual_current $R^2$ per joint")
+    ax_r2.set_title(r"Held-out actual_q $R^2$ per joint")
 
     for ax in (ax_rmse, ax_r2):
         plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
@@ -252,7 +257,7 @@ def plot_coefficients(model: "LinearModel"):
     _annotate_bars(ax, bars, coef, "{:+.3f}")
     ax.axhline(0, color=ur_style.GRAY, lw=0.8)
     ax.set_ylabel("weight")
-    ax.set_title("LinearModel coefficients (actual_current)")
+    ax.set_title("LinearModel coefficients (actual_q)")
     plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
     fig.tight_layout()
     return fig
@@ -306,7 +311,7 @@ def main():
     model = LinearModel()
 
     # Build the row matrix once (same features as fit) to estimate held-out
-    # error: predict the measured actual_current on held-out rows.
+    # error: predict the measured actual_q on held-out rows.
     X, y = model._design(recordings)
     print(f"{len(y)} rows from {len(recordings)} runs")
 
@@ -317,7 +322,7 @@ def main():
     err = X[is_test] @ coef - y[is_test]
     rmse = float(np.sqrt(np.mean(err ** 2)))
     ss = float(1 - np.sum(err ** 2) / np.sum((y[is_test] - y[is_test].mean()) ** 2))
-    print(f"held-out ({is_test.sum()} rows): actual_current RMSE {rmse:.3f} A   R2 {ss:.3f}")
+    print(f"held-out ({is_test.sum()} rows): actual_q RMSE {rmse:.4f} rad   R2 {ss:.3f}")
     print("coefficients:")
     for name, c in zip(LinearModel.FEATURE_NAMES, coef):
         print(f"  {name:12s} {c:+.4f}")
@@ -334,7 +339,7 @@ def main():
         y_j = y[mask]
         rmse_per_joint[j] = float(np.sqrt(np.mean(err_j ** 2)))
         r2_per_joint[j] = float(1 - np.sum(err_j ** 2) / np.sum((y_j - y_j.mean()) ** 2))
-        print(f"{JOINT_NAMES[j]:10s} {rmse_per_joint[j]:7.3f}A {r2_per_joint[j]:8.3f}")
+        print(f"{JOINT_NAMES[j]:10s} {rmse_per_joint[j]:8.4f}rad {r2_per_joint[j]:8.3f}")
 
     # Refit on everything and save.
     model.fit(recordings)

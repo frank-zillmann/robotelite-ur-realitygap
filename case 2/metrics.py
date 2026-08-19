@@ -46,6 +46,23 @@ class CurrentGapMetric(EvaluationMetric):
         return gap.sum(axis=1)
 
 
+class PositionGapMetric(EvaluationMetric):
+    """Position-tracking gap: ``|actual_q - target_q|`` (rad) summed over joints.
+
+    Same shape as ``CurrentGapMetric`` but reads position instead of current --
+    pair with a ``DistillModel`` that predicts ``actual_q``. Note the scale is
+    very different (~1e-3 rad vs. several A), which matters if this score is
+    combined with a cycle-time term elsewhere (see train_rla.py's OBJECTIVE).
+    """
+
+    def needs(self) -> list[str]:
+        return ["target_q", "actual_q"]
+
+    def per_row(self, df) -> np.ndarray:
+        gap = np.abs(get_block(df, "actual_q") - get_block(df, "target_q"))
+        return gap.sum(axis=1)
+
+
 def add_score(df, metric: EvaluationMetric):
     """Return ``df`` with a ``score`` column from ``metric``.
 

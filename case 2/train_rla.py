@@ -30,19 +30,22 @@ Requires `gymnasium` and `stable-baselines3` (see requirements.txt).
 from __future__ import annotations
 
 import argparse
+import os
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
+from stable_baselines3.common.monitor import Monitor
 
 from analysis import Recording
 from common import segments
 from dynamics import (DEG2RAD, GRID, MAX_JOINT_ACC, MAX_JOINT_SPEED, Dynamics,
                       default_dynamics, trapezoidal)
 from train_distillation_model import DistillModel, augment
-from metrics import CurrentGapMetric, EvaluationMetric, SCORE_COL, add_score
+from metrics import PositionGapMetric, EvaluationMetric, SCORE_COL, add_score
 from preprocess import Identity, Preprocess, default_preprocess
 from utils import ACC_COL, N_JOINTS, SCRIPT_COL, VEL_COL, get_block, set_block
 
@@ -330,11 +333,52 @@ class PathEnv(_MoveEnv):
 
 
 def train_ppo(env, steps: int, out: str):
-    """Train a PPO agent on an env and save it."""
-    agent = PPO("MlpPolicy", env, verbose=0)
+    """Train a PPO agent on an env, save it, and return its per-episode rewards.
+
+    Wraps ``env`` in SB3's ``Monitor`` so training progress can be plotted.
+    This env is a one-step contextual bandit (see module docstring): each
+    episode is one scored candidate move, so "episode reward" is just
+    ``-cost`` for that move, in the same order they were sampled during
+    training.
+    """
+    monitored = Monitor(env)
+    agent = PPO("MlpPolicy", monitored, verbose=0)
     agent.learn(total_timesteps=steps)
     agent.save(out)
-    return agent
+    return agent, monitored.get_episode_rewards()
+
+
+def plot_training_reward(rewards, window: int = 200):
+    """Reward per training episode, plus a rolling mean, over PPO training.
+
+    The raw reward is noisy (one bandit step per episode); the rolling mean is
+    the line to read for whether the policy is actually improving (reward is
+    ``-objective``, so higher/less negative = better).
+    """
+    import matplotlib.pyplot as plt
+    import ur_style
+    ur_style.apply()
+
+    rewards = np.asarray(rewards, dtype=float)
+    episodes = np.arange(1, len(rewards) + 1)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(episodes, rewards, color=ur_style.LIGHT_BLUE, lw=0.5, alpha=0.6,
+            label="reward per episode")
+
+    w = max(1, min(window, len(rewards) // 20 or 1))
+    if len(rewards) >= w:
+        roll = np.convolve(rewards, np.ones(w) / w, mode="valid")
+        ax.plot(episodes[w - 1:], roll, color=ur_style.NAVY, lw=2,
+                label=f"rolling mean ({w} episodes)")
+
+    ax.axhline(0, color=ur_style.GRAY, lw=0.8)
+    ax.set_xlabel("episode (one scored move)")
+    ax.set_ylabel("reward  (-objective; higher = better)")
+    ax.set_title("PPO training reward")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    return fig
 
 
 def build_dataset(model, metric, scripts, robot_ip, loop, pre=None, out=SIM_TO_REAL):
@@ -368,11 +412,15 @@ def main():
     ap.add_argument("--steps", type=int, default=20000, help="PPO timesteps")
     ap.add_argument("--out", default=None,
                     help="agent save path (default: models/agent_<mode>.zip)")
+    ap.add_argument("--no-plot", action="store_true",
+                    help="skip the training-reward plot")
+    ap.add_argument("--no-show", action="store_true",
+                    help="save the plot to results/<timestamp>/ but don't open a window")
     args = ap.parse_args()
     out = args.out or f"models/agent_{args.mode}.zip"
 
     model = DistillModel.load(args.model)
-    metric = CurrentGapMetric()
+    metric = PositionGapMetric()
     pre = default_preprocess()
     rec = build_dataset(model, metric, args.scripts, args.robot_ip, args.loop, pre)
     dyn = default_dynamics(rec)
@@ -380,8 +428,23 @@ def main():
     env = Env(model, metric, rec, dyn=dyn, pre=pre)
 
     print(f"mode: {args.mode}   training on {len(env.targets)} segments")
-    train_ppo(env, args.steps, out)
+    agent, rewards = train_ppo(env, args.steps, out)
     print(f"trained PPO ({args.mode}) for {args.steps} steps, saved {out}")
+    if len(rewards) >= 100:
+        print(f"reward: first 50 eps mean {np.mean(rewards[:50]):.3f}   "
+              f"last 50 eps mean {np.mean(rewards[-50:]):.3f}")
+
+    if not args.no_plot:
+        import matplotlib.pyplot as plt
+
+        out_dir = os.path.join("results", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+        os.makedirs(out_dir, exist_ok=True)
+        fig = plot_training_reward(rewards)
+        fig.savefig(os.path.join(out_dir, "training_reward.png"), dpi=150, bbox_inches="tight")
+        print(f"saved plot -> {out_dir}")
+
+        if not args.no_show:
+            plt.show()
 
 
 if __name__ == "__main__":
