@@ -11,13 +11,13 @@ trajectory directly.
 
 ## The task
 
-The pipeline runs end to end. The work is to make its two models better, so that
-the improvement it predicts survives contact with hardware:
+The pipeline runs end to end. The one model in it is **`DistillModel`**
+(`train_distillation_model.py`): what the robot really does with a commanded
+trajectory. Make it better, then optimize a motion against it, run baseline and
+optimized on the robot, and see whether the predicted improvement survives.
 
-- **`DistillModel`** (`train_distillation_model.py`) — what the robot really does.
-- **`motion.movej`** (`motion.py`) — what the controller commands in the first place.
-
-Then optimize a motion, run baseline and optimized on the robot, and compare.
+What the *controller* does with a script is not modelled at all — `convert.py`
+records it from the controller.
 
 ## Prerequisites
 
@@ -43,20 +43,22 @@ pip install -r requirements.txt
 #    go to runs/, watch them with `tensorboard --logdir runs`)
 python train_distillation_model.py --out models/distill.pkl
 
-# 2. optimize a script's moves against it; writes a servoj path next to the script
-python optimize.py --script scripts/triangle.script --model models/distill.pkl
+# 2. run the script on the controller and keep the trajectory it commanded
+python convert.py --script scripts/triangle.script --out scripts/triangle.path
 
-# 3. run baseline and optimized on the robot, compare
-python send.py --robot-ip 127.0.0.1 --script scripts/triangle.script --loop 10 --out baseline.csv
-python send.py --robot-ip 127.0.0.1 --path scripts/triangle.path --out optimized.csv
+# 3. optimize that path against the model
+python optimize.py --path scripts/triangle.path --model models/distill.pkl
 
-# 4. look at both, and at what the script alone implies
+# 4. run both on the robot and compare
+python send.py --robot-ip 127.0.0.1 --path scripts/triangle.path --out baseline.csv
+python send.py --robot-ip 127.0.0.1 --path scripts/triangle.optimized.path --out optimized.csv
+
+# 5. look at both
 python analysis.py --csv baseline.csv --model models/distill.pkl
 python analysis.py --csv optimized.csv --model models/distill.pkl
-python analysis.py --csv data/test-1.csv --script data/test-1.script --model models/distill.pkl
 ```
 
-Step 3 is the test that matters: if the drop the model predicted holds on hardware,
+Step 4 is the test that matters: if the drop the model predicted holds on hardware,
 the model matched the robot; if not, it was missing something, which sends you back
 to step 1.
 
@@ -68,9 +70,10 @@ to step 1.
 | `send.py` | send a URScript (or a `servoj` path) to the robot, run it, record it |
 | `analysis.py` | `Recording` (shared CSV loader) + a plotly target/actual/script/model viewer |
 | `common.py` | `segments` (split a recording into moves), `features`, and the torch `MoveDataset`/`loaders` |
-| `motion.py` | `movej` (what the controller commands) and `bspline` (what replaces it) |
+| `convert.py` | run a script on the controller, keep the trajectory it commanded, as a path |
+| `motion.py` | the differentiable B-spline, and the speed/acceleration envelope |
 | `train_distillation_model.py` | `DistillModel` interface + `CNNModel`: predict the actual channels |
-| `optimize.py` | differentiate a score through the model down to the spline's control points |
+| `optimize.py` | differentiate a score through the model down to the path's parameters |
 | `utils.py` | constants, UR10e kinematics (FK, Jacobian), URScript load/edit |
 
 `scripts/` holds the URScript motions, `models/` the trained models, `data/` the
@@ -79,21 +82,24 @@ recordings.
 ## How it flows
 
 ```
-control points, T ──► motion.bspline ──► commanded q(t)
-                                              │
-                       common.features (sin/cos q, qd, qdd, qddd)
-                                              │
-                        CNNModel ──► predicted actual q, and its uncertainty
-                                              │
-      loss = |actual - commanded|/base + k·sd  +  α·T/base  +  limits  +  straightness
-                                              │
-                                        .backward()
+URScript ──► the controller ──► recorded target_q          (convert.py)
+                                      │
+   offset, retiming, T ──► reference path + B-spline offset ──► commanded q(t)
+                                      │
+                    common.features (sin/cos q, qd, qdd, qddd)
+                                      │
+                     CNNModel ──► predicted actual q, and its uncertainty
+                                      │
+     loss = |actual - commanded|/base + k·sd + α·T/base + limits + drift
+                                      │
+                                .backward()
 ```
 
-Everything after the control points is torch, so one `backward()` moves both the
-shape of the trajectory and its duration. `T` is a free parameter, so nothing
-fixes how long the move takes — `--alpha` sets what a percent of cycle time is
-worth in percent of tracking error.
+Everything after the parameters is torch, so one `backward()` moves the shape of
+the trajectory, where its time goes, and how long it takes. All three parameter
+groups start at zero, which reproduces the recorded path *exactly* — so the
+optimizer can leave it alone if that is already best, and every number is reported
+against it.
 
 **What runs now (all of it is yours to change):**
 
@@ -104,11 +110,14 @@ worth in percent of tracking error.
   model because the gap is dynamic — the ring-down after a stop is invisible to any
   per-row model. `members=K` makes it a deep ensemble; the disagreement between the
   members is what tells the optimizer where the model is guessing.
-- **`motion.movej`** (`motion.py`): a trapezoidal speed profile along the straight
-  joint-space line, smoothed by a fixed 60 ms box. Its ceilings are identified from
-  the recordings, and the binding one is usually Cartesian: the tool runs at exactly
-  1.35 m/s through the middle of every recorded move. It reproduces the recorded
-  `target_q` to ~22 mrad — see **Known gaps**.
+- **`convert.py`**: runs the script on the controller and keeps `target_q`. Pauses,
+  blends, speed profiles and the Cartesian caps come out exactly right because the
+  controller produced them. The first move is dropped — it is the robot travelling
+  to the script's first waypoint, not part of the cycle.
+- **The parameters** (`optimize.py`): a B-spline offset added to the reference, a
+  monotone retiming that can shrink a pause without slowing a move, and the cycle
+  time. Where the reference stands still it is holding a waypoint, so the path is
+  held ten times harder there — the corners stay put while the moves are free.
 - **The objective** (`optimize.py`): tracking error (with `--k` standard deviations
   of the model's own uncertainty added, so wandering into trajectories the model has
   never seen is not free), cycle time, a penalty for exceeding a joint's ceilings,
@@ -117,23 +126,22 @@ worth in percent of tracking error.
 
 ## Known gaps
 
-- `motion.movej` reproduces the recorded `target_q` to about **22 mrad** peak on
-  runs 1–5 and worse on 6–7, which is larger than the reality gap it is supposed to
-  frame (~1–3 mrad). The controller is closed-source; this is an identification, not
-  its code. So the *absolute* baseline number `optimize.py` prints carries that
-  error — the honest comparison is to run both motions on the robot (step 3).
-- The recorded `target_q` and `target_qd` are not consistent with each other:
-  differentiating `target_q` gives ~2% more speed than the `target_qd` channel says.
-  Everything here differentiates `target_q`, and `motion.py`'s caps are calibrated
-  to match it.
-- Each move is optimized on its own, starting from rest. A script whose moves blend
-  into one another is not modelled that way.
-- **The optimizer only wins for `--alpha` below ~0.1.** A trapezoid is time-optimal
-  under an acceleration limit, and a B-spline is smooth, so it cannot match a
-  `movej`'s duration within the same ceilings — it buys accuracy with time. On
-  `scripts/triangle.script` it reaches −7% tracking error for +50% cycle time.
-  Every move now prints its score against the `movej` it replaces, so you can see
-  which way the trade went.
+- `convert.py` needs the controller running and in Remote Control, and it *moves the
+  robot* to record it. On URSim that is free; on hardware, watch the cell.
+- The RTDE recording comes out at ~8.25 ms per row while the model was trained at
+  7.83 ms, so `optimize.py` resamples the reference onto the model's grid. The
+  duration is preserved, only the spacing changes.
+- The tool-speed limit is checked with the Jacobian at the current trajectory,
+  refreshed each step from detached poses: the value is right, the gradient is the
+  speed's alone. Trajectories that stray far from the reference are still worth
+  checking against the printed peak tool speed.
+- The optimizer keeps the best iterate it saw rather than the last one — Adam
+  wanders near the optimum, and the reported numbers are of the path that is
+  actually written out.
+- `--k` adds the model's own uncertainty to the error, which is what stops the
+  optimizer from wandering into trajectories the model has never seen. It is not a
+  substitute for the explicit limit penalty: outside the envelope the model is
+  extrapolating, and a confident wrong answer there costs nothing.
 
 ## Tiers
 

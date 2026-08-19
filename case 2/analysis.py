@@ -1,17 +1,14 @@
 """Interactive plot of a recorded UR run.
 
-Loads a CSV from ``record.py`` and plots up to five sources of one quantity:
+Loads a CSV from ``record.py`` and plots up to three sources of one quantity:
 
     target          what the controller commanded  (target_* columns)
     actual          what the robot measured        (actual_* columns)
-    script          what the URScript alone implies, rebuilt through this repo's
-                    own models (``--script``, see ``script_plan``)
-    model(target)   the distilled model's actual_*, from the recorded commands
-    model(script)   the same, from the rebuilt ones (``--model``), each with a
-                    band of ``--sd-factor`` standard deviations, aleatoric and
-                    with the ensemble's disagreement added
+    model           what the distilled model predicts for those commands
+                    (``--model``), with a band of ``--sd-factor`` standard
+                    deviations, aleatoric and with the ensemble's disagreement added
 
-    python analysis.py --csv data/test-4.csv --script data/test-4.script --model models/distill.pkl --joint 1
+    python analysis.py --csv data/test-4.csv --model models/distill.pkl --joint 1
 
 Only the first ``--max-points`` rows are plotted, at the recording's full rate.
 
@@ -26,16 +23,14 @@ numpy arrays.
 from __future__ import annotations
 
 import argparse
-import re
 
 import numpy as np
 import pandas as pd
 
 from utils import (ACC_COL, JOINT_NAMES, N_JOINTS, SCL_COL, SCRIPT_COL, TIME_COL,
-                   VEL_COL, load_script)
+                   VEL_COL)
 
 TCP_AXES = ("x", "y", "z", "rx", "ry", "rz")
-WAYPOINT_TOL = 0.05       # rad: script waypoint vs the one actually reached
 
 # Quantities the viewer can show: label -> (target base, actual base, unit, component names).
 QUANTITIES = {
@@ -101,118 +96,14 @@ class Recording:
         return None
 
 
-# --- the script as a third data source ---------------------------------------
-
-_VEC = r"\[\s*([-+\d.eE,\s]+?)\s*\]"
-
-
-def _waypoints(text: str) -> list:
-    """Joint waypoint of every ``movej``, in order; ``None`` where unparsable.
-
-    Covers the three forms here: a literal ``movej([...])``, a named pose
-    (``POSE_A = [...]``, scripts/*.script), and the teach-pendant
-    ``movej(get_inverse_kin(..., qnear=P.q))`` whose joints are the ``q=[...]``
-    of ``global P = struct(...)`` (data/test-*.script).
-    """
-    vec = lambda s: np.array([float(v) for v in s.split(",")])
-    named = {}
-    for m in re.finditer(rf"(?:global\s+)?(\w+)\s*=\s*{_VEC}", text):
-        if len(v := vec(m.group(2))) == N_JOINTS:
-            named[m.group(1)] = v
-    for m in re.finditer(rf"(?:global\s+)?(\w+)\s*=\s*struct\([^\n]*?q\s*=\s*{_VEC}", text):
-        if len(v := vec(m.group(2))) == N_JOINTS:
-            named[f"{m.group(1)}.q"] = v
-
-    out = []
-    for m in re.finditer(r"movej\s*\(([^\n]*)", text):
-        arg = m.group(1)
-        if lit := re.match(rf"\s*{_VEC}", arg):
-            out.append(vec(lit.group(1)))
-        elif (nm := re.match(r"\s*([A-Za-z_]\w*)\s*[,)]", arg)) and nm.group(1) in named:
-            out.append(named[nm.group(1)])
-        elif (qn := re.search(r"qnear\s*=\s*([A-Za-z_]\w*)\.q", arg)) \
-                and f"{qn.group(1)}.q" in named:
-            out.append(named[f"{qn.group(1)}.q"])
-        else:
-            out.append(None)
-    return out
-
-
-def script_plan(rec: Recording, script_path: str) -> dict:
-    """What the URScript alone implies, on the recording's clock.
-
-    A third source next to ``target_*`` and ``actual_*``: the distance to
-    ``target_*`` is ``motion.movej``'s error, and to ``actual_*`` that plus the
-    reality gap. Each ``movej`` waypoint is parsed out of the script and rebuilt
-    with ``motion.movej``, laid down where ``script_control_line`` says that move
-    began; between moves the plan holds the waypoint it reached.
-
-    Returns ``{base: (n, N_JOINTS)}``, or ``{}`` if no ``movej`` could be parsed.
-    """
-    from common import segments
-    from motion import movej
-
-    way = _waypoints(load_script(script_path))
-    segs = segments(rec)
-    if not segs or not any(w is not None for w in way):
-        return {}
-
-    # Which movej is which: script_control_line holds the running movej's line, so
-    # its distinct values in order are the movejs in file order -- right even when a
-    # loop runs them repeatedly. Without that column, guess a cyclic offset.
-    lines = sorted({int(rec.scl[s.i0]) for s in segs if rec.scl[s.i0]})
-    if len(lines) == len(way):
-        index = {ln: i for i, ln in enumerate(lines)}
-        pick = lambda k, seg: index.get(int(rec.scl[seg.i0]))
-    else:
-        off = min(range(len(way)),
-                  key=lambda o: sum(float(np.abs(w - rec.target_q[s.i1]).max())
-                                    for k, s in enumerate(segs)
-                                    if (w := way[(k + o) % len(way)]) is not None))
-        pick = lambda k, seg: (k + off) % len(way)
-
-    n = len(rec.t)
-    q = np.repeat(rec.target_q[segs[0].i0][None], n, axis=0)
-    pos = rec.target_q[segs[0].i0].copy()
-    for k, seg in enumerate(segs):
-        mid = pick(k, seg)
-        w = way[mid] if mid is not None else None
-        # `movej(get_inverse_kin(..., qnear=P.q))` names a pose; qnear is only the
-        # seed for the controller's IK, and for some waypoints the solution it picks
-        # is far from it. Where the script disagrees with what was reached, trust
-        # the recording.
-        bad = w is None or np.abs(w - rec.target_q[seg.i1]).max() > WAYPOINT_TOL
-        dest = rec.target_q[seg.i1] if bad else w
-        built = movej(pos, dest, rec.dt, v=seg.vel, a=seg.acc)
-        nxt = segs[k + 1].i0 if k + 1 < len(segs) else n
-        stop = min(seg.i0 + len(built), nxt)
-        q[seg.i0:stop] = built[:stop - seg.i0]
-        q[stop:nxt] = q[stop - 1] if stop > seg.i0 else pos   # hold through the sleep
-        pos = q[max(nxt - 1, 0)].copy()
-
-    qd = np.gradient(q, rec.dt, axis=0)
-    return {"target_q": q, "target_qd": qd,
-            "target_qdd": np.gradient(qd, rec.dt, axis=0)}
-
-
 # --- viewer -------------------------------------------------------------------
 
-COLORS = {"target": "#636efa", "actual": "#ef553b", "script": "#00cc96",
-          "model(target)": "#ab63fa", "model(script)": "#ffa15a"}
+COLORS = {"target": "#636efa", "actual": "#ef553b", "model": "#ab63fa"}
 _rgba = lambda c, a: f"rgba({int(c[1:3], 16)},{int(c[3:5], 16)},{int(c[5:7], 16)},{a})"
 
 
-def _plan_frame(t, plan: dict):
-    """The rebuilt plan as a commanded-trajectory frame a DistillModel can read."""
-    from utils import set_block
-    df = pd.DataFrame({TIME_COL: t})
-    for base, block in plan.items():
-        set_block(df, base, block)
-    return df
-
-
-def view(rec: Recording, plan: dict = None, quantity: str = "angle q", joint: int = 1,
-         model=None, sd_factor: float = 1.0, max_points: int = 5000):
+def view(rec: Recording, quantity: str = "angle q", joint: int = 1, model=None,
+         sd_factor: float = 1.0, max_points: int = 5000):
     """Plotly figure comparing target / actual / script (+ model) for one channel.
 
     Only the first ``max_points`` rows are shown, at the recording's full rate: a
@@ -225,17 +116,15 @@ def view(rec: Recording, plan: dict = None, quantity: str = "angle q", joint: in
     t = rec.t[keep]
     fig = go.Figure()
     for name, block in (("target", rec.channel(t_base)),
-                        ("actual", rec.channel(a_base)),
-                        ("script", (plan or {}).get(t_base))):
+                        ("actual", rec.channel(a_base))):
         if block is not None:
             fig.add_scattergl(x=t, y=block[keep, joint], name=name,
                               line=dict(color=COLORS[name], width=1.5))
 
-    # The distilled model run on the recorded commands and on the script's rebuilt
-    # ones: both predict the actual channel, so they belong next to "actual".
-    for name, df in (("model(target)", rec.df),
-                     ("model(script)", _plan_frame(rec.t, plan) if plan else None)):
-        if df is None or model is None or a_base not in model.predicts():
+    # The distilled model run on the recorded commands: it predicts the actual
+    # channel, so it belongs next to "actual".
+    for name, df in (("model", rec.df),):
+        if model is None or a_base not in model.predicts():
             continue
         # Predicting the shown rows only is exact, not an approximation: the model
         # is causal, so row t never depends on a row after it.
@@ -264,8 +153,6 @@ def view(rec: Recording, plan: dict = None, quantity: str = "angle q", joint: in
 def main():
     ap = argparse.ArgumentParser(description="Interactive plot of a recorded UR run.")
     ap.add_argument("--csv", default="data/test-4.csv", help="recorded run CSV")
-    ap.add_argument("--script", default=None,
-                    help="URScript of the run; adds the rebuilt plan as a third trace")
     ap.add_argument("--quantity", choices=list(QUANTITIES), default="angle q",
                     help="which channel to plot")
     ap.add_argument("--joint", type=int, default=1, choices=range(N_JOINTS),
@@ -282,12 +169,11 @@ def main():
     args = ap.parse_args()
 
     rec = Recording(args.csv)
-    plan = script_plan(rec, args.script) if args.script else {}
     model = None
     if args.model:
         from train_distillation_model import DistillModel      # pulls in torch
         model = DistillModel.load(args.model)
-    view(rec, plan, args.quantity, args.joint, model, args.sd_factor,
+    view(rec, args.quantity, args.joint, model, args.sd_factor,
          args.max_points).show()
 
 
