@@ -398,15 +398,42 @@ that doesn't have any.
   window ring — shoulder/elbow both improved a lot over linear but item 2
   (lag features) is still the more direct fix for the ring specifically, and
   is untested on top of the tree model.
-6. `dynamics.Dynamics.frame()` doesn't emit an `actual_q` placeholder column
-  (only `actual_current`) — relevant once this model needs to run inside
-  `train_rla.py`'s candidate scoring, not for offline training/evaluation.
+6. ~~`dynamics.Dynamics.frame()` doesn't emit an `actual_q` placeholder
+  column~~ — checked (2026-08-19) and it's **not actually needed**: verified
+  directly that `utils.set_block` creates brand-new columns correctly (not
+  just overwrites existing ones), so `train_rla.py`'s `evaluate()` (which
+  calls `model.predict(frame)` then `set_block(frame, base, ...)`) already
+  works on a `Dynamics.frame()` output missing `actual_q*` entirely —
+  `model.predict()` only reads `target_*` columns, never `actual_q`, so
+  nothing needs it to pre-exist. This item had been carried forward in this
+  list without re-verifying; corrected now. Optional, not required: adding
+  an `actual_q{j} = 0.0` placeholder to `frame()` anyway would make the
+  candidate frame's schema match a real recording's before the model runs,
+  for readability — but it fixes nothing that's actually broken.
 7. `train_rla.py`/`run.py` still wired to `CurrentGapMetric`/`actual_current`
   — need to switch to `PositionGapMetric` before they'll run against a model
-  from this file.
+  from this file. **Also needs `SCORE_WEIGHT`/`CYCLE_WEIGHT` (and
+  `PATH_SCORE_WEIGHT`/`PATH_CYCLE_WEIGHT`) reconsidered when this happens**:
+  `CurrentGapMetric`'s score is in amps (order ~1-10 after aggregation),
+  comparable to `cycle_time` in seconds — `PositionGapMetric`'s score is in
+  radians (order ~0.01), 100-500x smaller. Swapping the metric class without
+  rescaling/reweighting would make `OBJECTIVE ≈ cycle_time` alone — the
+  agent would optimize almost purely for speed, silently dropping the
+  vibration-minimization term instead of balancing it.
 
 ## Changelog
 
+- **2026-08-19** — Corrected §7: the "`dynamics.Dynamics.frame()` needs an
+  `actual_q` placeholder" item had been carried forward unverified since
+  early in the session (a version of it was actually checked and ruled out
+  much earlier, but the conclusion never made it back into this file).
+  Re-verified directly (`set_block` creates new columns correctly) and
+  marked it not required. Also added the `SCORE_WEIGHT`/`CYCLE_WEIGHT`
+  scale-mismatch warning to item 7 (`PositionGapMetric`'s score is ~100-500x
+  smaller than `CurrentGapMetric`'s, relative to `cycle_time` — a naive
+  metric swap would silently break the RL objective's balance) — this was
+  flagged in passing back when the metric was first added but never written
+  down as a concrete blocker until now.
 - **2026-08-19** — Added `PerJointPositionModelNoGravity` (`--model
   linear_per_joint_no_gravity`) as a permanent, reproducible ablation
   baseline (7-feature `FEATURE_NAMES` override, nothing else) rather than
