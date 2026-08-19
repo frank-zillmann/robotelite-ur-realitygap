@@ -47,6 +47,7 @@ here again.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import pickle
@@ -62,12 +63,12 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 
 import ur_style
 from preprocess import Identity, Preprocess, default_preprocess
-from utils import (JOINT_NAMES, N_JOINTS, VEL_COL, ACC_COL, UR10e, frame_dt,
+from utils import (JOINT_NAMES, N_JOINTS, VEL_COL, ACC_COL, UR5e, frame_dt,
                    get_block, set_block)
 
 # Shared physics instance for the gravity-torque feature (PerJointPositionModel).
 # payload=0.0 (default): recordings don't log a per-run payload to plug in here.
-_UR10E = UR10e()
+_UR5E = UR5e()
 
 # Fixed seed for PerJointTreeModel's HistGradientBoostingRegressor: its
 # auto-triggered early stopping carves out its own internal validation split,
@@ -79,7 +80,7 @@ _RANDOM_STATE = 0
 def _gravity_block(q: np.ndarray) -> np.ndarray:
     """Gravity torque per joint, ``(n, N_JOINTS)`` Nm, for a whole trajectory.
 
-    ``UR10e.gravity_batch`` takes the full 6-joint pose for every row at once
+    ``UR5e.gravity_batch`` takes the full 6-joint pose for every row at once
     -- the torque on any one joint depends on the pose of the whole chain,
     not just that joint's own angle. Computed once per recording here, not
     once per joint inside ``_design``'s/``predict``'s per-joint loop, since a
@@ -89,7 +90,7 @@ def _gravity_block(q: np.ndarray) -> np.ndarray:
     is bit-identical but ~150x slower over the ~1e6 rows a full training run
     covers (verified: 7.5s vs. several minutes for 1.08M rows).
     """
-    return _UR10E.gravity_batch(q)
+    return _UR5E.gravity_batch(q)
 
 # Train on every recorded run; holdout is a row-level fraction, not a set of
 # held-out files. Matches original_train.py's methodology: pool every row of
@@ -104,7 +105,13 @@ def _gravity_block(q: np.ndarray) -> np.ndarray:
 # interpolation within seen trajectories more than generalization to an
 # unseen run. A file-level split (hold out whole recordings) is the stricter
 # alternative -- see git history for the version of this file that did that.
-DEFAULT_CSVS = [f"data/test-{i}.csv" for i in range(1, 8)]
+# Glob rather than a hardcoded range: the recording count isn't fixed (varies
+# by robot/data-collection session), and a hardcoded range silently drops or
+# errors on files outside it. Sorted lexically -- fine up to 9 files ("test-1"
+# .. "test-9"); re-check this if the set ever reaches double digits ("test-10"
+# would sort before "test-2").
+DEFAULT_CSVS = sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                             "data", "test-*.csv")))
 DEFAULT_HOLDOUT = 0.2
 
 
@@ -192,7 +199,7 @@ class PerJointPositionModel(DistillModel):
 
     Features: ``target_current``, ``qd``, ``qdd``, ``pos``, ``gravity_torque``,
     ``vel``, ``acc``, plus the intercept. ``gravity_torque`` is
-    ``utils.UR10e.gravity(target_q)[joint]`` -- the torque needed to hold the
+    ``utils.UR5e.gravity(target_q)[joint]`` -- the torque needed to hold the
     whole arm against gravity at that instant's commanded pose, Nm. It
     depends on all six joints' angles at once (the torque felt at any one
     joint depends on the pose of the whole chain, not just that joint's own
@@ -216,7 +223,7 @@ class PerJointPositionModel(DistillModel):
     - Add lag features (recent ``qd``/``qdd``/jerk) or a decaying-oscillation
       term to capture the ring -- a linear-in-recent-history model still fits
       with ``lstsq``, a nonlinear one needs a different regressor.
-    - Add ``utils.UR10e.mass_matrix(q)`` (effective inertia at the pose) --
+    - Add ``utils.UR5e.mass_matrix(q)`` (effective inertia at the pose) --
       the other direct physical driver of deflection not yet included.
     - Override ``_row_features`` (kept with a ``(joint, ...)`` signature even
       though this baseline ignores ``joint``) to feed a joint-specific physics

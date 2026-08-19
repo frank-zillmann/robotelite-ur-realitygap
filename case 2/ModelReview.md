@@ -9,7 +9,7 @@ version — that's what the changelog is for).
 ## 1. What we predict
 
 **Position**, not current. `PerJointPositionModel.predicts() -> ["actual_q"]`
-— the actual joint angle (rad) a real UR10e ends up at, given a commanded
+— the actual joint angle (rad) a real UR5e ends up at, given a commanded
 trajectory. Internally it predicts the *residual* `actual_q - target_q` (the
 tracking gap) and adds `target_q` back before returning, so the public
 interface still hands back an absolute angle like any other `DistillModel`.
@@ -142,7 +142,7 @@ model's behavior.
 | `qd` | `target_qd` (commanded velocity) | tracking lag and settle-window ring both scale with how fast the joint is being driven |
 | `qdd` | `np.gradient(qd, dt)` | commanded acceleration — same reasoning, and a proxy for the torque term `M(q)qdd` |
 | `pos` | `target_q` | commanded angle — the residual's reference point, and the input `gravity_torque` (below) is computed from; other pose-dependent physics (inertia at this pose) still isn't computed, see §7 |
-| `gravity_torque` | `utils.UR10e.gravity(target_q)[joint]` | direct physical driver of static deflection — see below |
+| `gravity_torque` | `utils.UR5e.gravity(target_q)[joint]` | direct physical driver of static deflection — see below |
 | `vel`, `acc` | the raw `movej` register values (not the realized `qd`/`qdd`) | the *commanded profile shape*, independent of what was actually achieved |
 | `bias` | constant 1 | per-joint intercept, see §2 |
 
@@ -152,11 +152,11 @@ unchanged — it has **not** been re-justified from scratch for position the
 way the split/metric/model-shape decisions above were. That re-justification
 is open work; see §6.
 
-**`gravity_torque`** (added 2026-08-19): `utils.UR10e.gravity(q)` returns all
+**`gravity_torque`** (added 2026-08-19): `utils.UR5e.gravity(q)` returns all
 six joints' torques from one full-pose call — a joint's own `pos` alone
 isn't enough, since gravity torque on any joint depends on the whole
 kinematic chain's configuration. Computed once per recording (not once per
-joint) via the new `utils.UR10e.gravity_batch` and sliced per joint;
+joint) via the new `utils.UR5e.gravity_batch` and sliced per joint;
 `_gravity_block` in this file wraps that call. **Performance note**: the
 per-row `gravity()` method is not vectorized and is ~150x too slow to call
 in a loop over the ~1e6 rows a training run covers (verified: would have
@@ -474,6 +474,31 @@ distill model itself is still unverified.
 
 ## Changelog
 
+- **2026-08-19** — Switched the whole pipeline from a UR10e to a UR5e (the
+  user's real robot). Renamed `utils.UR10e`→`utils.UR5e`,
+  `dynamics.UR10eDynamics`→`UR5eDynamics`, and the
+  `train_distillation_model.py` singleton `_UR10E`→`_UR5E`
+  (`gravity_torque`'s underlying `gravity_batch` call). Replaced `utils.py`'s
+  DH parameters (`_A`/`_D`/`_ALPHA`) and dynamics parameters
+  (`_MASS`/`_COM`/`_INERTIA`) with UR5e's published values, fetched from
+  Universal Robots' "DH Parameters for calculations of kinematics and
+  dynamics" page (same source family the UR10e numbers came from) — see the
+  comment above `utils.py`'s `_A` for the URL. Cross-checked the UR10e values
+  already in the file against the same page before trusting the fetch (exact
+  match), and confirmed UR5e/UR7e's *inertia tensor* is published as zero for
+  links 1-5 (UR only publishes nonzero link inertia from UR10e upwards — not
+  a fetch error; documented in the `_INERTIA` comment). Verified the new
+  constants structurally (shapes, no NaNs, symmetric/positive-definite mass
+  matrix) — see `utils.py`'s `_INERTIA` comment and the plan's verification
+  section; this does **not** verify the numbers are correct, only sane.
+  Changed `DEFAULT_CSVS` from a hardcoded `range(1,8)` to a sorted glob over
+  `data/test-*.csv` so it adapts to however many UR5 recordings exist,
+  instead of a fixed count. **`data/test-*.csv` still holds the old UR10e
+  recordings as of this entry** — the model has not yet been retrained on
+  real UR5 data; the feature table above (§3) and all results in §6/§8 still
+  describe the UR10e-trained model and predate this switch. Also switched
+  `simulation environment/docker-compose.yml`'s default `ROBOT_TYPE` from
+  `UR10` to `UR5` (`down -v` + `up -d`, confirmed via `docker inspect`).
 - **2026-08-19** — Wired `PositionGapMetric` into `train_rla.py`/`run.py`
   (see §8 for full detail): metric swap, `SCORE_WEIGHT`/`PATH_SCORE_WEIGHT`
   recalibrated from measured score/cycle_time ratios (~2524x, ~20x) rather

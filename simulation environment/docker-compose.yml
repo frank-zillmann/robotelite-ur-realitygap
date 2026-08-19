@@ -28,12 +28,12 @@ services:
     image: universalrobots/ursim_polyscopex:latest
     container_name: essre-ursim-psx
     environment:
-      # Use the INTERNAL controller type (UR10), not the consumer name (UR10e).
+      # Use the INTERNAL controller type (UR5), not the consumer name (UR5e).
       # setup.sh derives ROBOT_TYPE_CONTROLLER from this, so do NOT set
-      # ROBOT_TYPE_CONTROLLER here -- passing "UR10E" to the controller makes it
-      # reject the type ("invalid choice: UR10E") and never boot. Valid values:
+      # ROBOT_TYPE_CONTROLLER here -- passing "UR5E" to the controller makes it
+      # reject the type ("invalid choice: UR5E") and never boot. Valid values:
       # UR3 UR5 UR7e UR10 UR12e UR15 UR16 UR18 UR20 UR30 UR8LONG (+ g variants).
-      - ROBOT_TYPE=${ROBOT_TYPE:-UR10}
+      - ROBOT_TYPE=${ROBOT_TYPE:-UR5}
       - HOST_ARCH=${HOST_ARCH:-arm64}
       - ROS2_NAMESPACE=${ROS2_NAMESPACE:-UR8888}
       - DEVMODE=${DEVMODE:-true}

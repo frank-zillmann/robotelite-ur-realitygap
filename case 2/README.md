@@ -80,13 +80,13 @@ distillation.
 | `send.py` | send a URScript (or a `servoj` path) to the robot, run it, record it |
 | `analysis.py` | `Recording` (shared CSV loader) + per-joint stats and a current plot |
 | `common.py` | `segments`: split a recording into waypoint-to-waypoint moves |
-| `dynamics.py` | `Dynamics` interface + `UR10eDynamics`: candidate target torque/current |
+| `dynamics.py` | `Dynamics` interface + `UR5eDynamics`: candidate target torque/current |
 | `train_distillation_model.py` | `DistillModel` interface + `LinearModel`: predict the actual channels |
 | `metrics.py` | `EvaluationMetric` interface + `CurrentGapMetric`: the per-row `score` to minimize |
 | `preprocess.py` | `Preprocess` interface: reshape data into and out of the learners |
 | `train_rla.py` | Gym envs over the models; trains a PPO agent (`GapEnv` params, `PathEnv` path) |
 | `run.py` | ask the trained agent for a better motion, write the optimized script or path |
-| `utils.py` | constants, UR10e physics (FK, Jacobian, gravity, mass matrix, Coriolis), URScript load/edit |
+| `utils.py` | constants, UR5e physics (FK, Jacobian, gravity, mass matrix, Coriolis), URScript load/edit |
 
 `scripts/` holds the URScript motions, `models/` the trained models, `data/` the
 recordings.
@@ -109,7 +109,7 @@ actuals, `EvaluationMetric` scores them.
   with `--model`. Training always uses the fixed file-level split (`--train-csvs`
   / `--test-csvs`, defaults `DEFAULT_TRAIN_CSVS` / `DEFAULT_TEST_CSVS` at the top
   of the file) so held-out numbers are comparable across models/preprocessing.
-- **`Dynamics`** (`dynamics.py`): `UR10eDynamics`, `tau = M(q)qdd + g(q)`,
+- **`Dynamics`** (`dynamics.py`): `UR5eDynamics`, `tau = M(q)qdd + g(q)`,
   `current = tau/Kt` (Coriolis dropped); `vel`/`acc` deg/s to rad/s. Override
   `current(q, qd, qdd)` for friction, Coriolis, identified parameters.
 - **`EvaluationMetric`** (`metrics.py`): `CurrentGapMetric`, `|actual_current -
@@ -123,7 +123,7 @@ actuals, `EvaluationMetric` scores them.
   `path` action = `[accel_frac, decel_frac, speed]`, replaying the recorded
   trajectory at a trapezoidal speed profile. Change `observe`, the `OBJECTIVE`
   weights, or the action.
-- `utils.UR10e` supplies the robot physics (FK, Jacobian, gravity, mass matrix,
+- `utils.UR5e` supplies the robot physics (FK, Jacobian, gravity, mass matrix,
   Coriolis) for `Dynamics` and as `DistillModel` features.
 
 ## Tiers
@@ -137,5 +137,5 @@ actuals, `EvaluationMetric` scores them.
   the `Dynamics` torque model (friction, Coriolis, identified parameters), and beat
   a fixed baseline's score.
 - **Diamond, push to real:** shape the servoj path (path mode) and transfer to a
-  real UR10e, refit the `DistillModel`/`Dynamics` on the real recordings, and close
+  real UR5e, refit the `DistillModel`/`Dynamics` on the real recordings, and close
   the sim-to-real loop until the robot measurably improves.
