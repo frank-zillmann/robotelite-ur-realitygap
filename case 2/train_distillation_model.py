@@ -33,8 +33,10 @@ from __future__ import annotations
 
 import argparse
 import glob
+import os
 import pickle
 from abc import ABC, abstractmethod
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -199,6 +201,63 @@ class LinearModel(DistillModel):
         return self.vel_range, self.acc_range
 
 
+def _annotate_bars(ax, bars, values, fmt="{:.3f}"):
+    """Print each bar's value above (or below, if negative) the bar itself."""
+    for bar, v in zip(bars, values):
+        y = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width() / 2, y, fmt.format(v),
+                ha="center", va="bottom" if y >= 0 else "top", fontsize=9)
+    ax.margins(y=0.15)
+
+
+def plot_per_joint_metrics(rmse: np.ndarray, r2: np.ndarray):
+    """RMSE and R2 of held-out ``actual_current`` predictions, one bar per joint."""
+    import matplotlib.pyplot as plt
+    import ur_style
+    ur_style.apply()
+
+    fig, (ax_rmse, ax_r2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    bars = ax_rmse.bar(JOINT_NAMES, rmse, color=ur_style.BLUE)
+    _annotate_bars(ax_rmse, bars, rmse, "{:.3f} A")
+    ax_rmse.set_ylabel("RMSE (A)")
+    ax_rmse.set_title("Held-out actual_current RMSE per joint")
+
+    bars = ax_r2.bar(JOINT_NAMES, r2, color=ur_style.MID_BLUE)
+    _annotate_bars(ax_r2, bars, r2, "{:.3f}")
+    ax_r2.set_ylabel(r"$R^2$")
+    ax_r2.set_title(r"Held-out actual_current $R^2$ per joint")
+
+    for ax in (ax_rmse, ax_r2):
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+    fig.tight_layout()
+    return fig
+
+
+def plot_coefficients(model: "LinearModel"):
+    """Bar chart of the fitted LinearModel's per-feature weights.
+
+    Diverging two-tone: BLUE for positive weights, NAVY for negative, so sign
+    reads at a glance without leaving the brand palette.
+    """
+    import matplotlib.pyplot as plt
+    import ur_style
+    ur_style.apply()
+
+    coef = np.asarray(model.coef)
+    colors = [ur_style.BLUE if c >= 0 else ur_style.NAVY for c in coef]
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    bars = ax.bar(LinearModel.FEATURE_NAMES, coef, color=colors)
+    _annotate_bars(ax, bars, coef, "{:+.3f}")
+    ax.axhline(0, color=ur_style.GRAY, lw=0.8)
+    ax.set_ylabel("weight")
+    ax.set_title("LinearModel coefficients (actual_current)")
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+    fig.tight_layout()
+    return fig
+
+
 def augment(model: DistillModel, csv: str, pre: Preprocess = None):
     """Overwrite a recording's actual_* columns with the model's predictions.
 
@@ -229,6 +288,10 @@ def main():
     ap.add_argument("--out", default="models/distill.pkl", help="pickle path")
     ap.add_argument("--holdout", type=float, default=0.2,
                     help="fraction of rows held out for the error report")
+    ap.add_argument("--no-plot", action="store_true",
+                    help="skip the RMSE/R2/coefficient plots entirely")
+    ap.add_argument("--no-show", action="store_true",
+                    help="save plots to results/<timestamp>/ but don't open interactive windows")
     args = ap.parse_args()
 
     # Import under the real module name (not "__main__") so the saved pickle
@@ -259,10 +322,43 @@ def main():
     for name, c in zip(LinearModel.FEATURE_NAMES, coef):
         print(f"  {name:12s} {c:+.4f}")
 
+    # Per-joint held-out RMSE/R2: the last N_JOINTS columns of X are the joint
+    # one-hot, so each row's joint is just its argmax there.
+    joint_idx = X[:, -N_JOINTS:].argmax(axis=1)
+    rmse_per_joint = np.zeros(N_JOINTS)
+    r2_per_joint = np.zeros(N_JOINTS)
+    print(f"{'joint':10s} {'RMSE':>8s} {'R2':>8s}")
+    for j in range(N_JOINTS):
+        mask = is_test & (joint_idx == j)
+        err_j = X[mask] @ coef - y[mask]
+        y_j = y[mask]
+        rmse_per_joint[j] = float(np.sqrt(np.mean(err_j ** 2)))
+        r2_per_joint[j] = float(1 - np.sum(err_j ** 2) / np.sum((y_j - y_j.mean()) ** 2))
+        print(f"{JOINT_NAMES[j]:10s} {rmse_per_joint[j]:7.3f}A {r2_per_joint[j]:8.3f}")
+
     # Refit on everything and save.
     model.fit(recordings)
     model.save(args.out)
     print(f"saved {args.out}")
+
+    if not args.no_plot:
+        import matplotlib.pyplot as plt
+
+        out_dir = os.path.join("results", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+        os.makedirs(out_dir, exist_ok=True)
+
+        fig_metrics = plot_per_joint_metrics(rmse_per_joint, r2_per_joint)
+        fig_metrics.savefig(os.path.join(out_dir, "per_joint_metrics.png"),
+                            dpi=150, bbox_inches="tight")
+
+        fig_coef = plot_coefficients(model)
+        fig_coef.savefig(os.path.join(out_dir, "coefficients.png"),
+                         dpi=150, bbox_inches="tight")
+
+        print(f"saved plots -> {out_dir}")
+
+        if not args.no_show:
+            plt.show()
 
 
 if __name__ == "__main__":

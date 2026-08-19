@@ -67,19 +67,23 @@ class Recording:
         current.
         """
         import matplotlib.pyplot as plt
+        import ur_style
+        ur_style.apply()
 
         name = JOINT_NAMES[joint]
         gap = self.current_gap(joint)
         fig, (ax_c, ax_g) = plt.subplots(2, 1, figsize=(9, 6), sharex=True)
 
-        ax_c.plot(self.t, self.target_current[:, joint], label="target current", lw=2)
-        ax_c.plot(self.t, self.actual_current[:, joint], label="actual current", lw=1)
+        ax_c.plot(self.t, self.target_current[:, joint], label="target current",
+                  color=ur_style.NAVY, lw=2)
+        ax_c.plot(self.t, self.actual_current[:, joint], label="actual current",
+                  color=ur_style.LIGHT_BLUE, lw=1)
         ax_c.set_ylabel("current (A)")
         ax_c.set_title(f"{name} joint")
         ax_c.legend(loc="best")
 
-        ax_g.plot(self.t, gap, color="tab:red", lw=1)
-        ax_g.axhline(0, color="grey", lw=0.8)
+        ax_g.plot(self.t, gap, color=ur_style.MID_BLUE, lw=1)
+        ax_g.axhline(0, color=ur_style.GRAY, lw=0.8)
         ax_g.set_ylabel("actual - target (A)")
         ax_g.set_xlabel("time (s)")
 
