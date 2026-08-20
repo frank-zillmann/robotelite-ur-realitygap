@@ -1,0 +1,28 @@
+{
+  "datetime": "2026-08-20_17-47-34",
+  "type": "run",
+  "mode": "params",
+  "script": "scripts/triangle.script",
+  "distill_model": "models/distill.pkl",
+  "agent": "models/agent_params.zip",
+  "sim_csv": "C:\\Users\\aacom\\Desktop\\SDU Summer School\\robotelite-ur-realitygap\\case 2\\results\\2026-08-20_17-47-34_run_params\\triangle.sim_to_real.csv",
+  "results": {
+    "baseline": {
+      "vel": 57238.48373356924,
+      "acc": 57238.48373356924,
+      "score": 0.00022987132001157505,
+      "cycle_time": 0.5024999999999893
+    },
+    "optimized": {
+      "vel": 68.68083357810974,
+      "acc": 166.72944724559784,
+      "score": 0.0001868588312057722,
+      "cycle_time": 1.0649999999999773
+    },
+    "improvement": {
+      "score_pct": 18.71155079443446,
+      "cycle_time_pct": -111.94029850746269
+    },
+    "output": "scripts/triangle.optimized.script"
+  }
+}
