@@ -119,25 +119,28 @@ def cycle_time(csv: str) -> float:
 
 
 def stats(recs, model, robot):
-    """Print the optimizer's objective for the complete recorded trajectories."""
+    """Print predicted gap and cycle time for the complete recorded trajectories.
+
+    The barrier is an optimization device, not something to score a finished
+    trajectory by (it's already known to respect the limits, or it wouldn't have
+    been sent), so it's evaluated at weight 0 here.
+    """
     import torch
     from optimize import measures, objective
 
     q = [torch.as_tensor(rec.target_q, dtype=torch.float32) for rec in recs]
     times = [cycle_time(rec.path) for rec in recs]
     with torch.no_grad():
-        base_gap, _, _ = measures(model, robot, q[0])
+        base_gap, _, _ = measures(model, robot, q[0], weight=0)
         scale = times[0] / float(base_gap.clamp_min(1e-8))
-        rows = [objective(model, robot, qi, cycle, scale)
+        rows = [objective(model, robot, qi, cycle, scale, weight=0)
                 for qi, cycle in zip(q, times)]
 
     names = [os.path.basename(rec.path) for rec in recs]
     width = max(map(len, names))
-    print(f"  {'run':{width}s} {'gap [mrad]':>12s} {'cycle [s]':>10s} "
-          f"{'barrier':>9s} {'objective':>10s}")
-    for name, cycle, (total, gap, penalty, _) in zip(names, times, rows):
-        print(f"  {name:{width}s} {float(gap) * 1000:12.4f} {cycle:10.3f} "
-              f"{float(penalty):9.4f} {float(total):10.4f}")
+    print(f"  {'run':{width}s} {'gap [mrad]':>12s} {'cycle [s]':>10s} {'objective':>10s}")
+    for name, cycle, (total, gap, _, _) in zip(names, times, rows):
+        print(f"  {name:{width}s} {float(gap) * 1000:12.4f} {cycle:10.3f} {float(total):10.4f}")
 
 
 def view(recs: list, quantity: str = "angle q", joint: int = 1, model=None,
@@ -208,7 +211,7 @@ def main():
                     help="recorded run CSVs; the first is the one the rest are scored against")
     ap.add_argument("--quantity", choices=list(QUANTITIES), default="angle q",
                     help="which channel to plot")
-    ap.add_argument("--joint", type=int, default=1, choices=range(N_JOINTS),
+    ap.add_argument("--joint", type=int, default=0, choices=range(N_JOINTS),
                     help="component 0..5: a joint (base..wrist3), or a Cartesian "
                          "axis (x, y, z, rx, ry, rz) for the TCP quantities")
     ap.add_argument("--model", required=True,

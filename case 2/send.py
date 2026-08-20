@@ -331,10 +331,13 @@ def _record_path_rtde(host, rows, out, dt):
     small per-tick corrections, not an arbitrary jump.
 
     RTDEControlInterface paces ``waitPeriod`` to its own fixed ``frequency``,
-    not to the ``t`` passed to servoJ, so a row's own ``dt`` (uniform, or
-    varying when optimize.py has retimed it) can't be handed to servoJ
-    directly -- the loop ticks at the fixed STREAM_HZ instead, and each row's
-    servoJ call repeats for as many ticks as its own ``dt`` needs.
+    not to the ``t`` passed to servoJ, so a row's own ``dt`` can't be handed to
+    servoJ directly -- the loop ticks at the fixed STREAM_HZ instead, and each
+    row's servoJ call repeats for as many ticks as its own ``dt`` needs
+    (rounded to the nearest tick). Every ``.path`` this pipeline writes is on
+    the uniform DT grid (optimize.py resamples onto it before writing), so
+    that round-trip is exact in practice, one tick per row; the rounding only
+    matters for a ``dt`` that isn't a whole multiple of STREAM_HZ's period.
     """
     import rtde_control    # heavy optional dependency: only needed for this engine
     import rtde_receive

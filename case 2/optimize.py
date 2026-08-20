@@ -23,7 +23,8 @@ STEPS = 2000
 LR = 0.01
 MIN_DT = 0.002
 EXPLOITATION_EXPLORATION_FACTOR = 1.0
-BARRIER_WEIGHT = 10.0
+BARRIER_WEIGHT_START = 10.0
+BARRIER_WEIGHT_END = 0.01
 # A waypoint-to-waypoint step smaller than this isn't a distinct pose worth its own
 # minimum dwell time -- it's below the model's own tracking-error scale (a few mrad),
 # so it is free to shrink towards zero instead of floored at MIN_DT.
@@ -68,7 +69,7 @@ def penalties(q, robot, weight):
     }
 
 
-def measures(model, robot, q, weight=BARRIER_WEIGHT):
+def measures(model, robot, q, weight=BARRIER_WEIGHT_START):
     gap, var = model.gap(q)
     gap_rmse = torch.sqrt((gap.square() + EXPLOITATION_EXPLORATION_FACTOR * var).mean())
     costs = penalties(q, robot, weight)
@@ -76,7 +77,7 @@ def measures(model, robot, q, weight=BARRIER_WEIGHT):
     return gap_rmse, penalty, costs
 
 
-def objective(model, robot, q, cycle_time, cycle_time_per_gap_rmse, weight=BARRIER_WEIGHT):
+def objective(model, robot, q, cycle_time, cycle_time_per_gap_rmse, weight=BARRIER_WEIGHT_START):
     gap_rmse, penalty, costs = measures(model, robot, q, weight)
     cycle_time = torch.as_tensor(cycle_time, dtype=q.dtype, device=q.device)
     total = cycle_time + cycle_time_per_gap_rmse * gap_rmse + penalty
@@ -96,10 +97,12 @@ def optimize(model, q_ref, dt_ref, robot, run=None, start_dt=DT):
         cycle_time_per_gap_rmse = float((base_dt.sum() + start_dt) / baseline.clamp_min(1e-8))
     for step in range(STEPS + 1):
         # The barrier weight starts high (smooth, keeps the path well clear of every
-        # limit) and decays 100x by the end (only a genuine near-limit approach still
-        # costs much, since -log(1-ratio) itself still shoots to infinity there
-        # regardless of weight) -- reuses BARRIER/STEPS, no extra hyperparameter.
-        weight = BARRIER_WEIGHT * (1 - 0.99 * step / STEPS)
+        # limit) and decays to a thousandth of that by 80% of the run, well before
+        # the end -- so the last stretch is essentially free to optimize cycle time
+        # and gap alone. Never exactly 0: -log(1-ratio) must stay in the loss, or a
+        # true violation would go unpunished. Reuses BARRIER_WEIGHT/STEPS, no extra
+        # hyperparameter.
+        weight = BARRIER_WEIGHT_START + step / (0.8 * STEPS) * (BARRIER_WEIGHT_END - BARRIER_WEIGHT_START) if step < 0.8 * STEPS else BARRIER_WEIGHT_END
         dt = F.softplus(raw_dt) + min_dt
         path = resample(q0, dt)
         total, gap, penalty, costs = objective(
@@ -158,10 +161,15 @@ def main():
     print(f"  {len(q_ref)} input setpoints, {path_dt.sum():.3f} s; logging to {run}")
     best = optimize(model, q_ref, dt_ref, robot, run, start_dt)
     q, dt = executable(best["q"], best["dt"])
+    # Written on the model's own uniform DT grid, not the learned variable dt: a
+    # servoJ streamer can only tick at one fixed rate (see send.py's ur_rtde engine),
+    # and this is exactly the discretization the objective was scored on anyway.
+    final = resample(torch.as_tensor(q, dtype=torch.float32),
+                     torch.as_tensor(dt, dtype=torch.float32)).numpy()
     out = args.out or args.path.rsplit(".", 1)[0] + ".retime.path"
-    write_path(out, q, np.r_[start_dt, dt])
+    write_path(out, final, DT)
     print(f"\n  gap RMSE {best['gap'] * 1000:.3f} mrad, penalty {best['penalty']:.4f}, cycle {path_dt.sum():.3f} -> "
-          f"{start_dt + dt.sum():.3f} s\n  wrote {out}: {len(q)} commands")
+          f"{start_dt + dt.sum():.3f} s\n  wrote {out}: {len(final)} commands")
 
 
 if __name__ == "__main__":

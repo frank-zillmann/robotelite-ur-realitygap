@@ -117,8 +117,12 @@ URScript ──► the controller ──► recorded target_q                (co
   an otherwise-static stretch) is free to shrink towards zero instead of floored at
   `MIN_DT`. Interpolated to the model's 8 ms grid, with a log barrier (`-log(1 -
   value/limit)`, true to +infinity at the limit) for joint position, joint speed,
-  acceleration, and TCP speed; its weight decays over the run, from smooth and
-  cautious to a sharp cutoff right at the limit.
+  acceleration, and TCP speed; its weight decays over the first 80% of the run,
+  smooth and cautious at first, a sharp cutoff right at the limit by the time it
+  reaches its floor, then holds there so the last stretch is essentially free to
+  optimize cycle time and gap alone. The written path is always resampled onto
+  the same uniform 8 ms grid the objective was scored on -- a servoJ streamer can
+  only tick at one fixed rate anyway (see `send.py`'s `ur_rtde` engine).
 - **`utils.Robot`**: `Robot("UR5e")` swaps the DH table and the joint speed limits.
   The distilled model is *not* interchangeable — it is trained on one arm's
   recordings, so each arm has its own folder and its own pickle
@@ -141,16 +145,17 @@ URScript ──► the controller ──► recorded target_q                (co
   tried as a single cross-target approach and dropped: Python/OS scheduling
   cannot reliably hit servoJ's timing, and it caused a fault on real hardware.
 - Everything runs on `utils.DT`, one 8.00 ms grid (125 Hz): what `record.py` asks
-  the stream for, what the model is trained on, and what a path is written at. 8 ms
+  the stream for, what the model is trained on, and what every `.path` is written
+  at (`convert.py` records at it directly; `optimize.py` resamples onto it). 8 ms
   divides both control cycles UR ships (2 ms e-Series, 8 ms CB3). `MoveDataset`
-  refuses a recording made at another rate. A path's `dt` column may still differ per
-  row and is honoured from 2 ms to 50 ms, but below the controller's 2 ms
-  cycle it cannot act on each setpoint separately.
+  refuses a recording made at another rate.
 - `analysis.py` takes cycle time from the matching `.path`, not host-clock CSV
-  timestamps. It scores gap and barriers over every recorded target row, so long
+  timestamps, and scores gap (not the barrier -- that's an optimization device, not
+  a property of a finished trajectory) over every recorded target row, so long
   loops naturally dominate their startup transient without changing their mean cost.
-- A smooth barrier is not a safety controller. Check the emitted path independently
-  before running it on hardware; UR5e uses the 1.5 m/s and 191°/s limits here.
+- A log barrier pushed to gradient-descent's usual numerical limits is still not a
+  hard guarantee. Check the emitted path independently before running it on
+  hardware; UR5e uses the 1.5 m/s and 191°/s limits here.
 - The joint acceleration ceilings are measured, not specified — UR publishes none —
   and the UR5e reuses the UR10e's for want of anything better.
 - The tool-speed limit uses the Jacobian at the current trajectory, refreshed each
