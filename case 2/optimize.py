@@ -100,31 +100,32 @@ def optimize(model, q_ref, dt_ref, robot, run=None, start_dt=DT):
         # limit) and decays to a thousandth of that by 80% of the run, well before
         # the end -- so the last stretch is essentially free to optimize cycle time
         # and gap alone. Never exactly 0: -log(1-ratio) must stay in the loss, or a
-        # true violation would go unpunished. Reuses BARRIER_WEIGHT/STEPS, no extra
-        # hyperparameter.
+        # true violation would go unpunished. Reuses BARRIER_WEIGHT_START/END and
+        # STEPS, no extra hyperparameter.
         weight = BARRIER_WEIGHT_START + step / (0.8 * STEPS) * (BARRIER_WEIGHT_END - BARRIER_WEIGHT_START) if step < 0.8 * STEPS else BARRIER_WEIGHT_END
         dt = F.softplus(raw_dt) + min_dt
         path = resample(q0, dt)
-        total, gap, penalty, costs = objective(
+        total_loss, gap, penalty, costs = objective(
             model, robot, path, dt.sum() + start_dt, cycle_time_per_gap_rmse, weight)
-        if best is None or float(total.detach()) < best["total"]:
-            best = {"total": float(total.detach()), "q": q0.numpy(), "dt": dt.detach().numpy(),
+        loss = total_loss - penalty       # the true objective alone, without the barrier
+        if best is None or float(total_loss.detach()) < best["total"]:
+            best = {"total": float(total_loss.detach()), "q": q0.numpy(), "dt": dt.detach().numpy(),
                     "gap": float(gap.detach()), "penalty": float(penalty.detach())}
         if log:
-            values = {"loss/total": total, "loss/gap_rmse": gap,
+            values = {"loss/loss": loss, "loss/total_loss": total_loss, "loss/gap_rmse": gap,
                       "loss/cycle_time": dt.sum(), "loss/penalties": penalty,
                       **{f"penalty/{k}": v for k, v in costs.items()}}
             for key, value in values.items():
                 log.add_scalar(key, float(value.detach()), step)
         if step < STEPS:
             opt.zero_grad(set_to_none=True)
-            total.backward()
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_([raw_dt], 1.0)
             opt.step()
         if step % 100 == 0:
-            print(f"    step {step:4d}  loss {float(total.detach()):6.3f}  gap "
-                  f"{float(gap.detach()) * 1000:6.3f} mrad  T {float(dt.sum().detach()):5.3f}s  "
-                  f"penalty {float(penalty.detach()):.4f}")
+            print(f"    step {step:4d}  loss {float(loss.detach()):6.3f}  total_loss "
+                  f"{float(total_loss.detach()):6.3f}  gap {float(gap.detach()) * 1000:6.3f} mrad  "
+                  f"T {float(dt.sum().detach()):5.3f}s  penalty {float(penalty.detach()):.4f}")
     if log:
         log.close()
     return best
