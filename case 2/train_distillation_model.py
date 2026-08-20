@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import os
 import pickle
 import time
 from abc import ABC, abstractmethod
@@ -117,8 +118,13 @@ class CNNModel(DistillModel):
 
     def __init__(self, targets=("actual_q",), hidden: int = 48,
                  dilations=(1, 2, 4, 8, 16, 32), kernel: int = 3, members: int = 3,
-                 epochs: int = 50, batch: int = 16, lr: float = 3e-3,
+                 epochs: int = 50, batch: int = 12, lr: float = 3e-3,
                  val_frac: float = 0.2, seed: int = 0):
+        # ``batch`` is 12, not 16, because of the machine and not the model: on
+        # torch 2.9 / arm64 the 1x1 convolutions in ``_Block.mix`` fall off a cliff
+        # at batch 16 exactly -- 0.29 ms at 15, 17 ms at 16, a 60x step for one more
+        # sequence. Anything below it is flat, so 12 is free headroom. Re-measure
+        # before raising it; the cliff is a kernel-dispatch threshold, not a law.
         self.targets = tuple(targets)
         self.epochs, self.batch, self.val_frac = epochs, batch, val_frac
         self.lr, self.seed = lr, seed
@@ -272,10 +278,19 @@ def load_recordings(folder: str):
     ``heldout/`` are left alone on purpose -- so anything that will not load as a
     run at ``utils.DT`` is reported and passed over rather than silently ruining
     the fit.
+
+    ``pooled.csv`` is skipped by name, which the others are not: it loads
+    perfectly well, and that is the problem. It is a concatenation of the sweep
+    recordings that sit beside it in the same folder, so leaving it in trains on
+    every sweep row twice and quietly doubles their weight against the T-series
+    trajectories the optimizer actually runs on.
     """
     from analysis import Recording
     out = []
     for p in sorted(glob.glob(f"{folder}/*.csv")):
+        if os.path.basename(p) == "pooled.csv":
+            print(f"  skipping {p}: a pooled copy of the runs beside it")
+            continue
         try:
             rec = Recording(p)
             if abs(rec.dt - DT) > 0.05 * DT:

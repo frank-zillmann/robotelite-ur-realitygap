@@ -15,3 +15,7 @@ tensorboard>=2.10          # train_distillation_model.py logs each run to runs/
 # No robot driver: record.py talks to the robot over raw TCP sockets with the
 # Python standard library only (same approach as case 1/ur_client.py). Nothing
 # to compile, no ur_rtde.
+
+# RL stack (rl_optimize.py: the policy over the same objective)
+gymnasium>=1.0             # the Env interface PPO trains against
+stable-baselines3>=2.4     # PPO, SubprocVecEnv
