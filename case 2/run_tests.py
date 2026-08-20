@@ -44,36 +44,69 @@ MODE = {0: "DISCONNECTED", 1: "CONFIRM_SAFETY", 2: "BOOTING", 3: "POWER_OFF",
 SETTLE_S = 1.0          # quiet time required before the next program is sent
 
 
-def wait_idle(host: str, timeout: float = 20.0) -> bool:
-    """Block until the controller is not running a program, and has been for a moment.
+class State:
+    """One RTDE connection, reused and reopened if the controller drops it.
 
-    Polling the real state rather than sleeping a guessed interval: the failure this
-    prevents is silent, and its symptom points at the wrong cause.
+    A sweep used to open a fresh stream for every readiness check -- 49 connections
+    across twelve pairs. A controller allows only so many RTDE clients, and a socket
+    it has not finished releasing still counts, so a long run could start being
+    refused part way through and take the whole sweep down with it. One connection,
+    held open, removes that entirely.
+
+    Reconnecting is still worth handling: a controller reboot or a network blip drops
+    the stream, and losing an hour of runs to a momentary refusal is not acceptable.
     """
-    recipe = record.build_recipe([])
-    s = record.open_stream(host, 125.0, recipe)
-    try:
+
+    def __init__(self, host: str, hz: float = 125.0):
+        self.host, self.hz = host, hz
+        self.recipe = record.build_recipe([])
+        self.s = None
+
+    def _stream(self):
+        if self.s is None:
+            self.s = record.open_stream(self.host, self.hz, self.recipe)
+        return self.s
+
+    def sample(self, tries: int = 5):
+        for i in range(tries):
+            try:
+                return record.read_sample(self._stream(), self.recipe)
+            except (OSError, ValueError, ConnectionError) as e:
+                self.close()
+                if i == tries - 1:
+                    raise
+                print(f"  RTDE dropped ({type(e).__name__}), reconnecting "
+                      f"{i + 1}/{tries - 1}...")
+                time.sleep(2.0 * (i + 1))
+        raise RuntimeError("unreachable")
+
+    def close(self):
+        if self.s is not None:
+            try:
+                self.s.close()
+            except Exception:
+                pass
+            self.s = None
+
+    def mode(self) -> int:
+        return int(self.sample()["robot_mode"])
+
+    def wait_idle(self, timeout: float = 20.0) -> bool:
+        """Block until no program is running, and none has been for a moment.
+
+        Polling the real state rather than sleeping a guessed interval: a UR drops a
+        program sent while another is playing, without saying so, and the error it
+        produces then blames Remote Control.
+        """
         quiet, t0 = None, time.perf_counter()
         while time.perf_counter() - t0 < timeout:
-            smp = record.read_sample(s, recipe)
-            if int(smp["runtime_state"]) == send.RUNTIME_PLAYING:
+            if int(self.sample()["runtime_state"]) == send.RUNTIME_PLAYING:
                 quiet = None
             else:
                 quiet = quiet or time.perf_counter()
                 if time.perf_counter() - quiet >= SETTLE_S:
                     return True
         return False
-    finally:
-        s.close()
-
-
-def ready(host: str) -> int:
-    recipe = record.build_recipe([])
-    s = record.open_stream(host, 125.0, recipe)
-    try:
-        return int(record.read_sample(s, recipe)["robot_mode"])
-    finally:
-        s.close()
 
 
 def summarize(csv: str, expect_s: float) -> dict:
@@ -96,11 +129,21 @@ def main():
     ap.add_argument("--loop", type=int, default=5, help="cycles per run")
     ap.add_argument("--out-dir", default="results", help="where recordings go")
     ap.add_argument("--only", nargs="+", default=None, help="specific pairs by name")
-    ap.add_argument("--keep-going", action="store_true",
-                    help="continue after a failed run instead of stopping")
+    ap.add_argument("--stop-on-fail", action="store_true",
+                    help="stop at the first bad run. Off by default: a sweep is long "
+                         "and usually unattended, and one bad run is a data point, "
+                         "not a reason to discard the remaining twenty.")
     args = ap.parse_args()
 
-    mode = ready(args.robot_ip)
+    state = State(args.robot_ip)
+    try:
+        mode = state.mode()
+    except OSError as e:
+        raise SystemExit(
+            f"cannot reach the robot's RTDE port at {args.robot_ip}:30004 "
+            f"({type(e).__name__}).\n"
+            f"  Check the address, that the controller is on, and that nothing else\n"
+            f"  already holds an RTDE connection -- a controller allows only a few.")
     print(f"robot at {args.robot_ip}: mode {mode} ({MODE.get(mode, '?')})")
     if mode != 7:
         raise SystemExit(
@@ -118,6 +161,11 @@ def main():
     print(f"{'pair':16s} {'lane':9s} {'seconds':>8s} {'travel':>8s} "
           f"{'err mean':>9s} {'err max':>8s} {'ok':>4s}")
 
+    tally = os.path.join(args.out_dir, "results.csv")
+    if not os.path.exists(tally):
+        with open(tally, "w") as f:
+            f.write("pair,lane,seconds,travel,err_mean,err_max,ok\n")
+
     rows, failed = [], []
     for stem in stems:
         got = {}
@@ -125,33 +173,50 @@ def main():
             src = f"{args.dir}/{stem}.{lane}.{ext}"
             if not os.path.exists(src):
                 continue
-            if not wait_idle(args.robot_ip):
-                raise SystemExit("  the controller never went idle; something is still "
-                                 "running. Stop the program on the pendant.")
             out = f"{args.out_dir}/{stem}.{lane}.csv"
-            kw = dict(host=args.robot_ip, out=out, loop=args.loop)
-            expect = None
-            # send.py streams a progress line to stdout; it would land in the middle
-            # of the results table, so it goes to the log file instead.
-            noise = io.StringIO()
-            with contextlib.redirect_stdout(noise):
-                if ext == "path":
-                    expect = len(send.load_path(src)) * 0.008 * args.loop
-                    send.record_path(path=src, **kw)
-                else:
-                    send.record_run(script=src, **kw)
-            open(os.path.join(args.out_dir, "send.log"), "a").write(noise.getvalue())
-            s = summarize(out, expect or 0.0)
-            ok = s["travel"] > 1e-3 and not (expect and s["short"])
+            # Every run is isolated. A robot that faults, a controller that drops the
+            # connection, a recording that ends mid-write -- each is one bad run to be
+            # noted and moved past, not a reason to lose the rest of the sweep.
+            try:
+                if not state.wait_idle():
+                    raise RuntimeError("controller never went idle; a program is still "
+                                       "running -- stop it on the pendant")
+                kw = dict(host=args.robot_ip, out=out, loop=args.loop)
+                expect = None
+                # send.py streams progress to stdout; it would land in the middle of
+                # the results table, so it goes to the log file instead.
+                noise = io.StringIO()
+                with contextlib.redirect_stdout(noise):
+                    if ext == "path":
+                        expect = len(send.load_path(src)) * 0.008 * args.loop
+                        send.record_path(path=src, **kw)
+                    else:
+                        send.record_run(script=src, **kw)
+                open(os.path.join(args.out_dir, "send.log"), "a").write(noise.getvalue())
+                s = summarize(out, expect or 0.0)
+                ok = s["travel"] > 1e-3 and not (expect and s["short"])
+            except Exception as e:
+                print(f"{stem if lane == 'baseline' else '':16s} {lane:9s} "
+                      f"{'-':>7s}  {'-':>7s}  {'-':>8s} {'-':>7s}  {'NO':>4s}"
+                      f"   {type(e).__name__}: {str(e)[:60]}")
+                failed.append(f"{stem}.{lane} ({type(e).__name__})")
+                state.close()                     # force a fresh connection next time
+                if args.stop_on_fail:
+                    break
+                continue
             got[lane] = s
             print(f"{stem if lane == 'baseline' else '':16s} {lane:9s} "
                   f"{s['seconds']:7.2f}s {s['travel']:7.2f}r {s['err_mean']*1000:8.4f}m "
                   f"{s['err_max']*1000:7.3f}m {'yes' if ok else 'NO':>4s}")
+            # Appended per run, not held to the end: a sweep is long, and a crash on
+            # run 20 must not throw away the nineteen that worked.
+            with open(tally, "a") as f:
+                f.write(f"{stem},{lane},{s['seconds']:.3f},{s['travel']:.4f},"
+                        f"{s['err_mean']:.8f},{s['err_max']:.8f},{int(ok)}\n")
             if not ok:
-                failed.append(f"{stem}.{lane}")
-                if not args.keep_going:
-                    raise SystemExit(f"\n  {stem}.{lane} did not run properly. Re-run with "
-                                     f"--keep-going to continue past failures.")
+                failed.append(f"{stem}.{lane} (ran short)")
+                if args.stop_on_fail:
+                    break
         if len(got) == 2:
             rows.append((stem, got["baseline"], got["ppo"]))
 
@@ -161,7 +226,9 @@ def main():
     cut = np.array([(1 - p["seconds"] / b["seconds"]) * 100 for _, b, p in rows])
     real = [(b, p) for _, b, p in rows if b["err_mean"] > 1e-9]
     ratio = np.array([p["err_mean"] / b["err_mean"] for b, p in real]) if real else None
-    print(f"  {len(rows)} pairs, {len(failed)} failed run(s){': ' + ', '.join(failed) if failed else ''}")
+    print(f"  {len(rows)} complete pairs out of {len(stems)}, {len(failed)} failed run(s)")
+    for f in failed:
+        print(f"    - {f}")
     print(f"  cycle time   : {np.median(cut):+.1f}% (median), range "
           f"{cut.min():+.1f}% to {cut.max():+.1f}%")
     if ratio is None:
@@ -172,6 +239,7 @@ def main():
     else:
         print(f"  tracking error: x{np.median(ratio):.2f} (median), range "
               f"x{ratio.min():.2f} to x{ratio.max():.2f}")
+    print(f"  every run is in {tally}, appended as it finished")
     print(f"\n  per-pair detail:  python analysis.py --csv {args.out_dir}/"
           f"{rows[0][0]}.baseline.csv {args.out_dir}/{rows[0][0]}.ppo.csv "
           f"--model models/distill-ur5e.pkl")
