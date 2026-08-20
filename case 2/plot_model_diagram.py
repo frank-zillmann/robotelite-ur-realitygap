@@ -1,11 +1,15 @@
 """Architecture diagram for the per-joint position model, for the report.
 
-Shows the shared pipeline both PerJointPositionModel and PerJointTreeModel
-use: eleven input features -> one regressor per joint -> predicted residual
--> added back to the commanded position -> predicted actual_q. The
-regressor box is generic (linear least-squares or gradient-boosted trees)
-since the surrounding architecture is identical either way -- only the
-fitting method inside that one box differs between the two models.
+Shows the shared pipeline PerJointPositionModel, PerJointTreeModel, and
+PerJointForestModel all use: eleven input features -> one regressor per
+joint -> predicted residual -> added back to the commanded position ->
+predicted actual_q. The regressor box is generic (linear least-squares,
+gradient-boosted trees, or random forest) since the surrounding architecture
+is identical for all three -- only the fitting method inside that one box
+differs. (PooledLinearModel is intentionally NOT shown here -- it shares a
+single fit across all six joints instead of this "x6 independent" shape, so
+it isn't the same architecture; see its docstring in
+train_distillation_model.py.)
 
     python plot_model_diagram.py
 
@@ -96,9 +100,9 @@ def plot_model_diagram(out_path: str = "model_architecture.png"):
     # ---- regressor box ------------------------------------------------------
     reg_x, reg_y, reg_w, reg_h = 5.9, 2.55, 3.1, 3.0
     _box(ax, (reg_x, reg_y), reg_w, reg_h,
-        "Regressor$_j$\n\nlinear least-squares\nOR\ngradient-boosted trees",
+        "Regressor$_j$\n\nlinear least-squares\nOR gradient-boosted trees\nOR random forest",
         face=ur_style.BLUE, edge=ur_style.NAVY, text_color="white",
-        fontsize=11, fontweight="bold")
+        fontsize=10.5, fontweight="bold")
     ax.text(reg_x + reg_w / 2, reg_y - 0.32, "predicts the residual\n"
             r"$\hat{\Delta}_j \approx$ actual_q$_j$ $-$ target_q$_j$",
             ha="center", va="top", fontsize=9.7, color=ur_style.NAVY, linespacing=1.3)

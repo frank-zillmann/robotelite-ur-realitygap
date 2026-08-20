@@ -9,9 +9,18 @@ version — that's what the changelog is for).
 ## 0. Plain-language summary — for slides
 
 The rest of this document is the working log. This section is the pitch:
-what the shipped model (`models/distill.pkl`, `PerJointTreeModel` with
-gravity + lag, see §6) does and why gravity and history were worth adding,
-without requiring the reader to know what gradient boosting or R² is.
+what the best model on the current real-UR5e data (`PerJointTreeModel` with
+gravity + lag, hyperparameters tuned via file-grouped CV — see §6c) does and
+why per-joint fitting, gravity, history, and boosting each earned their
+place, without requiring the reader to know what gradient boosting or R² is.
+
+**Not what `models/distill.pkl` currently holds.** That file (the one
+`run.py`/`train_rla.py` load by default) was never repointed to this model —
+it still holds an old UR10e-era pickle that, as of 2026-08-20, **fails to
+load at all** under the installed scikit-learn (an old-version pickle,
+incompatible internals). The actual best model described here is saved
+separately at `models/distill_tree_tuned.pkl`. Repointing `distill.pkl` is a
+deliberate follow-up, not done as part of this note — see §7.
 
 **One sentence**: for each joint, the model predicts how far off the real
 robot's position will end up from what was commanded, as a function of how
@@ -64,9 +73,14 @@ above X *and* gravity torque is above Y, add Z"), each correcting what the
 previous rules got wrong. That lets it pick up on interactions between the
 inputs automatically, without anyone having to guess and hand-write the
 interaction terms. Switching from the straight-line formula to trees, with
-the exact same inputs, nearly doubled the explained error variance (§6) —
-that gain is the regressor picking up nonlinear structure already present in
-the same data, not new information.
+the exact same inputs, nearly doubled the explained error variance on the
+original synthetic UR10e dataset trees were first tried on (§6) — but that
+gain didn't carry over for free to the real UR5e data this model actually
+ships against: with default hyperparameters, the tree *lost* to the linear
+model there (§6b). It took hyperparameter tuning, not just switching to
+trees, to recover and exceed the linear model's number (§6c). The
+trees-beat-a-straight-line story below is real on the current data, but it's
+as much a tuning story as a model-family one.
 
 ### Why gravity torque helps: it's a real, physical, missing input
 
@@ -125,32 +139,55 @@ not a full continuous history, just enough for the model to notice "there
 was a hard stop recently" and how hard. This is the model's *only* source of
 memory; every other input is still a single instant in time.
 
-**Result, and why it's convincing**: this was the single biggest jump in
-the whole project. Shoulder — the joint with the most visible ringing —
-gained the most of any joint on both models, and the gains lined up with
+**Result, and why it's convincing**: on the original ablation this was
+tested on (old synthetic UR10e data, §3/§6), this was the single biggest
+jump of any one addition. Shoulder — the joint with the most visible ringing
+— gained the most of any joint on both models, and the gains lined up with
 which joints actually have a visible ring, not a blanket improvement across
-the board (§3/§6).
+the board. On the real UR5e data below, gravity and lag are still there
+(both baked into every model past the first row of the table), but the
+biggest *aggregate* lever turned out to be something else entirely — see
+after the table.
 
-### Putting it together — the net effect
+### Putting it together — the net effect (real UR5e data, file-level heldout on unseen recordings)
 
 | step | overall R² (0 = no better than assuming no error, 1 = perfect) |
 |---|---|
-| straight-line formula, no physics inputs | 0.44 |
-| + gradient-boosted trees (same inputs) | 0.88 |
-| + gravity torque | 0.92 |
-| + lag/history features (**shipped model**) | **0.92**, and the *per-joint* numbers shift meaningfully (see §6) |
+| linear, pooled across joints, no gravity/lag | 0.764 |
+| + fit per joint instead of pooled | 0.765 |
+| + gravity torque | 0.775 |
+| + gradient-boosted trees (+lag), **default hyperparameters** | 0.689 — a *regression*, see §6b |
+| + gradient-boosted trees (+lag), **CV-tuned hyperparameters** (**current best**) | **0.820** |
 
 (R² here specifically measures how much of the *tracking gap* — the
 millirad-scale error, not the whole trajectory — the model explains; see §4
-for why that framing matters and how it differs from a more naive score.)
+for why that framing matters and how it differs from a more naive score.
+Table numbers: §6c/Changelog 2026-08-20.)
 
-Read together: trees vs. a straight-line formula was the single biggest
-jump in aggregate; gravity and lag are smaller in the aggregate number but
-each is *targeted* — each closed a specific, physically-understood gap
-(gravity: static sag on the joints that actually carry load against gravity;
-lag: the settle-window ring on the joints that visibly exhibit one) rather
-than moving every joint a little. See §6 for the full per-joint breakdown
-and `model_architecture.png` for a diagram of the whole pipeline.
+**The honest reading of this table**: per-joint fitting and gravity each
+give small, real, monotonic gains (0.764 → 0.765 → 0.775) — consistent with
+the physics reasoning above. Switching to trees does *not* automatically
+help — with untuned defaults it's a net loss (0.775 → 0.689), because
+`HistGradientBoostingRegressor`'s default early stopping validates against
+randomly-split, highly-autocorrelated rows instead of genuinely unseen
+recordings (§6c). Tuning the tree via file-grouped cross-validation is what
+actually delivers the win (0.689 → 0.820) — the single biggest lever in this
+table, bigger than gravity, per-joint fitting, or switching model families
+by themselves. **The takeaway for a slide: on this dataset, "use a fancier
+model" without tuning it properly is not obviously better than a well-built
+linear baseline — and might be worse.**
+
+Gravity and lag are each still *targeted* wins, independent of the tuning
+story above — each closes a specific, physically-understood gap (gravity:
+static sag on the joints that actually carry load against gravity; lag: the
+settle-window ring on the joints that visibly exhibit one) rather than
+moving every joint a little; see §3 for the joint-by-joint evidence for
+each. See §6c for the current model's full per-joint breakdown (§6/§6b are
+earlier, now-superseded stages of this same story — kept for the record, not
+as the current numbers) and `model_architecture.png` for a diagram of the
+whole per-joint pipeline (the architecture is unchanged by hyperparameter
+tuning — same 11 features, same per-joint independent-regressor shape;
+only what's fitted inside the `Regressor` box differs).
 
 ## 1. What we predict
 
@@ -472,8 +509,16 @@ an unseen run. Measured effect on this data: row-level held-out R²=0.437 vs.
 the stricter file-level split's 0.432 — a small optimistic bias in this case,
 but worth stating whenever these numbers are reported.
 
-## 6. Current results (last run: 2026-08-19, `results/2026-08-19_20-53-55/` linear,
-`results/2026-08-19_20-55-23/` tree)
+## 6. UR10e-era results (superseded — see §6b for real UR5e numbers)
+
+**These numbers describe the old UR10e placeholder data** (see the
+Changelog's "Switched from UR10e to UR5e" entry and `UR5eMigration.md`).
+Kept below for historical reference only — §6b has the current, real-UR5e,
+file-level-heldout comparison across all three models, which is what should
+be quoted or trusted now.
+
+Last run on UR10e data: 2026-08-19, `results/2026-08-19_20-53-55/` linear,
+`results/2026-08-19_20-55-23/` tree.
 
 7 files, 20% row holdout (216,099 held-out rows/joint). With `gravity_torque`
 + the `qdd_lag4/16/64` history taps (previous gravity-only run without lag in
@@ -572,6 +617,180 @@ have to, and the plot is silently skipped (printed, not an error) rather than
 shown empty or wrong — there's no reason to plot linear weights for a model
 that doesn't have any.
 
+## 6b. Real UR5e data + file-level heldout comparison (2026-08-19)
+
+`data/` was populated with real UR5e recordings (101 files: `T01`–`T08`,
+`T11` fast/medium/slow × 2 reps, plus `reach_extend_*`, `short_moves_*`,
+`workspace_sweep_*`, `wrist_sweep_*` sweeps) and a `data/heldout/`
+subdirectory (`T09`, `T10`, 12 files) that is **never trained on** — the
+first genuinely unseen-trajectory test this project has had. Two code
+changes were needed before this data could be used at all:
+
+- `DEFAULT_CSVS` globbed `data/test-*.csv` (the old UR10e naming) — no file
+  matches that pattern anymore, so the default run trained on zero
+  recordings. Changed to glob `data/*.csv`; since `glob.glob` is
+  non-recursive this still never picks up `data/heldout/*.csv`.
+- Added `DEFAULT_HELDOUT_CSVS` (`data/heldout/*.csv`) and a `--heldout-csvs`
+  flag to `main()`: after the model is refit on 100% of `--csvs`, it's also
+  scored with `_evaluate_model`/`_compute_metrics` on the heldout
+  recordings — files the model never saw in any form, unlike
+  `_row_split_eval`'s row-level split (rows from the *same* trajectories the
+  model trained on, §5's documented caveat). Results land in
+  `log.json`'s new `heldout_files`/`heldout_metrics` keys, a `heldout/`
+  plot subfolder per run, and a dedicated `runs_summary_heldout.csv` /
+  `comparison_plot_heldout.png` so the three models' unseen-trajectory
+  numbers accumulate in one place. This is the leave-one-file-out-style
+  diagnostic §7 item 4 had been asking for — done via a fixed held-out file
+  set rather than full leave-one-file-out CV (cheaper, and the recordings
+  already come pre-split into a training pool and a held-out pool).
+
+All three registered models were retrained on the 101 training files and
+scored on the 12 heldout files (original run folders since deleted from
+disk — see `results/runs_summary_heldout.csv` for the preserved numbers, or
+rerun `python train_distillation_model.py --model <name>` for a fresh,
+numerically-equivalent folder: no-gravity/gravity reproduced at
+`results/2026-08-20_10-40-55/`/`results/2026-08-20_10-44-06/`; the untuned
+tree's exact config is no longer the default post-§6c, see §6c):
+
+| joint | linear (no gravity) R² | linear (+gravity) R² | tree (+gravity+lag) R² |
+|---|---|---|---|
+| overall | 0.765 | **0.775** | 0.689 |
+| base | 0.883 | **0.886** | 0.772 |
+| shoulder | 0.620 | **0.644** | 0.594 |
+| elbow | 0.679 | **0.693** | 0.634 |
+| wrist1 | 0.520 | **0.527** | 0.492 |
+| wrist2 | 0.359 | **0.360** | 0.316 |
+| wrist3 | 0.917 | **0.920** | 0.806 |
+
+**Two findings, one expected and one not:**
+
+1. **Gravity still helps, consistently** — `linear (+gravity)` beats
+   `linear (no gravity)` on every single joint, matching §3's original
+   physics-based reasoning (small but real gains, largest on
+   shoulder/elbow/wrist3).
+2. **The tree model loses to *both* linear models, on every joint, on
+   both splits** — the opposite of the UR10e-era §6 result, where the tree
+   won by a wide margin (0.921 vs. 0.613 overall) on a row-level split. On
+   this real UR5e data the tree is behind even on its own row-level split
+   (overall R²=0.777 vs. linear-gravity's 0.881, preserved in
+   `results/runs_summary.csv`'s row-level numbers for that run — its
+   `log.json` folder no longer exists on disk), not just the file-level one
+   (0.689 vs. 0.775).
+
+   **This turned out not to be the leakage story §6/§7 item 4 predicted**:
+   if the tree's row-level number were mostly leakage-driven optimism, its
+   row→file R² drop should be *larger* than the linear models' (more
+   capacity to exploit "this held-out row's neighbors are in the training
+   set," per §6's original concern). Measured, it's the opposite — tree
+   drops 0.777→0.689 (−0.089), linear-gravity drops 0.881→0.775 (−0.107),
+   linear-no-gravity drops 0.877→0.765 (−0.112). The tree's row-level
+   number was *not* especially inflated by leakage relative to linear's;
+   it's just a worse fit to this dataset's residual on both splits. A
+   plausible explanation: `HistGradientBoostingRegressor`'s untuned
+   defaults (particularly its internal early-stopping validation split,
+   sized for the ~1e6-row UR10e-era dataset) may not suit this dataset's
+   size/noise characteristics — this hasn't been tested, and is the
+   natural next step before writing the tree model off, rather than
+   concluding trees are categorically worse here. **Practical read for
+   now**: on this real-UR5e dataset, with default hyperparameters, the
+   linear+gravity model is the better choice — the opposite conclusion
+   from the UR10e-era recommendation, and not yet fully explained.
+   **Update:** the untuned-defaults hypothesis was tested and confirmed —
+   see §6c, where a tuned tree overtakes linear+gravity on every joint.
+
+`models/distill.pkl` (the path `run.py`/`train_rla.py` load by default)
+has **not** been repointed as part of this — the three models are saved
+separately as `models/distill_linear_no_gravity.pkl`,
+`models/distill_linear_gravity.pkl`, `models/distill_tree.pkl`, and
+`models/distill.pkl` still holds the old UR10e-trained tree model from the
+prior Changelog entry. Repointing it to `distill_linear_gravity.pkl` (this
+comparison's winner) is a follow-up decision, not made here.
+
+## 6c. Tree hyperparameter tuning + Random Forest (2026-08-20)
+
+Followed up on §6b's open hypothesis (untuned `HistGradientBoostingRegressor`
+defaults, sized for the old ~1e6-row UR10e dataset, don't suit the smaller/
+noisier real-UR5e one) and added a bagging alternative.
+
+**Root cause, more specifically than §6b could say:** `PerJointTreeModel`
+set nothing but `random_state=0` — full sklearn defaults. Worse than just
+"untuned," `HistGradientBoostingRegressor`'s default `early_stopping="auto"`
+(active above 10k samples, true here) validates against a *random split of
+the pooled training rows*. Rows are ~8ms apart and highly autocorrelated
+within a recording (more so with the `qdd_lag*` taps in play), so that
+internal validation signal is systematically easier/more optimistic than
+this project's real generalization target — an unseen *recording*
+(`data/heldout/*.csv`). The tree's stopping criterion and its actual
+evaluation criterion were measuring different things.
+
+**Fix:** `PerJointPositionModel._design` now returns a third element per
+joint, `groups` (the source-recording index for every row), so a
+hyperparameter search can use `sklearn.model_selection.GroupKFold` — CV
+folds split by whole recording, matching the file-level heldout evaluation
+methodology instead of the leaky row-level one. New standalone script
+`tune_tree_hyperparams.py` runs a per-joint `RandomizedSearchCV` with
+`GroupKFold` for `tree_per_joint` and `forest_per_joint`.
+
+**Tree search** (all 101 training files, 25 candidates × 5 folds/joint,
+`early_stopping=False` fixed so `max_iter` is tuned explicitly instead of
+picked by the mismatched internal split): all six joints' searches
+independently converged on the *same* hyperparameters —
+`max_iter=300, learning_rate=0.2, max_leaf_nodes=63, min_samples_leaf=20,
+l2_regularization=1.0` — with file-grouped CV R² of 0.87–0.96 per joint
+(`results/tuning_tree_per_joint_2026-08-20_08-27-23.json`). `max_iter` and
+`max_leaf_nodes` landed on the *edge* of the search grid, so there may be
+more headroom with a wider grid — not chased further here. These became
+`PerJointTreeModel.HGB_KWARGS`.
+
+**Forest search — abandoned, replaced with a cheap smoke test:** the
+equivalent full-dataset `RandomForestRegressor` search (started at
+`n_estimators` up to 500, `max_depth` including unbounded) took ~17 minutes
+for the *first* joint alone — unbounded-depth trees are expensive to grow on
+~370k rows, and the estimated ~1.5–2 hours for all six joints wasn't worth
+it relative to the gain expected (forests are far less hyperparameter-
+sensitive than boosting — no learning-rate/iteration-count interaction to
+get wrong). Replaced with a 20-file, 3-candidates×3-folds smoke test
+(`results/tuning_forest_per_joint_2026-08-20_09-42-12.json`): `max_depth`
+capped at 16, `min_samples_leaf=5`, `max_features=0.5` plateaued for the
+higher-signal joints (base/shoulder/elbow, R² 0.86–0.92 on that small
+sample); wrist joints were inconclusive on only 20 files. These, plus a
+fixed `n_estimators=200`, became `PerJointForestModel.RF_KWARGS`. A proper
+file-grouped search (smaller candidate/fold count, or a row-count cap) is
+the natural follow-up if more headroom is worth the wait.
+
+**Result — both changes flip the §6b conclusion.** Retrained on the 101
+training files, scored on the same 12 never-trained-on heldout files:
+
+| joint | linear (+gravity) R² | tree, untuned (§6b) | tree, tuned | forest |
+|---|---|---|---|---|
+| overall | 0.775 | 0.689 | **0.820** | 0.809 |
+| base | 0.886 | 0.772 | **0.915** | 0.911 |
+| shoulder | 0.644 | 0.594 | **0.745** | 0.698 |
+| elbow | 0.693 | 0.634 | 0.726 | **0.740** |
+| wrist1 | 0.527 | 0.492 | **0.584** | 0.584 |
+| wrist2 | 0.360 | 0.316 | 0.385 | **0.400** |
+| wrist3 | 0.920 | 0.806 | **0.931** | **0.931** |
+
+(original run folders `results/2026-08-20_10-18-44/`/`results/2026-08-20_10-22-42/`
+since deleted from disk; re-run and reproduced at
+`results/2026-08-20_10-45-56/` tuned tree, `results/2026-08-20_10-56-46/`
+forest — tree R² came back 0.816 on the re-run, not 0.820: `HistGradientBoostingRegressor`
+isn't perfectly bit-reproducible run-to-run even with a fixed `random_state`,
+due to floating-point summation order in its multi-threaded histogram
+building; forest reproduced exactly, since `RandomForestRegressor` has no
+such nondeterminism. Table below keeps the original numbers; expect ~0.004
+R² of run-to-run noise on the tree specifically.) Both tuned tree-based
+models now beat linear+gravity on **every
+joint** — confirming §6b's hypothesis: the tree family was never worse than
+linear here, the boosted model's defaults just didn't fit this dataset's
+size/noise and its early-stopping validation split was measuring the wrong
+thing. The tuned HGB tree is the best model overall and the model of choice
+if only one is shipped; forest is close behind and, being far less
+hyperparameter-sensitive, is the safer choice if this dataset changes size/
+composition again before there's time to re-tune. Neither `models/distill.pkl`
+nor the §6b "which model to ship" follow-up was changed here — this section
+is a hyperparameter/model-family comparison, not a repointing decision.
+
 ## 7. Not yet done, in priority order
 
 1. ~~Gravity torque feature~~ — done, see §3/§6 (2026-08-19).
@@ -589,9 +808,14 @@ that doesn't have any.
   Nm-scale units against a millirad-scale target. Show `coef_j × std(feature_j)`
   instead so bar heights are comparable across features regardless of native
   units; doesn't change the fit, only the display.
-4. **Leave-one-file-out CV diagnostic** — 7 cheap refits (42 params), gives
-  an honest file-level generalization number alongside the row-level holdout
-  (§5's caveat); doesn't change what gets shipped.
+4. ~~Leave-one-file-out CV diagnostic~~ — done differently than originally
+  scoped: rather than full leave-one-file-out CV, added a fixed
+  `data/heldout/*.csv` file set (`--heldout-csvs`) never trained on, scored
+  after the model's refit on 100% of the training files. Gives the same
+  honest file-level generalization number alongside the row-level holdout
+  (§5's caveat) at lower cost, since the recordings already arrived
+  pre-split into a training pool and a held-out pool. See §6b for the
+  result — it overturned the tree-vs-linear recommendation from §6.
 5. ~~A non-linear regressor~~ — done, `PerJointTreeModel`, see §2/§6
   (2026-08-19), **out of this list's stated order** (done before item 2, at
   the user's explicit direction). The predicted caveat held at the time: the
@@ -630,9 +854,132 @@ that doesn't have any.
   move stopped. Still fits with plain `lstsq` if linear-in-the-fitted-basis;
   lower priority than items 3/4/7 since the FIR taps already captured most of
   the effect cheaply.
+9. **Repoint (or fix) `models/distill.pkl`** — the file `run.py`/`train_rla.py`
+  load by default was never updated past an old UR10e-era pickle, and as of
+  2026-08-20 it **fails to load at all** (`ModuleNotFoundError: No module
+  named '_loss'`) under the installed scikit-learn (1.9.0) — an old pickle's
+  internal module layout no longer matches. Anyone running the pipeline
+  end-to-end right now hits this. Fix: either repoint it at
+  `models/distill_tree_tuned.pkl` (the current best model, §6c) via a fresh
+  `train_distillation_model.py --model tree_per_joint --out models/distill.pkl`,
+  or retrain/re-save whichever model should actually ship. Not done here —
+  §0 only documents the discrepancy.
 
 ## Changelog
 
+- **2026-08-20** — Every `results/<timestamp>/` folder from earlier today
+  and 2026-08-19 (no-gravity, +gravity, untuned tree, tuned tree, forest,
+  first pooled-linear run) was found deleted from disk mid-session — outside
+  any command run here; `runs_summary.csv`/`runs_summary_heldout.csv` still
+  had every row, only the per-run folders (plots/log.json/pickle) were gone.
+  Re-ran the four presentation models (`train_pooled_linear.py`;
+  `train_distillation_model.py --model {linear_per_joint_no_gravity,
+  linear_per_joint,tree_per_joint}`) and `--model forest_per_joint`, landing
+  in fresh folders (`results/2026-08-20_10-39-13/` pooled,
+  `.../10-40-55/` no-gravity, `.../10-44-06/` gravity, `.../10-45-56/` tuned
+  tree, `.../10-56-46/` forest) with numbers matching the deleted originals
+  to within floating-point noise (`HistGradientBoostingRegressor`'s
+  multi-threaded histogram building isn't perfectly bit-reproducible run to
+  run even with a fixed `random_state` — tree R² came back 0.816 vs. the
+  original 0.820; every other model reproduced exactly). Updated every
+  `results/<old-timestamp>/` path reference in §6b/§6c/below to either the
+  new folder or a note that the folder is gone but the number is preserved
+  in the summary CSVs. **The untuned tree's exact original run has no
+  replacement folder** — its config (default `HistGradientBoostingRegressor`
+  hyperparameters) is no longer what `PerJointTreeModel` builds post-§6c, so
+  reproducing that folder would require temporarily reverting `HGB_KWARGS`;
+  not done, since the number is already fully preserved in §6b's text and
+  `runs_summary(_heldout).csv`.
+- **2026-08-20** — Brought §0 (the plain-language, slide-ready summary) back
+  in sync with the real-UR5e results: it had still been describing the old
+  synthetic-UR10e R² progression (0.44→0.88→0.92→0.92) and calling
+  `models/distill.pkl` "the shipped model" — both stale, and the second one
+  actively wrong (`distill.pkl` was never repointed off an old UR10e-era
+  pickle and, checked directly, now **fails to load** under the installed
+  scikit-learn 1.9.0; see new §7 item 9). Rewrote the opening framing, the
+  "why gradient-boosted trees" paragraph, and the closing net-effect table to
+  the current real-UR5e, file-level-heldout numbers (pooled linear 0.764 →
+  per-joint 0.765 → +gravity 0.775 → tree/default-hyperparameters 0.689,
+  a regression → tree/CV-tuned 0.820), with an explicit "tuning mattered more
+  than model family" takeaway that the old table's clean monotonic story
+  didn't have room for. Also updated `plot_model_diagram.py`'s regressor box
+  (`linear least-squares OR gradient-boosted trees` → `... OR random forest`,
+  now that `PerJointForestModel` exists) and regenerated
+  `model_architecture.png`; noted in both the script's docstring and §0 that
+  `PooledLinearModel` is deliberately not shown in that diagram, since it
+  shares one fit across all six joints instead of the "×6 independent"
+  architecture the diagram depicts.
+- **2026-08-20** — Added `PooledLinearModel` (`train_distillation_model.py`)
+  for a presentation comparison: one shared-slope `lstsq` fit across all six
+  joints' stacked rows (6-column joint one-hot standing in for a per-joint
+  intercept), same no-gravity/no-lag 6-feature set as
+  `PerJointPositionModelNoGravity`, isolating the per-joint-vs-pooled
+  variable specifically. Mirrors this project's original `LinearModel`
+  (removed in `062a315`, which predicted `actual_current` on the old UR10e
+  data) retargeted at `actual_q` on the current real-UR5e data. Not
+  registered in `MODELS`/`--model` — `main()`'s row-level diagnostic assumes
+  a per-joint-keyed design, which a single stacked-across-joints fit doesn't
+  produce — so it's trained via a new standalone script,
+  `train_pooled_linear.py`, with its own row-level held-out helper
+  (`_pooled_row_split_eval`) that reconstructs per-joint metrics from the
+  flat design so it still plugs into the existing `_compute_metrics`/
+  `log_run`. Result (original folder `results/2026-08-20_10-36-15/` since
+  deleted from disk; re-run and reproduced exactly at
+  `results/2026-08-20_10-39-13/`, file-level heldout): overall R²=0.764,
+  essentially tied with `PerJointPositionModelNoGravity`'s
+  0.765 and slightly behind it on every joint but wrist3 — a much smaller
+  per-joint-fitting gap on the position target than the original current-target
+  pooled-vs-per-joint comparison in §2 (R² 0.43→0.60 for wrist2) found, but
+  directionally the same (pooling never wins).
+- **2026-08-20** — Followed up §6b's open "untuned tree defaults" hypothesis
+  and added a Random Forest alternative — see §6c for the full writeup.
+  `PerJointPositionModel._design` now returns a per-row recording-group id
+  (`{joint: (X, y, groups)}`, was `(X, y)`) so a hyperparameter search can use
+  file-grouped CV (`GroupKFold`) instead of the leaky row-level split
+  `HistGradientBoostingRegressor`'s own default early stopping was
+  implicitly using. New standalone script `tune_tree_hyperparams.py` runs a
+  per-joint `RandomizedSearchCV` for `tree_per_joint`/`forest_per_joint`.
+  `PerJointTreeModel` gained a tuned `HGB_KWARGS` class attribute
+  (`early_stopping=False`, plus CV-selected `max_iter`/`learning_rate`/
+  `max_leaf_nodes`/`min_samples_leaf`/`l2_regularization`) threaded into both
+  its `HistGradientBoostingRegressor` call sites. Added `PerJointForestModel`
+  (`RandomForestRegressor` per joint, registered as `forest_per_joint` in
+  `MODELS`) with a smoke-tested `RF_KWARGS` — its own full file-grouped
+  search was abandoned as too slow for this dataset (~17 min for a single
+  joint), see §6c for why and what replaced it. Both changes reverse §6b's
+  conclusion: tuned tree (heldout R² 0.820) and forest (0.809) now beat
+  linear+gravity (0.775) on every joint, where the untuned tree (0.689) had
+  lost to it on every joint. `models/distill.pkl` was **not** repointed —
+  saved separately as `models/distill_tree_tuned.pkl`/`distill_forest.pkl`,
+  pending a ship decision.
+- **2026-08-19** — Real UR5e recordings landed in `data/` (101 training
+  files) plus a never-trained-on `data/heldout/` (12 files, `T09`/`T10`) —
+  see §6b for the full writeup. Fixed `DEFAULT_CSVS`, which globbed the old
+  `data/test-*.csv` naming and matched nothing on the new files (`T01_*`,
+  `reach_extend_*`, etc.), to glob `data/*.csv` instead (still excludes
+  `data/heldout/*.csv` since `glob.glob` is non-recursive). Added
+  `DEFAULT_HELDOUT_CSVS`/`--heldout-csvs` to `train_distillation_model.py`:
+  after the model refits on 100% of `--csvs`, it's also scored on the
+  heldout files via the existing `_evaluate_model`/`_compute_metrics` (no
+  new eval code needed), logged into `log.json`'s new
+  `heldout_files`/`heldout_metrics` keys, plotted into a `run_dir/heldout/`
+  subfolder, and appended to a new `runs_summary_heldout.csv`/
+  `comparison_plot_heldout.png` (`_update_summary` gained an optional
+  `suffix` param for this). This is §7 item 4's leave-one-file-out
+  diagnostic, done via a fixed held-out set instead of full CV since the
+  data already arrived pre-split. Retrained all three registered models
+  (`linear_per_joint_no_gravity`, `linear_per_joint`, `tree_per_joint`) on
+  the real data and compared them on the heldout files — the tree model,
+  the UR10e-era winner by a wide margin, now **loses to both linear models
+  on every joint, on both the row-level and file-level splits**; the
+  row→file R² drop is if anything *smaller* for the tree (−0.089) than for
+  linear (−0.107), so this isn't the leakage-optimism story §6 had
+  predicted — more likely the tree's untuned
+  `HistGradientBoostingRegressor` defaults don't suit this dataset, not yet
+  investigated. `models/distill.pkl` (the default pipeline path) was
+  **not** repointed — the three new models are saved separately
+  (`models/distill_linear_no_gravity.pkl`, `distill_linear_gravity.pkl`,
+  `distill_tree.pkl`) pending a decision on which one ships.
 - **2026-08-19** — Switched from UR10e to UR5e (the user's real robot) on
   this branch, bringing over the physics fix already applied on
   `apostolosRLA` (see `UR5eMigration.md`, copied over from that branch, for

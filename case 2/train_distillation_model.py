@@ -59,7 +59,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
 
 import ur_style
 from preprocess import Identity, Preprocess, default_preprocess
@@ -127,12 +127,22 @@ def _gravity_block(q: np.ndarray) -> np.ndarray:
 # alternative -- see git history for the version of this file that did that.
 # Glob rather than a hardcoded range: the recording count isn't fixed (varies
 # by robot/data-collection session), and a hardcoded range silently drops or
-# errors on files outside it. Sorted lexically -- fine up to 9 files ("test-1"
-# .. "test-9"); re-check this if the set ever reaches double digits ("test-10"
-# would sort before "test-2").
+# errors on files outside it. Globs every top-level csv in data/ (not just a
+# "test-*" prefix -- the current UR5e recordings are named "T01_fast_r1.csv"
+# etc., "reach_extend_*.csv", "short_moves_*.csv") and, since glob.glob is
+# non-recursive, this never picks up data/heldout/*.csv -- those are the
+# file-level generalization check (DEFAULT_HELDOUT_CSVS below) and must never
+# be trained on.
 DEFAULT_CSVS = sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                             "data", "test-*.csv")))
+                                             "data", "*.csv")))
 DEFAULT_HOLDOUT = 0.2
+
+# Recordings never trained on, scored only after the model is refit on 100%
+# of DEFAULT_CSVS -- an honest generalization number on unseen trajectories,
+# unlike _row_split_eval's row-level split (rows from the same trajectories
+# the model fits on, see its docstring's caveat).
+DEFAULT_HELDOUT_CSVS = sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                     "data", "heldout", "*.csv")))
 
 
 class DistillModel(ABC):
@@ -341,18 +351,24 @@ class PerJointPositionModel(DistillModel):
     # --- fit ------------------------------------------------------------------
 
     def _design(self, recordings) -> dict:
-        """Per-joint (features, position-error target) design matrices.
+        """Per-joint (features, position-error target, group) design matrices.
 
-        Returns ``{joint: (X, y)}``, ``y`` being ``actual_q - target_q`` (the
-        residual this model fits). Shared by ``fit`` so joint and pooled
+        Returns ``{joint: (X, y, groups)}``, ``y`` being ``actual_q - target_q``
+        (the residual this model fits) and ``groups`` the source-recording
+        index for each row (0 for every row of ``recordings[0]``, 1 for
+        ``recordings[1]``, ...) -- for a file-grouped CV split (e.g.
+        ``sklearn.model_selection.GroupKFold``) so a hyperparameter search's
+        own validation score reflects unseen-file generalization rather than
+        the same within-file row leakage ``_row_split_eval``'s row-level split
+        has (see its docstring). Shared by ``fit`` so joint and pooled
         evaluation build the feature matrix the same way. Only computes
         ``_gravity_block`` (the expensive full-pose FK pass) when
         ``"gravity_torque"`` is actually in ``self.FEATURE_NAMES``, so a
         subclass that omits it doesn't pay for it.
         """
         needs_gravity = "gravity_torque" in self.FEATURE_NAMES
-        per_joint = {j: ([], []) for j in range(N_JOINTS)}
-        for rec in recordings:
+        per_joint = {j: ([], [], []) for j in range(N_JOINTS)}
+        for rec_idx, rec in enumerate(recordings):
             if rec.vel_cmd is None or rec.acc_cmd is None:
                 raise ValueError(f"{rec.path} has no vel/acc registers; record "
                                  "with `--float-register 1 vel 2 acc`")
@@ -362,14 +378,16 @@ class PerJointPositionModel(DistillModel):
             # cross-recording pooling -- see _lag_array.
             lag_block = self._lag_block(qdd)
             for j in range(N_JOINTS):
-                Xs, ys = per_joint[j]
+                Xs, ys, gs = per_joint[j]
                 Xs.append(self._row_features(j, rec.target_current[:, j], rec.target_q[:, j],
                                              rec.target_qd[:, j], qdd[:, j],
                                              rec.vel_cmd, rec.acc_cmd,
                                              grav[:, j] if needs_gravity else None,
                                              self._lag_cols_for_joint(lag_block, j)))
                 ys.append(rec.actual_q[:, j] - rec.target_q[:, j])
-        return {j: (np.vstack(Xs), np.concatenate(ys)) for j, (Xs, ys) in per_joint.items()}
+                gs.append(np.full(len(rec.target_q), rec_idx))
+        return {j: (np.vstack(Xs), np.concatenate(ys), np.concatenate(gs))
+               for j, (Xs, ys, gs) in per_joint.items()}
 
     def fit(self, recordings) -> "PerJointPositionModel":
         """Fit one row model per joint, independently, on every row of every real run."""
@@ -378,7 +396,7 @@ class PerJointPositionModel(DistillModel):
         vel_col = self.FEATURE_NAMES.index("vel")
         acc_col = self.FEATURE_NAMES.index("acc")
         vel_all, acc_all = [], []
-        for j, (X, y) in design.items():
+        for j, (X, y, _groups) in design.items():
             self.coefs[j], *_ = np.linalg.lstsq(X, y, rcond=None)
             vel_all.append(X[:, vel_col])
             acc_all.append(X[:, acc_col])
@@ -474,10 +492,30 @@ class PerJointTreeModel(PerJointPositionModel):
     ``coefficients()`` returns ``None`` -- there's no per-feature linear
     weight to show, so ``_plot_coefficients`` skips the plot (prints, does
     not error) rather than displaying something meaningless.
+
+    ``HGB_KWARGS`` are extra kwargs passed to every ``HistGradientBoostingRegressor``
+    this class constructs, tuned via ``tune_tree_hyperparams.py`` (file-grouped
+    CV, since the real UR5e dataset is small/noisy enough that the untuned
+    defaults underperformed the linear baseline -- see ``ModelReview.md`` §6b/§6c).
+    ``early_stopping`` is fixed to ``False``: the regressor's own auto early
+    stopping (default, active above 10k samples) validates against a *random*
+    split of the pooled rows, which are highly autocorrelated within a
+    recording (adjacent rows are ~8ms apart); that's a much easier signal than
+    this project's real generalization target (unseen recordings), so it was
+    silently letting the tree overfit relative to file-level held-out
+    performance. Regularization/``max_iter`` are tuned by CV instead, to match
+    the metric that actually matters. All six joints' searches independently
+    landed on the same values (2026-08-20, ``results/tuning_tree_per_joint_*.json``),
+    including two grid boundaries (``max_iter``, ``max_leaf_nodes``) -- a wider
+    grid is a natural follow-up if more headroom is worth chasing, see
+    ``ModelReview.md`` §6c.
     """
 
     # FEATURE_NAMES inherited from PerJointPositionModel (incl. gravity_torque
     # and the qdd_lag* taps) -- deliberately not overridden, see class docstring.
+
+    HGB_KWARGS = {"early_stopping": False, "max_iter": 300, "learning_rate": 0.2,
+                  "max_leaf_nodes": 63, "min_samples_leaf": 20, "l2_regularization": 1.0}
 
     def __init__(self):
         super().__init__()
@@ -489,9 +527,9 @@ class PerJointTreeModel(PerJointPositionModel):
         vel_col = self.FEATURE_NAMES.index("vel")
         acc_col = self.FEATURE_NAMES.index("acc")
         vel_all, acc_all = [], []
-        for j, (X, y) in design.items():
+        for j, (X, y, _groups) in design.items():
             self.models[j] = HistGradientBoostingRegressor(
-                random_state=_RANDOM_STATE).fit(X, y)
+                random_state=_RANDOM_STATE, **type(self).HGB_KWARGS).fit(X, y)
             vel_all.append(X[:, vel_col])
             acc_all.append(X[:, acc_col])
         self.vel_range = (float(np.min(vel_all)), float(np.max(vel_all)))
@@ -500,7 +538,7 @@ class PerJointTreeModel(PerJointPositionModel):
 
     def _row_split_fit_predict(self, X_train, y_train, X_test) -> np.ndarray:
         return HistGradientBoostingRegressor(
-            random_state=_RANDOM_STATE).fit(X_train, y_train).predict(X_test)
+            random_state=_RANDOM_STATE, **type(self).HGB_KWARGS).fit(X_train, y_train).predict(X_test)
 
     def predict(self, df) -> dict:
         dt = frame_dt(df)
@@ -526,6 +564,97 @@ class PerJointTreeModel(PerJointPositionModel):
             "type":         "hist_gradient_boosting_per_joint",
             "features":     self.FEATURE_NAMES,
             "random_state": _RANDOM_STATE,
+            "hgb_kwargs":   type(self).HGB_KWARGS,
+            "vel_range":    list(self.vel_range) if self.vel_range else None,
+            "acc_range":    list(self.acc_range) if self.acc_range else None,
+        }
+
+    def coefficients(self):
+        return None
+
+
+class PerJointForestModel(PerJointPositionModel):
+    """Random-forest position model, one independent regressor per joint.
+
+    A bagging alternative to ``PerJointTreeModel``'s boosting: each tree is
+    fit on a bootstrap resample with random feature subsets and the forest
+    averages their predictions, which tends to be more robust than boosting
+    on a small/noisy dataset without needing careful early-stopping/learning-
+    rate tuning -- boosting keeps fitting the residual of previous trees
+    (prone to overfitting exactly the kind of within-file noise this
+    project's real UR5e recordings have), while bagging's variance reduction
+    comes from averaging independently-overfit trees instead. Otherwise
+    identical in structure to ``PerJointTreeModel``: same target convention
+    (predicts the residual ``actual_q - target_q``), same inherited
+    ``FEATURE_NAMES`` (incl. ``gravity_torque``/``qdd_lag*``), same "no
+    feature scaling needed" property, no per-feature linear coefficients.
+
+    ``RF_KWARGS`` are extra kwargs passed to every ``RandomForestRegressor``
+    this class constructs. Not CV-tuned like ``PerJointTreeModel.HGB_KWARGS``
+    -- a full file-grouped search (``tune_tree_hyperparams.py --model
+    forest_per_joint``) turned out too expensive on this dataset (~17 min/joint
+    at 8 candidates x 3 folds on all 101 files, unbounded-depth trees are
+    costly to grow on ~370k rows) to be worth the wait. Instead these are the
+    winning values from a cheap smoke test (20 files, 3 candidates x 3 folds,
+    ``max_depth`` capped at 16) that plateaued for the higher-signal joints
+    (base/shoulder/elbow, R² 0.86-0.92); a proper search is a natural
+    follow-up if more headroom is worth chasing, see ``ModelReview.md`` §6c.
+    Forests are also less sensitive to hyperparameters than boosting (no
+    learning-rate/iteration-count interaction to get wrong), so untuned-but-
+    reasonable values matter less here than they did for ``HGB_KWARGS``.
+    """
+
+    RF_KWARGS = {"n_estimators": 200, "max_depth": 16, "min_samples_leaf": 5,
+                "max_features": 0.5, "n_jobs": -1}
+
+    def __init__(self):
+        super().__init__()
+        self.models = [None] * N_JOINTS      # one fitted RandomForestRegressor per joint
+
+    def fit(self, recordings) -> "PerJointForestModel":
+        """Fit one random-forest model per joint, independently."""
+        design = self._design(recordings)
+        vel_col = self.FEATURE_NAMES.index("vel")
+        acc_col = self.FEATURE_NAMES.index("acc")
+        vel_all, acc_all = [], []
+        for j, (X, y, _groups) in design.items():
+            self.models[j] = RandomForestRegressor(
+                random_state=_RANDOM_STATE, **type(self).RF_KWARGS).fit(X, y)
+            vel_all.append(X[:, vel_col])
+            acc_all.append(X[:, acc_col])
+        self.vel_range = (float(np.min(vel_all)), float(np.max(vel_all)))
+        self.acc_range = (float(np.min(acc_all)), float(np.max(acc_all)))
+        return self
+
+    def _row_split_fit_predict(self, X_train, y_train, X_test) -> np.ndarray:
+        return RandomForestRegressor(
+            random_state=_RANDOM_STATE, **type(self).RF_KWARGS).fit(X_train, y_train).predict(X_test)
+
+    def predict(self, df) -> dict:
+        dt = frame_dt(df)
+        ti = get_block(df, "target_current")
+        q = get_block(df, "target_q")
+        qd = get_block(df, "target_qd")
+        qdd = np.gradient(qd, dt, axis=0)
+        vel = df[VEL_COL].to_numpy(dtype=float)
+        acc = df[ACC_COL].to_numpy(dtype=float)
+        needs_gravity = "gravity_torque" in self.FEATURE_NAMES
+        grav = _gravity_block(q) if needs_gravity else None
+        lag_block = self._lag_block(qdd)
+        out = np.zeros_like(q)
+        for j in range(N_JOINTS):
+            feats = self._row_features(j, ti[:, j], q[:, j], qd[:, j], qdd[:, j], vel, acc,
+                                       grav[:, j] if needs_gravity else None,
+                                       self._lag_cols_for_joint(lag_block, j))
+            out[:, j] = q[:, j] + self.models[j].predict(feats)
+        return {"actual_q": out}
+
+    def params(self) -> dict:
+        return {
+            "type":         "random_forest_per_joint",
+            "features":     self.FEATURE_NAMES,
+            "random_state": _RANDOM_STATE,
+            "rf_kwargs":    type(self).RF_KWARGS,
             "vel_range":    list(self.vel_range) if self.vel_range else None,
             "acc_range":    list(self.acc_range) if self.acc_range else None,
         }
@@ -557,11 +686,128 @@ class PerJointPositionModelNoGravity(PerJointPositionModel):
     FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "vel", "acc", "bias"]
 
 
+class PooledLinearModel(DistillModel):
+    """Least-squares linear baseline predicting actual position with ONE
+    shared fit across all six joints, instead of ``PerJointPositionModel``'s
+    six independent per-joint fits.
+
+    Isolates exactly one variable against ``PerJointPositionModelNoGravity``
+    for a clean "what does per-joint fitting buy you" comparison: same
+    target convention (predicts the residual ``actual_q - target_q``), same
+    6-feature set (no ``gravity_torque``, no ``qdd_lag*``), but a single
+    ``lstsq`` call over every joint's rows stacked together, with a
+    6-column joint one-hot block standing in for each joint's own intercept
+    (a separate bias column would be perfectly collinear with a full
+    one-hot block, so there isn't one). Mirrors this project's original
+    ``LinearModel`` (removed in commit ``062a315``, when it predicted
+    ``actual_current`` on the old UR10e dataset with the same shared-slope +
+    one-hot shape) retargeted at ``actual_q`` on the current real-UR5e data.
+
+    Not registered in ``MODELS``/selectable via ``--model``: ``main()``'s
+    row-level diagnostic (``_row_split_eval``) assumes a per-joint-keyed
+    design (``{joint: (X, y, groups)}``), which doesn't fit this model's
+    single stacked fit across joints. Trained via the standalone
+    ``train_pooled_linear.py`` instead, which builds its own row-level
+    diagnostic directly against the flat design ``_design`` returns here.
+
+    See ``PerJointPositionModel``'s docstring for why per-joint fitting was
+    adopted for the shipped model: joints differ enough in scale/sign of
+    their sensitivity to the inputs that a single shared coefficient vector
+    is a compromise fit, worst for the low-signal wrist joints -- this class
+    exists to put a number on exactly that gap on the current data.
+    """
+
+    FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "vel", "acc"]
+
+    def __init__(self):
+        self.coef = None                 # (len(FEATURE_NAMES) + N_JOINTS,)
+        self.vel_range = None
+        self.acc_range = None
+
+    def predicts(self) -> list[str]:
+        return ["actual_q"]
+
+    def _design(self, recordings):
+        """Flat, all-joints-stacked design matrix -- not a per-joint dict
+        (see class docstring).
+
+        Returns ``(X, y, target_q, joint_ids, groups)``: ``X`` includes the
+        6-column joint one-hot block, ``y`` is the stacked
+        ``actual_q - target_q`` residual, ``target_q``/``joint_ids`` let a
+        caller reconstruct per-joint metrics from the flat arrays, and
+        ``groups`` is the source-recording index per row (same convention as
+        ``PerJointPositionModel._design``).
+        """
+        Xs, ys, tgts, jids, gs = [], [], [], [], []
+        for rec_idx, rec in enumerate(recordings):
+            if rec.vel_cmd is None or rec.acc_cmd is None:
+                raise ValueError(f"{rec.path} has no vel/acc registers; record "
+                                 "with `--float-register 1 vel 2 acc`")
+            qdd = np.gradient(rec.target_qd, rec.dt, axis=0)
+            n = len(rec.target_q)
+            for j in range(N_JOINTS):
+                onehot = np.zeros((n, N_JOINTS))
+                onehot[:, j] = 1.0
+                cols = np.column_stack([rec.target_current[:, j], rec.target_qd[:, j],
+                                        qdd[:, j], rec.target_q[:, j],
+                                        rec.vel_cmd, rec.acc_cmd])
+                Xs.append(np.hstack([cols, onehot]))
+                ys.append(rec.actual_q[:, j] - rec.target_q[:, j])
+                tgts.append(rec.target_q[:, j])
+                jids.append(np.full(n, j))
+                gs.append(np.full(n, rec_idx))
+        return (np.vstack(Xs), np.concatenate(ys), np.concatenate(tgts),
+               np.concatenate(jids), np.concatenate(gs))
+
+    def fit(self, recordings) -> "PooledLinearModel":
+        """Fit a single shared-slope model over every joint's stacked rows."""
+        X, y, _, _, _ = self._design(recordings)
+        self.coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+        vel_col = self.FEATURE_NAMES.index("vel")
+        acc_col = self.FEATURE_NAMES.index("acc")
+        self.vel_range = (float(np.min(X[:, vel_col])), float(np.max(X[:, vel_col])))
+        self.acc_range = (float(np.min(X[:, acc_col])), float(np.max(X[:, acc_col])))
+        return self
+
+    def predict(self, df) -> dict:
+        dt = frame_dt(df)
+        ti = get_block(df, "target_current")
+        q = get_block(df, "target_q")
+        qd = get_block(df, "target_qd")
+        qdd = np.gradient(qd, dt, axis=0)
+        vel = df[VEL_COL].to_numpy(dtype=float)
+        acc = df[ACC_COL].to_numpy(dtype=float)
+        n = len(q)
+        out = np.zeros_like(q)
+        for j in range(N_JOINTS):
+            onehot = np.zeros((n, N_JOINTS))
+            onehot[:, j] = 1.0
+            feats = np.hstack([np.column_stack([ti[:, j], qd[:, j], qdd[:, j],
+                                                q[:, j], vel, acc]), onehot])
+            out[:, j] = q[:, j] + feats @ self.coef
+        return {"actual_q": out}
+
+    def bounds(self):
+        if self.vel_range is None:
+            return None
+        return self.vel_range, self.acc_range
+
+    def params(self) -> dict:
+        return {
+            "type":         "pooled_linear_shared_slope",
+            "features":     self.FEATURE_NAMES + [f"is_{n}" for n in JOINT_NAMES],
+            "coefficients": self.coef.tolist() if self.coef is not None else None,
+            "vel_range":    list(self.vel_range) if self.vel_range else None,
+            "acc_range":    list(self.acc_range) if self.acc_range else None,
+        }
+
+
 # Models selectable via --model. Add a new DistillModel subclass here to make
 # it available from the CLI without touching the train/test split logic.
 MODELS = {"linear_per_joint": PerJointPositionModel,
          "linear_per_joint_no_gravity": PerJointPositionModelNoGravity,
-         "tree_per_joint": PerJointTreeModel}
+         "tree_per_joint": PerJointTreeModel,
+         "forest_per_joint": PerJointForestModel}
 
 
 def augment(model: DistillModel, csv: str, pre: Preprocess = None):
@@ -863,9 +1109,16 @@ def _plot_coefficients(model: DistillModel, run_dir: str):
 
 
 def _update_summary(model: DistillModel, held_out_metrics: dict,
-                    results_dir: str, dt_str: str):
-    """Append a row to runs_summary.csv and regenerate the comparison plot."""
-    summary_path = os.path.join(results_dir, "runs_summary.csv")
+                    results_dir: str, dt_str: str, suffix: str = ""):
+    """Append a row to runs_summary.csv and regenerate the comparison plot.
+
+    ``suffix`` (default ``""``, backward compatible) redirects both output
+    files to ``runs_summary{suffix}.csv``/``comparison_plot{suffix}.png`` --
+    used with ``"_heldout"`` to keep the file-level held-out-file comparison
+    (data/heldout/*.csv, never trained on) in its own trend file, separate
+    from the row-level held-out numbers this function also logs unsuffixed.
+    """
+    summary_path = os.path.join(results_dir, f"runs_summary{suffix}.csv")
     row = {"datetime": dt_str, "model_class": type(model).__name__}
     for ch, m in held_out_metrics.items():
         row[f"{ch}_rmse"] = m["rmse"]
@@ -900,7 +1153,7 @@ def _update_summary(model: DistillModel, held_out_metrics: dict,
             ax.set_ylabel(ylabel)
             ax.set_title(f"{ch} — held-out {ylabel} over runs")
     fig.tight_layout()
-    path = os.path.join(results_dir, "comparison_plot.png")
+    path = os.path.join(results_dir, f"comparison_plot{suffix}.png")
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"[results] comparison -> {path}")
@@ -912,7 +1165,7 @@ def _row_split_eval(model: DistillModel, recordings, holdout: float) -> dict:
 
     Matches ``original_train.py``'s split (``step = round(1/holdout)``, every
     step-th row by index, no RNG). Requires ``model._design(recordings)`` ->
-    ``{joint: (X, y)}`` with ``y = actual_<channel> - target_<channel>`` (what
+    ``{joint: (X, y, groups)}`` with ``y = actual_<channel> - target_<channel>`` (what
     ``PerJointPositionModel`` provides) and ``model._row_split_fit_predict``
     for the throwaway fit -- neither is part of the generic ``DistillModel``
     interface, so a model without both can't use this. The throwaway fit
@@ -938,7 +1191,7 @@ def _row_split_eval(model: DistillModel, recordings, holdout: float) -> dict:
     is_test = np.arange(n) % step == 0
 
     eval_data = {ch: {}}
-    for j, (X, y) in design.items():
+    for j, (X, y, _groups) in design.items():
         pred_res = model._row_split_fit_predict(X[~is_test], y[~is_test], X[is_test])
         tgt    = target_by_joint[j][is_test]
         actual = tgt + y[is_test]
@@ -950,7 +1203,8 @@ def _row_split_eval(model: DistillModel, recordings, holdout: float) -> dict:
 
 def log_run(model: DistillModel, csvs: list, holdout: float,
             held_out_eval: dict, in_sample_metrics: dict,
-            results_dir: str = None, dt_str: str = None):
+            results_dir: str = None, dt_str: str = None,
+            heldout_csvs: list = None, heldout_eval: dict = None):
     """Log a training run: save log.json, residual plot, per-joint RMSE plot,
     update runs_summary.csv and regenerate the comparison plot.
 
@@ -961,6 +1215,15 @@ def log_run(model: DistillModel, csvs: list, holdout: float,
     as good as the held-out numbers, and if it doesn't, the fit itself is
     broken.
 
+    ``heldout_csvs``/``heldout_eval`` (optional) are the file-level held-out
+    set -- recordings never in ``csvs`` at all (e.g. ``data/heldout/*.csv``),
+    scored with ``_evaluate_model`` on the *saved* (100%-refit) model. Unlike
+    ``held_out_eval``'s row-level split, these rows come from trajectories
+    the model never saw during fitting, so this is the honest
+    unseen-trajectory number -- logged and plotted separately (a
+    ``heldout/`` subfolder and a ``_heldout``-suffixed summary/comparison
+    file) so it's never confused with the row-level diagnostic.
+
     Args:
         model:              the DistillModel already refit on 100% of ``csvs``.
         csvs:                every recording used (train and, in this row-level
@@ -970,6 +1233,8 @@ def log_run(model: DistillModel, csvs: list, holdout: float,
         in_sample_metrics:   from ``_compute_metrics(_evaluate_model(model, recordings))``.
         results_dir:         override for RESULTS_DIR.
         dt_str:              override for the run timestamp (default: now).
+        heldout_csvs:        paths of the file-level held-out recordings, or ``None``.
+        heldout_eval:        from ``_evaluate_model(model, heldout_recordings)``, or ``None``.
     """
     results_dir = results_dir or RESULTS_DIR
     dt_str      = dt_str or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -977,6 +1242,7 @@ def log_run(model: DistillModel, csvs: list, holdout: float,
     os.makedirs(run_dir, exist_ok=True)
 
     held_out_metrics = _compute_metrics(held_out_eval)
+    heldout_metrics = _compute_metrics(heldout_eval) if heldout_eval else None
 
     log = {
         "datetime":          dt_str,
@@ -990,6 +1256,8 @@ def log_run(model: DistillModel, csvs: list, holdout: float,
         },
         "held_out_metrics":  held_out_metrics,
         "in_sample_metrics": in_sample_metrics,
+        "heldout_files":     heldout_csvs,
+        "heldout_metrics":   heldout_metrics,
     }
     log_path = os.path.join(run_dir, "log.json")
     with open(log_path, "w") as f:
@@ -1006,6 +1274,16 @@ def log_run(model: DistillModel, csvs: list, holdout: float,
     _plot_coefficients(model, run_dir)
     summary_row = {ch: m["overall"] for ch, m in held_out_metrics.items()}
     _update_summary(model, summary_row, results_dir, dt_str)
+
+    if heldout_metrics is not None:
+        heldout_dir = os.path.join(run_dir, "heldout")
+        os.makedirs(heldout_dir, exist_ok=True)
+        _plot_residuals(heldout_eval, heldout_metrics, model.predicts(), heldout_dir)
+        _plot_residuals_per_joint(heldout_eval, heldout_metrics, model.predicts(), heldout_dir)
+        _plot_per_joint_metrics(heldout_metrics, model.predicts(), heldout_dir)
+        heldout_summary_row = {ch: m["overall"] for ch, m in heldout_metrics.items()}
+        _update_summary(model, heldout_summary_row, results_dir, dt_str, suffix="_heldout")
+
     print(f"[results] run complete -> {run_dir}")
 
 
@@ -1017,6 +1295,11 @@ def main():
                     "docstring for the row-level-split caveat.")
     ap.add_argument("--csvs", nargs="+", default=DEFAULT_CSVS,
                     help="recordings to train on (default: all of them)")
+    ap.add_argument("--heldout-csvs", nargs="+", default=DEFAULT_HELDOUT_CSVS,
+                    help="recordings never trained on, scored after the model "
+                        "is refit on 100%% of --csvs, for an honest "
+                        "unseen-trajectory comparison across models (default: "
+                        "data/heldout/*.csv; pass nothing to skip)")
     ap.add_argument("--holdout", type=float, default=DEFAULT_HOLDOUT,
                     help="row fraction held out for the printed/plotted/logged "
                         "error report (default: %(default)s); the saved model "
@@ -1054,9 +1337,32 @@ def main():
     model.save(args.out)             # models/distill.pkl — "latest" for pipeline defaults
     print(f"refit on 100% of {len(recordings)} run(s), saved {args.out}")
 
+    # File-level held-out set: recordings never in --csvs at all (default
+    # data/heldout/*.csv) -- an honest unseen-trajectory number, unlike the
+    # row-level split above (rows from the same trajectories just fit on).
+    heldout_eval = None
+    if args.heldout_csvs:
+        heldout_recordings = [Recording(r.path, df=pre.transform_distill(r.df))
+                              for r in (Recording(p) for p in args.heldout_csvs)]
+        heldout_eval = _evaluate_model(model, heldout_recordings)
+        heldout_metrics = _compute_metrics(heldout_eval)
+        n_heldout_rows = len(next(iter(heldout_eval[model.predicts()[0]].values()))["actual"])
+        print(f"file-level heldout ({n_heldout_rows} rows/joint) from "
+              f"{len(heldout_recordings)} unseen file(s): "
+              f"{[os.path.basename(p) for p in args.heldout_csvs]}")
+        for ch, m in heldout_metrics.items():
+            ovr = m["overall"]
+            print(f"  {ch}: RMSE={ovr['rmse']:.4f}  R2={ovr['r2']:.4f}")
+            for pj in m["per_joint"]:
+                print(f"    {pj['joint']:10s} RMSE={pj['rmse']:.4f}  R2={pj['r2']:.4f}")
+    else:
+        print("no --heldout-csvs given/found -- skipping file-level heldout eval")
+
     # Log this run: save results/<datetime>/{log.json, model, plots} and update summary.
     dt_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_run(model, args.csvs, args.holdout, held_out_eval, in_sample_metrics, dt_str=dt_str)
+    log_run(model, args.csvs, args.holdout, held_out_eval, in_sample_metrics, dt_str=dt_str,
+           heldout_csvs=args.heldout_csvs if args.heldout_csvs else None,
+           heldout_eval=heldout_eval)
 
 
 if __name__ == "__main__":
