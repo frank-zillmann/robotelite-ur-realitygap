@@ -198,6 +198,7 @@ def send_program(host: str, program: str, port: int = SCRIPT_PORT):
         program += "\n"                    # controller runs on the trailing newline
     with socket.create_connection((host, port), timeout=5) as s:
         s.sendall(program.encode())
+        print(program.encode())                     # echo the program to stdout for reference
 
 
 def _done_check():
