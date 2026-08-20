@@ -1,0 +1,15 @@
+# T09_slow_r1 optimized: retimed by rl_optimize, geometry unchanged.
+#
+# Each movej is the same straight line the recording drew; only its speed
+# and acceleration differ, and each sleep is the original scaled. Run it
+# with send.py --script, or load it on the pendant.
+
+sleep(0.0033)
+movej([-0.599966, -1.799966, 0.900017, -1.570800, -1.570800, 0.000000], a=2.2467, v=0.5798)
+sleep(0.0683)
+movej([0.399957, -1.000035, 0.999996, -1.570800, -1.570800, 0.000000], a=2.0749, v=0.5572)
+sleep(0.0683)
+movej([-0.299947, -1.599954, 1.000000, -1.570800, -1.570800, 0.000000], a=2.4699, v=0.6079)
+sleep(0.0683)
+movej([-0.000048, -1.200065, 1.199968, -1.570800, -1.570800, 0.000000], a=0.8846, v=0.3638)
+sleep(0.0808)

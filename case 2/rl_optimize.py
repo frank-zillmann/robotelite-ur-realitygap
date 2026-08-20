@@ -575,7 +575,7 @@ def _apply(args):
     comparison a comparison. The predicted improvement is printed alongside, because
     that is the number the robot is being asked to confirm or refute.
     """
-    from convert import write_path
+    from convert import write_path, write_script
     from stable_baselines3 import PPO
     from train_distillation_model import DistillModel
 
@@ -603,11 +603,20 @@ def _apply(args):
             print(f"  {name}: not in the bank, skipped")
             continue
         it = by[name]
+        a_used, _ = agent.predict(bank.normalize(it.obs), deterministic=True)
         q, T, reward, terms = agent_solve(agent, model, robot, bank, it, args.k,
                                           args.w_peak, args.w_settle)
         base = os.path.join(args.out_dir, name)
         write_path(f"{base}.baseline.path", it.q, DT)
         write_path(f"{base}.ppo.path", q, DT)
+        # Also as URScript. A retiming leaves the geometry alone, so it can be
+        # expressed as the original movej line at a different speed -- a few dozen
+        # lines the controller runs itself, instead of thousands of streamed rows.
+        mult = O.time_scale(torch.as_tensor(np.asarray(a_used[:it.n_blocks]),
+                                            dtype=torch.float64)).numpy()
+        write_script(f"{base}.baseline.script", it.q, it.bnd,
+                     np.ones(it.n_blocks), DT, f"{name} baseline")
+        write_script(f"{base}.ppo.script", it.q, it.bnd, mult, DT, f"{name} optimized")
         flag = "  ** INFEASIBLE, do not run" if terms["pen"] > 1e-9 else ""
         print(f"{name:18s} {it.T0:7.3f} {T:7.3f} {(1-T/it.T0)*100:5.1f}% "
               f"{terms['err']/it.baseline(args.k):6.3f} {terms['pen']:7.5f} "

@@ -1,0 +1,10 @@
+# T10_fast_r1 baseline: retimed by rl_optimize, geometry unchanged.
+#
+# Each movej is the same straight line the recording drew; only its speed
+# and acceleration differ, and each sleep is the original scaled. Run it
+# with send.py --script, or load it on the pendant.
+
+movej([-0.000003, -1.299999, 1.299998, -1.570799, -1.570801, 0.000004], a=2.0000, v=1.0000)
+sleep(0.8080)
+movej([-0.800000, -0.900000, 0.700000, -1.200000, -1.900000, 1.200000], a=2.0000, v=1.0000)
+sleep(0.7920)

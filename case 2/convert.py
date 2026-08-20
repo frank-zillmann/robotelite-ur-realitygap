@@ -62,6 +62,54 @@ def write_path(path: str, q, dt: float):
         w.writerows([f"{v:.6f}" for v in [*row, dt]] for row in q)
 
 
+def write_script(path: str, q, bnd, mult, dt: float = DT, name: str = ""):
+    """Write a retimed trajectory as a URScript program of ``movej`` and ``sleep``.
+
+    A ``.path`` has to be streamed: thousands of ``servoj`` rows pushed over a socket,
+    which costs upload time, breaks if a program is sent before the last one ended,
+    and cannot be loaded on the pendant. A retiming does not need any of that, because
+    it never changes the geometry -- each move is still the straight joint-space line
+    the original ``movej`` drew, and only its duration differs.
+
+    That conversion is exact rather than approximate. Scaling a trapezoidal speed
+    profile in time by ``k`` gives another trapezoid with ``v/k`` and ``a/k**2``, so a
+    block the optimizer shortened to ``k`` of its recorded duration is reproduced by
+    ``movej(dest, a=a0/k**2, v=v0/k)``; a pause it shortened is ``sleep(t0*k)``. The
+    controller then generates the motion itself, at its own control rate.
+
+    ``v0``/``a0`` are measured from the recorded block rather than read from the source
+    script, so this works for any recording, including ones whose script is not to hand.
+    """
+    rows = np.round(np.asarray(bnd) / dt).astype(int).clip(0, len(q) - 1)
+    qd = np.gradient(np.asarray(q, float), dt, axis=0)
+    qdd = np.gradient(qd, dt, axis=0)
+    out = [f"# {name or 'optimized'}: retimed by rl_optimize, geometry unchanged.",
+           "#",
+           "# Each movej is the same straight line the recording drew; only its speed",
+           "# and acceleration differ, and each sleep is the original scaled. Run it",
+           "# with send.py --script, or load it on the pendant.",
+           ""]
+    held = 0.0
+    for b, (i0, i1) in enumerate(zip(rows[:-1], rows[1:])):
+        k = float(mult[b]) if b < len(mult) else 1.0
+        span = np.abs(q[i1] - q[i0]).max()
+        if span < 1e-3:                                   # a pause: scale the wait
+            held += (i1 - i0) * dt * k
+            continue
+        if held > 1e-3:
+            out.append(f"sleep({held:.4f})")
+            held = 0.0
+        v0 = float(np.abs(qd[i0:i1 + 1]).max())
+        a0 = float(np.abs(qdd[i0:i1 + 1]).max())
+        dest = ", ".join(f"{x:.6f}" for x in q[i1])
+        out.append(f"movej([{dest}], a={a0 / k ** 2:.4f}, v={v0 / k:.4f})")
+    if held > 1e-3:
+        out.append(f"sleep({held:.4f})")
+    with open(path, "w") as f:
+        f.write("\n".join(out) + "\n")
+    return sum(1 for line in out if line.startswith("movej"))
+
+
 def main():
     ap = argparse.ArgumentParser(description="Record what a script commands, as a path.")
     ap.add_argument("--script", required=True, help="URScript to run")
