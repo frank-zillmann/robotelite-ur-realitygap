@@ -17,6 +17,15 @@ motion against it, run baseline and optimized on the robot, and see whether the
 predicted improvement survives. What the *controller* does with a script is not
 modelled — `convert.py` records it from the controller.
 
+There are two solvers over that one model, minimizing the identical objective so
+their numbers are comparable:
+
+- **`optimize.py`** — differentiates the score down to a spline's control points.
+  Exact, and it re-solves from scratch for every path.
+- **`rl_optimize.py`** — a PPO policy trained across many paths, so an unseen one
+  costs a forward pass (~6 ms) instead of a solve (~10 s). It reparameterizes the
+  problem onto the `movable` blocks, which is where the gain actually is.
+
 ## Prerequisites
 
 ```bash
@@ -63,6 +72,46 @@ python analysis.py --csv baseline.csv optimized.csv --model models/distill-ur5e.
 the improvement the model predicted holds on hardware, the model matched the robot;
 if not, it was missing something, which sends you back to step 1.
 
+### The learned solver
+
+The RL lane needs **no robot at all** until the last step: `paths.py` rebuilds every
+recording's commanded trajectory offline, which is the same signal `convert.py` gets
+by running the script.
+
+```bash
+# a. every recording as a closed path, plus its baselines: the training bank
+python paths.py --data data/ur5e --model models/distill-ur5e.pkl --robot UR5e \
+    --out models/bank-ur5e.pkl
+
+# b. is there anything here worth training for? (~5 min, no training)
+python rl_optimize.py preflight --bank models/bank-ur5e.pkl \
+    --model models/distill-ur5e.pkl --robot UR5e
+
+# c. clone a search, then improve on it with PPO (~25 min; the clone is cached)
+python rl_optimize.py train --bank models/bank-ur5e.pkl --model models/distill-ur5e.pkl \
+    --robot UR5e --rl-points 0 --steps 500000 --bc 150 --agent models/ppo-ur5e.zip
+
+# d. score it on paths it never saw
+python paths.py --data data/ur5e/heldout --model models/distill-ur5e.pkl --robot UR5e \
+    --held-out --no-sub-paths --out models/bank-ur5e-heldout.pkl
+python rl_optimize.py eval --bank models/bank-ur5e-heldout.pkl \
+    --model models/distill-ur5e.pkl --robot UR5e --rl-points 0 --agent models/ppo-ur5e.zip
+
+# e. write the optimized motions, as URScript and as a servoj path
+python rl_optimize.py apply --bank models/bank-ur5e-heldout.pkl \
+    --model models/distill-ur5e.pkl --robot UR5e --agent models/ppo-ur5e.zip \
+    --out-dir optimized
+
+# f. run every baseline/optimized pair on the robot, one command
+python run_tests.py --robot-ip <ip>
+python hw_check.py --robot-ip <ip>      # if a program will not start
+```
+
+Step **b** is a gate, not a formality: it measures how much of each cycle is dead
+time, sweeps each action coordinate, and runs a CEM search as the ceiling any
+black-box optimizer could reach. If CEM cannot beat the gradient lane there is
+nothing for a policy to amortize, and it says so before you spend the training run.
+
 ## Folder contents
 
 | File | Role |
@@ -70,8 +119,12 @@ if not, it was missing something, which sends you back to step 1.
 | `record.py` | passive RTDE logger: stream robot state to a CSV, never moves the robot |
 | `collect_data.py` | record a whole matrix of trajectories x speeds x reps, with a manifest |
 | `send.py` | send a URScript (or a `servoj` path) to the robot, run it, record it |
-| `convert.py` | run a script on the controller, keep the trajectory it commanded |
-| `optimize.py` | differentiate a score through the model down to the path's parameters |
+| `convert.py` | run a script on the controller, keep the trajectory it commanded; writes a `.path` or a retimed `.script` |
+| `optimize.py` | differentiate a score through the model down to the path's parameters; also the block-aligned basis both solvers share |
+| `paths.py` | rebuild every recording's commanded path offline — no robot — as the RL training bank |
+| `rl_optimize.py` | a PPO policy over the same objective `optimize.py` differentiates |
+| `run_tests.py` | run every baseline/optimized pair on the robot and report what changed |
+| `hw_check.py` | why a program will not start, using one that moves nothing |
 | `train_distillation_model.py` | `DistillModel` interface + `CNNModel`: predict the actual channels |
 | `common.py` | `segments` (split a recording into moves), `features`, `MoveDataset`/`loaders` |
 | `analysis.py` | `Recording` (shared CSV loader) + a plotly viewer and the measured error/cycle-time table |
@@ -135,30 +188,63 @@ reported against it.
   refuses a recording made at another rate. A path's `dt` column may still differ per
   row and is honoured from at least 1 ms to 50 ms, but below the controller's 2 ms
   cycle it cannot act on each setpoint separately.
-- The limit penalty is soft, so the result can sit a percent or two above the
-  controller's own tool-speed cap of 1.35 m/s — still far below the safety limit that
-  stops the robot, and `optimize.py` prints the peak either way. Raise `LIMIT` to
-  hold it tighter, at some cost in convergence.
+- **The two solvers want different things from the limit penalty.** `penalty` scores
+  the mean overshoot *and* a fourth-power norm of it, because the mean alone dilutes a
+  brief excursion into noise — a path a tool-speed limit over the cap for a tenth of a
+  second scored 9e-5, which at any weight is worth buying. But a barrier stiff enough
+  to resist half a million policy evaluations is hostile to gradient descent
+  approaching it from inside: measured, the gradient lane degrades monotonically with
+  `LIMIT` and finds nothing at all above ~100, while CEM returns the same feasible
+  answer anywhere from 30 to 1000. `LIMIT = 30` is where both still work. Note the
+  ceilings are the controller's *spec* values; `Robot.MARGIN` exists so a differenced
+  recording is not misread as a violation, and handing it to an optimizer would just
+  convert tolerance into 2% more speed the controller then clamps.
 - The joint acceleration ceilings are measured, not specified — UR publishes none —
   and the UR5e reuses the UR10e's for want of anything better.
-- **The optimizer finds a local optimum.** On `scripts/triangle.script` it scores
-  1.72 against the recorded path's 2.00 (−12% tracking error, −16% cycle time), but
-  a hand-built solution that simply deletes the pauses scores 1.45 — the model says
-  the pauses buy only 1.4% of error for 2.4 s of cycle time, and gradient descent
-  does not get there from the reference.
+- **The gradient lane finds a local optimum, and the basis is why.** A recorded cycle
+  spends 25–43% of itself standing still on `sleep`, but `phase`'s 24 uniform slices
+  straddle moves and pauses — a pause spans anywhere from 0.1 to 4.8 of them — so
+  nothing can shorten one without stretching the move beside it. `optimize.bounds`
+  reparameterizes onto the `movable` blocks instead (4–9 of them, each wholly a move
+  or wholly a pause), and a search in that basis reaches a median 0.50 against the
+  gradient lane's 0.12 on the same objective. That gap is what the RL lane exists for.
+- **The policy is conservative, deliberately.** It reaches ~79% of what a per-path CEM
+  search finds. Cloning the search alone scores *higher* on the median (0.40 vs 0.31)
+  but produced motions the controller would refuse on 5 of 9 paths — one commanding
+  1.5× the joint-speed limit and 3.9× the tool-speed cap. PPO trades a fifth of the
+  score for solutions that are feasible every time, which is the right trade when an
+  infeasible path is worth nothing.
+- **The action is a fixed-width vector, so block count is a coverage question.**
+  Coordinate *k* drives block *k*. Trained on paths of 2–7 blocks, a policy has never
+  exercised the coordinates an 8-block path uses and emits an untrained answer for
+  them — measured, a limit violation of 1.9 on exactly those paths. `paths.repeat`
+  fills the range by running each closed cycle twice, which is a real trajectory
+  (`send.py --loop 2`), not a synthetic one. Sub-paths cannot do it: every one has
+  *fewer* blocks than its parent.
+- **The gap model is ~22% optimistic on runs it never saw.** Against the held-out
+  recordings it predicts 0.076 mrad where 0.097 was measured — a consistent factor
+  (0.66–0.85, no outliers) rather than noise, so the *ratio* of optimized to baseline
+  survives it better than the absolute does. Its uncertainty is honest: 70% of rows
+  fall inside the predicted 1-sd band against 0.68 for perfect calibration.
 - The tool-speed limit uses the Jacobian at the current trajectory, refreshed each
   step from detached poses: the value is right, the gradient is the speed's alone.
 
 ## Tiers
 
-- **Bronze, understand it:** run the pipeline end to end, use `analysis.py` to see
-  the reality gap, explore the `Preprocess` step, and decide what `EvaluationMetric`
-  should measure. Record more runs with `record.py` if you like.
-- **Silver, build the model:** write your own `DistillModel`, choose the features
-  and architecture, and beat `CNNModel` on held-out runs.
-- **Gold, optimize it:** improve the RL agent (observation, `OBJECTIVE`, reward) and
-  the `Dynamics` torque model (friction, Coriolis, identified parameters), and beat
-  a fixed baseline's score.
-- **Diamond, push to real:** shape the servoj path (path mode) and transfer to a
-  real UR10e, refit the `DistillModel`/`Dynamics` on the real recordings, and close
-  the sim-to-real loop until the robot measurably improves.
+- **Bronze, understand it:** run the pipeline end to end, use `analysis.py` to see the
+  reality gap on a recording, and read `optimize.loss` — decide for yourself what
+  `ALPHA` should be for your arm, given how big its gap actually is.
+- **Silver, build the model:** write your own `DistillModel`, choose the features and
+  architecture, and beat `CNNModel` on held-out runs. Score it the way `Known gaps`
+  does: predicted against measured on recordings it never trained on, and whether its
+  uncertainty band is calibrated.
+- **Gold, optimize it:** improve either solver against the same objective —
+  `optimize.py`'s `error`/`penalty`/spline for the gradient lane, or
+  `rl_optimize.py`'s observation, action basis and reward for the policy. Beat the
+  recorded path on motions the optimizer never saw, with every result feasible.
+- **Diamond, push to real:** transfer to hardware, refit the `DistillModel` on the new
+  recordings, and close the loop until the arm measurably improves. `run_tests.py`
+  runs every baseline/optimized pair in one command; `hw_check.py` says why a program
+  will not start. A simulator cannot finish this tier — there the measured angle *is*
+  the commanded one, so it can confirm the cycle time and the controller's acceptance
+  of a path, and nothing about the gap.
