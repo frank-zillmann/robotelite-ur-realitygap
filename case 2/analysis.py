@@ -14,9 +14,11 @@ and the model pale and thick behind them.
     python analysis.py --csv baseline.csv optimized.csv --path baseline.path optimized.path \
         --model models/distill-ur5e.pkl --robot UR5e
 
-Several runs can be given at once; their optimizer objective is printed for
-comparison. Cycle time comes from ``--path`` (one entry per ``--csv``, same
-order), while the learned gap is evaluated over all recorded target rows.
+Several runs can be given at once; their gap, predicted gap, and optimizer
+loss are printed for comparison. Cycle time comes from ``--path`` (one
+entry per ``--csv``, same order); gap and predicted_gap are RMSE over all
+recorded rows, the former measured (actual vs. target), the latter the
+model's guess at it from target alone.
 
 Only the first ``--max-points`` rows are plotted, at the recording's full rate.
 
@@ -120,32 +122,38 @@ def cycle_time(path: str) -> float:
 
 
 def stats(recs, paths, model, robot):
-    """Print predicted gap and cycle time for the complete recorded trajectories.
+    """Print measured and predicted gap, cycle time, and loss per trajectory.
 
-    ``paths`` is the `.path` matching each recording, one-to-one -- a run's `.csv`
-    no longer implies its `.path` by name (e.g. send.py names a stream/batch run
-    `foo.stream.csv`, not `foo.csv`), so it has to be given explicitly.
+    ``paths`` matches each recording one-to-one -- a run's `.csv` no longer implies
+    its `.path` by name (e.g. `foo.stream.csv` from send.py), so it's explicit.
 
-    The barrier is an optimization device, not something to score a finished
-    trajectory by (it's already known to respect the limits, or it wouldn't have
-    been sent), so it's evaluated at weight 0 here.
+    ``gap`` is the true RMSE between ``actual_q`` and ``target_q``; ``predicted_gap``
+    is the model's guess at that from ``target_q`` alone -- what the optimizer
+    actually chases, since it never sees ``actual_q``. ``loss`` mirrors the
+    optimizer's training loss, built from the predicted gap. The barrier itself
+    isn't scored here (an optimization device, and the trajectory is already known
+    to respect the limits), so it's evaluated at weight 0.
     """
     import torch
-    from optimize import measures, objective
+    from optimize import loss as loss_fn
+    from optimize import penalties
 
     q = [torch.as_tensor(rec.target_q, dtype=torch.float32) for rec in recs]
     times = [cycle_time(p) for p in paths]
+    measured = [float(np.sqrt(np.mean((rec.actual_q - rec.target_q) ** 2))) for rec in recs]
     with torch.no_grad():
-        base_gap, _, _ = measures(model, robot, q[0], weight=0)
+        base_gap, _, _ = penalties(model, robot, q[0], weight=0)
         scale = times[0] / float(base_gap.clamp_min(1e-8))
-        rows = [objective(model, robot, qi, cycle, scale, weight=0)
+        rows = [loss_fn(model, robot, qi, cycle, scale, weight=0)
                 for qi, cycle in zip(q, times)]
 
     names = [os.path.basename(rec.path) for rec in recs]
     width = max(map(len, names))
-    print(f"  {'run':{width}s} {'gap [mrad]':>12s} {'cycle [s]':>10s} {'objective':>10s}")
-    for name, cycle, (total, gap, _, _) in zip(names, times, rows):
-        print(f"  {name:{width}s} {float(gap) * 1000:12.4f} {cycle:10.3f} {float(total):10.4f}")
+    print(f"  {'run':{width}s} {'gap [mrad]':>12s} {'predicted_gap [mrad]':>21s} "
+          f"{'cycle [s]':>10s} {'loss':>10s}")
+    for name, cycle, gap_meas, (total, gap_pred, _, _) in zip(names, times, measured, rows):
+        print(f"  {name:{width}s} {gap_meas * 1000:12.4f} {float(gap_pred) * 1000:21.4f} "
+              f"{cycle:10.3f} {float(total):10.4f}")
 
 
 def view(recs: list, quantity: str = "angle q", joint: int = 1, model=None,

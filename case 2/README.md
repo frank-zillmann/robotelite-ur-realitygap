@@ -59,7 +59,7 @@ python send.py scripts/triangle.retime.path --robot-ip 127.0.0.1 --engine batch 
 python send.py scripts/triangle.path --robot-ip 192.168.1.100 --engine stream --loop 5
 python send.py scripts/triangle.retime.path --robot-ip 192.168.1.100 --engine stream --loop 5
 
-# 5. compare them: one plot, and the optimizer objective side by side
+# 5. compare them: one plot, and the optimizer loss side by side
 python analysis.py --csv scripts/triangle.stream.csv scripts/triangle.retime.stream.csv --path scripts/triangle.path scripts/triangle.retime.path --model models/distill-ur5e.pkl --robot UR5e --joint 0
 ```
 
@@ -78,7 +78,7 @@ if not, it was missing something, which sends you back to step 1.
 | `optimize.py` | differentiates a score through the model to the path |
 | `train_distillation_model.py` | `DistillModel` + `CNNModel`: predict actual channels |
 | `common.py` | `segments`, `features`, `MoveDataset`/`loaders` |
-| `analysis.py` | `Recording` CSV loader, plotly viewer, objective table |
+| `analysis.py` | `Recording` CSV loader, plotly viewer, loss table |
 | `utils.py` | constants, `Robot` kinematics/ceilings, URScript load/edit |
 
 `scripts/` the URScript motions, `models/` the trained models, `data/<arm>/`
@@ -111,8 +111,9 @@ URScript ──► the controller ──► recorded target_q                (co
 - **`optimize.py`**: learns one time interval per recorded waypoint. An edge below
   `PAUSE_TOL` (not a real pose, just noise) shrinks freely instead of floored at
   `MIN_DT`. A log barrier (true to +infinity at each limit) keeps it inside joint
-  and TCP speed/accel/position limits, its weight decaying early in the run so the
-  tail is free to optimize cycle time and gap alone. Output is resampled onto the
+  and TCP speed/accel limits (position is untouched by retiming, so it's never
+  checked), its weight decaying early in the run so the tail is free to optimize
+  cycle time and gap alone. Output is resampled onto the
   model's uniform 8 ms grid (a servoJ streamer only ticks at one fixed rate anyway).
 - **`utils.Robot`**: swaps DH table and limits per arm. The model isn't
   interchangeable between arms — keep `--data`/`--model`/`--robot` matched.

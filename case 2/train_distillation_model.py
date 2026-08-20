@@ -118,7 +118,7 @@ class CNNModel(DistillModel):
     def __init__(self, targets=("actual_q",), hidden: int = 48,
                  dilations=(1, 2, 4, 8, 16, 32), kernel: int = 3, members: int = 3,
                  epochs: int = 50, batch: int = 16, lr: float = 3e-3,
-                 val_frac: float = 0.2, seed: int = 0):
+                 val_frac: float = 0.0, seed: int = 0):
         self.targets = tuple(targets)
         self.epochs, self.batch, self.val_frac = epochs, batch, val_frac
         self.lr, self.seed = lr, seed
@@ -170,12 +170,12 @@ class CNNModel(DistillModel):
         return mean[0].T, (aleatoric + epistemic)[0].T
 
     def loss(self, xb, yb, mask, warmup: bool):
-        """``(objective, info)`` for one batch, averaged over the real rows.
+        """``(loss, info)`` for one batch, averaged over the real rows.
 
         ``info`` is what gets logged; the ``err/*`` entries are de-standardised, so
         they are in the target's own unit (A for currents, rad for angles):
 
-            loss/objective    what this step minimizes: mse warming up, nll after
+            loss/loss         what this step minimizes: mse warming up, nll after
             loss/sq           precision-weighted squared error, mean over members
             loss/logvar       0.5*log var, the penalty on being wide
             loss/nll          sq + logvar, the Gaussian NLL
@@ -191,15 +191,15 @@ class CNNModel(DistillModel):
         sq = masked_mean((0.5 * (yb - mu) ** 2 * torch.exp(-lv)).mean(0))
         logvar = masked_mean(0.5 * lv.mean(0))
         mse = masked_mean(((yb - mu) ** 2).mean(0))
-        objective = mse if warmup else sq + logvar
+        loss = mse if warmup else sq + logvar
         # Ensemble mixture: mean of variances (aleatoric) + variance of means. The
         # label std turns a standardised difference back into the real unit.
         out_mean, aleatoric, epistemic = self.outputs(mu, lv)
         my, sy = (torch.as_tensor(v, dtype=yb.dtype)[:, None] for v in self.stats[2:])
         err = (yb * sy + my - out_mean).abs()
         std = torch.sqrt(aleatoric + epistemic)
-        return objective, {
-            "loss/objective": objective, "loss/sq": sq, "loss/logvar": logvar,
+        return loss, {
+            "loss/loss": loss, "loss/sq": sq, "loss/logvar": logvar,
             "loss/nll": sq + logvar, "loss/mse": mse,
             "err/mean": masked_mean(err), "err/std": masked_mean((std - err).abs()),
             "err/coverage": masked_mean((err <= std).float()),
@@ -210,10 +210,10 @@ class CNNModel(DistillModel):
         logs = []
         for xb, yb, mask in loader:
             with torch.set_grad_enabled(opt is not None):
-                objective, info = self.loss(xb, yb, mask, warmup)
+                loss, info = self.loss(xb, yb, mask, warmup)
             if opt is not None:
                 opt.zero_grad(set_to_none=True)
-                objective.backward()
+                loss.backward()
                 # The NLL weights the error by exp(-log_var), so one outlier row under
                 # a confident prediction can otherwise blow up the step.
                 nn.utils.clip_grad_norm_(self.parameters(), 5.0)
