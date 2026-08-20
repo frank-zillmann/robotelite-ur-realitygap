@@ -265,17 +265,24 @@ class CNNModel(DistillModel):
                 "var_epistemic": split(epi)}
 
 
+SKIP = {"manifest.csv", "pooled.csv"}     # aggregates, not runs of their own
+
+
 def load_recordings(folder: str):
     """Every recording directly in ``folder``, skipping what is not one.
 
-    A data folder also holds a manifest and pooled copies, and subfolders such as
-    ``heldout/`` are left alone on purpose -- so anything that will not load as a
-    run at ``utils.DT`` is reported and passed over rather than silently ruining
-    the fit.
+    A data folder also holds a manifest and a pooled copy of every run in it
+    (``SKIP``, skipped by name -- ``pooled.csv`` has the right schema and rate to
+    load as a Recording, so it would otherwise double every move's weight rather
+    than fail loudly), and subfolders such as ``heldout/`` are left alone on
+    purpose -- so anything left that will not load as a run at ``utils.DT`` is
+    reported and passed over rather than silently ruining the fit.
     """
     from analysis import Recording
     out = []
     for p in sorted(glob.glob(f"{folder}/*.csv")):
+        if p.rsplit("/", 1)[-1] in SKIP:
+            continue
         try:
             rec = Recording(p)
             if abs(rec.dt - DT) > 0.05 * DT:
@@ -292,6 +299,9 @@ def main():
     ap = argparse.ArgumentParser(description="Train the distillation model.")
     ap.add_argument("--data", required=True, help="folder of recordings, e.g. data/ur5e")
     ap.add_argument("--out", required=True, help="pickle to write, e.g. models/distill-ur5e.pkl")
+    ap.add_argument("--epochs", type=int, default=50, help="training epochs")
+    ap.add_argument("--hidden", type=int, default=48, help="channels per residual block")
+    ap.add_argument("--members", type=int, default=3, help="ensemble size")
     args = ap.parse_args()
 
     # Import under the real module name (not "__main__") so the pickle loads
@@ -300,7 +310,7 @@ def main():
 
     recordings = load_recordings(args.data)
     print(f"{len(recordings)} recordings from {args.data}")
-    CNNModel().fit(recordings).save(args.out)
+    CNNModel(hidden=args.hidden, epochs=args.epochs, members=args.members).fit(recordings).save(args.out)
     print(f"saved {args.out}")
 
 

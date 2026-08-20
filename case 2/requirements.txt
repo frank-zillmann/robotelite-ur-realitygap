@@ -12,6 +12,9 @@ scipy>=1.10                # optional: Butterworth filter for the jerk metric
 torch>=2.0                 # the gap model, and the optimizer that differentiates it
 tensorboard>=2.10          # train_distillation_model.py logs each run to runs/
 
+gymnasium>=0.29            # train_ppo.py: the RL environment
+stable-baselines3>=2.0     # train_ppo.py: the PPO agent
+
 # No robot driver: record.py talks to the robot over raw TCP sockets with the
 # Python standard library only (same approach as case 1/ur_client.py). Nothing
 # to compile, no ur_rtde.

@@ -1,6 +1,7 @@
 /case 2/*.csv
 /case 2/models/
 /case 2/runs/
+/case 2/results/
 /case 2/scripts/*.path
 
 /.vscode/

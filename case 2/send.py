@@ -157,22 +157,51 @@ def wrap_path(rows, dt: float, loop: int | None = None) -> str:
     """Wrap a list of joint setpoints into a servoj-streaming program.
 
     Each row is six joint values, optionally followed by a per-row servoj time
-    (a 7th column); rows without it use ``dt``. The program streams the setpoints
-    with ``servoj``. Same done-flag auto-stop as ``wrap_program``; ``loop``
-    repeats the whole path.
+    (a 7th column); rows without it use ``dt``. Same done-flag auto-stop as
+    ``wrap_program``; ``loop`` repeats the whole path.
+
+    Prepends a ``movej`` to the path's first setpoint before the servoj stream
+    starts: ``servoj`` commands a small step from wherever the robot currently
+    is, not an absolute move -- if the robot is somewhere else, the first
+    servoj call would ask for an effectively instantaneous jump.
+
+    The setpoints are encoded as one flat URScript list literal (7 numbers per
+    row, back to back) and walked with a ``while`` loop indexing by arithmetic
+    offset, rather than one literal ``servoj(...)`` statement per row -- a
+    *nested* list literal (``[[...], [...], ...]``) is auto-coerced to URScript's
+    ``matrix`` type, which is not indexable with ``points[i]`` at all (confirmed
+    on real hardware: "Type error: the variable of type 'matrix' is not
+    indexable", the program ran its leading movej fine and aborted the instant
+    it reached the first ``points[i]``). A flat list has no such coercion.
     """
     IND = "  "
-    body = []
+    ROW = 7  # q0..q5 + dt, per row, in the flat list
+
+    flat = []
     for r in rows:
         q, dt_r = r[:6], (r[6] if len(r) > 6 else dt)
-        body.append(f"servoj([{', '.join(f'{v:.6f}' for v in q)}], 0, 0, "
-                    f"{dt_r:.6f}, {SERVO_LOOKAHEAD}, {SERVO_GAIN})")
-    out = ["def prog():", IND + f"write_output_float_register({DONE_REG}, 0)"]
+        flat += [f"{v:.6f}" for v in [*q, dt_r]]
+    points = "[" + ", ".join(flat) + "]"
+    first_q = rows[0][:6]
+    inner = [
+        IND + "i = 0",
+        IND + f"while (i < {len(rows)}):",
+        2 * IND + f"b = i * {ROW}",
+        2 * IND + "servoj([points[b], points[b+1], points[b+2], points[b+3], "
+                  "points[b+4], points[b+5]], 0, 0, points[b+6], "
+                  f"{SERVO_LOOKAHEAD}, {SERVO_GAIN})",
+        2 * IND + "i = i + 1",
+        IND + "end",
+    ]
+    out = ["def prog():",
+          IND + f"write_output_float_register({DONE_REG}, 0)",
+          IND + f"movej([{', '.join(f'{v:.6f}' for v in first_q)}], a=1.0, v=0.5)",
+          IND + f"points = {points}"]
     if loop is None:
-        out += [IND + b for b in body]
+        out += inner
     else:
         out += [IND + "loop_count = 0", IND + f"while (loop_count < {loop}):"]
-        out += [2 * IND + b for b in body]
+        out += [IND + ln for ln in inner]
         out += [2 * IND + "loop_count = loop_count + 1", IND + "end"]
     out += [IND + f"write_output_float_register({DONE_REG}, 1)", "end"]
     return "\n".join(out) + "\n"
@@ -200,7 +229,7 @@ def send_program(host: str, program: str, port: int = SCRIPT_PORT):
         s.sendall(program.encode())
 
 
-def _done_check():
+def _done_check(start_timeout: float = START_TIMEOUT_S):
     """Build a per-sample stop test for the sent program's done-flag register.
 
     Returns a closure ``check(smp, t)`` for ``record.record_stream`` that returns
@@ -209,7 +238,9 @@ def _done_check():
         to 0 (armed = motion running under our program),
       - wrapper flips the flag to 1 on its last line -> finished,
       - runtime leaves PLAYING after it started -> aborted,
-      - never starts within START_TIMEOUT_S -> not in Remote Control mode.
+      - never starts within ``start_timeout`` -> not in Remote Control mode
+        (or, for a large unrolled program, still parsing -- see ``record_path``'s
+        ``start_timeout``, which gives this longer before giving up).
     """
     state = {"started": False, "armed": False}
 
@@ -224,14 +255,14 @@ def _done_check():
             return "program finished"
         if state["started"] and not playing:       # runtime dropped: script aborted
             return "program stopped (aborted? check URSim Log Messages)"
-        if not state["started"] and t > START_TIMEOUT_S:
+        if not state["started"] and t > start_timeout:
             return "program never started (is the robot in Remote Control mode?)"
         return None
 
     return check
 
 
-def run_and_record(host, program, out, hz, recipe, port):
+def run_and_record(host, program, out, hz, recipe, port, start_timeout: float = START_TIMEOUT_S):
     """Send a ready-made program, record RTDE to `out`, stop when it finishes.
 
     Returns (n_samples, reason). Uses ``record.record_stream`` for the RTDE
@@ -242,7 +273,7 @@ def run_and_record(host, program, out, hz, recipe, port):
     send_program(host, program, port)      # stream open first, so we catch the start
     print(f"sent + recording {host}:{port} -> {out}  (Ctrl-C to stop)")
     try:
-        return record_stream(stream, out, recipe, stop_check=_done_check())
+        return record_stream(stream, out, recipe, stop_check=_done_check(start_timeout))
     finally:
         stream.close()
 
@@ -261,17 +292,72 @@ def record_run(host, script, out, hz=125.0, registers=("1", "vel", "2", "acc"),
     return run_and_record(host, program, out, hz, recipe, port)
 
 
-def record_path(host, path, out, dt=0.008, hz=125.0, loop=None, port=SCRIPT_PORT):
-    """Stream a servoj path file on the robot once (or ``loop`` times) and record it.
+# Rows per servoj program. Empirically bisected on real hardware: 200-row and
+# smaller programs start reliably every time; 544 rows never starts, at any
+# timeout, regardless of program structure (confirmed with both an unrolled
+# one-statement-per-row program and a flat-list-plus-loop one) -- a real
+# controller-side size limit, not a parsing-speed or syntax problem. A path
+# longer than this is sent as consecutive chunks (see record_path) rather than
+# assuming any single size is safe for every controller/firmware.
+CHUNK_SIZE = 200
+
+
+def record_path(host, path, out, dt=0.008, hz=125.0, loop=None, port=SCRIPT_PORT,
+                start_timeout: float = 30.0, chunk_size: int = CHUNK_SIZE):
+    """Stream a servoj path file on the robot once and record it.
 
     Like ``record_run`` but for a path CSV: wrap the setpoints as a servoj
     program at ``dt`` s per row. Only the done-flag register is logged (a servoj
     path carries no vel/acc registers).
+
+    Paths longer than ``chunk_size`` rows are sent as consecutive chunks, each
+    its own program/connection run back to back, with their recordings
+    concatenated into one ``out`` CSV -- see ``CHUNK_SIZE``'s docstring for why
+    this exists. ``loop`` is only supported for a path that fits in one chunk;
+    a longer path can't be looped this way (pass a pre-looped/concatenated path
+    instead).
+
+    ``start_timeout`` defaults far higher than ``record_run``'s (30s vs 5s):
+    even a single chunk is a program orders of magnitude larger than a normal
+    script, and might need longer than 5s to start -- which looks identical to
+    a Remote Control problem (both report "program never started") but isn't.
     """
+    rows = load_path(path)
     recipe = build_recipe([(DONE_REG, "_done")])
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    program = wrap_path(load_path(path), dt, loop)
-    return run_and_record(host, program, out, hz, recipe, port)
+
+    if len(rows) <= chunk_size:
+        program = wrap_path(rows, dt, loop)
+        return run_and_record(host, program, out, hz, recipe, port, start_timeout)
+
+    if loop is not None:
+        raise ValueError("record_path: --loop needs a path that fits in one chunk "
+                         f"(<= {chunk_size} rows); pass a pre-looped path instead")
+
+    chunks = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
+    print(f"  path is {len(rows)} rows -- sending as {len(chunks)} chunks of <= {chunk_size}")
+    total_n, header, body, stop = 0, None, [], None
+    for ci, chunk in enumerate(chunks):
+        tmp = f"{out}.chunk.csv"
+        print(f"  chunk {ci + 1}/{len(chunks)} ({len(chunk)} rows)")
+        n, stop = run_and_record(host, wrap_path(chunk, dt, None), tmp, hz, recipe,
+                                 port, start_timeout)
+        total_n += n
+        with open(tmp, newline="") as f:
+            rows_read = list(csv.reader(f))
+        os.remove(tmp)
+        if header is None:
+            header = rows_read[0]
+        body += rows_read[1:]
+        if stop != "program finished":
+            print(f"  chunk {ci + 1} did not finish cleanly ({stop}) -- stopping here")
+            break
+
+    with open(out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(body)
+    return total_n, stop
 
 
 def main():
