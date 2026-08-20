@@ -73,10 +73,14 @@ def convert(script: str, robot_ip: str):
 
 def write_path(path: str, q, dt: float):
     """Write joint setpoints plus their step time, the format send.py streams."""
+    q = np.asarray(q)
+    dt = np.broadcast_to(dt, len(q))
+    if np.any(dt <= 0):
+        raise ValueError("path dt values must be positive")
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([f"q{j}" for j in range(N_JOINTS)] + ["dt"])
-        w.writerows([f"{v:.6f}" for v in [*row, dt]] for row in q)
+        w.writerows([f"{v:.6f}" for v in [*row, step]] for row, step in zip(q, dt))
 
 
 def main():

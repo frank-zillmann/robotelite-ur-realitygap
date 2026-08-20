@@ -1,23 +1,9 @@
-"""Optimize a recorded path by differentiating a score through the distilled model.
+"""Optimize a streamed joint path against the distilled reality-gap model.
 
-convert.py gives the trajectory the controller really commands. This bends it:
-
-    t, u, T  = phase(theta)                     each slice of the path gets its own time
-    q(t)     = path(u) + bspline(u, offset)     the reference plus a free offset
-    actual   = q + DistillModel(features(q))    the learned reality gap
-    loss     = |actual - q| + K*sd + ALPHA*T + limits + drift
-
-All of it is torch, so one ``backward()`` moves the shape of the trajectory, where
-its time goes, and how long it takes. Both parameters start at zero, which
-reproduces the recorded path exactly -- so the optimizer can leave it alone if that
-is already best, and every number is reported against it.
-
-Steps go to ``runs/optimize/<stamp>``: ``loss/total`` (without the limit penalty,
-which would swamp it), ``loss/error`` in rad, ``loss/time`` in s, and
-``loss/limits``, the overshoot of the ceilings, 0 meaning the controller can run it.
-
-    python optimize.py --path scripts/triangle.path --model models/distill-ur5e.pkl \\
-        --robot UR5e
+``retime`` keeps every recorded waypoint and changes only its interval. ``reshape``
+uses a small, direct, piecewise-linear set of waypoints between the same endpoints.
+The model is always evaluated on its 8 ms training grid; linear interpolation turns
+either variable-time path into that grid.
 """
 from __future__ import annotations
 
@@ -26,189 +12,163 @@ import time
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-from common import X_CLIP, features
 from convert import write_path
 from send import load_path
 from train_distillation_model import DistillModel
 from utils import DT, N_JOINTS, Robot
 
-ALPHA = 3.0        # a percent off the cycle time is worth this many percent more
-                   # tracking error. At 1 a well-tuned path is already optimal and
-                   # the optimizer rightly leaves it alone.
-K = 1.0            # standard deviations of the model's own uncertainty added to the error
-LIMIT = 100.0      # how hard the ceilings are held: soft, so a percent or two of
-                   # overshoot is affordable. That stays far below the safety limit
-                   # that would actually stop the robot; raise it to hold them tighter.
-KNOTS, POINTS, STEPS, LR = 24, 16, 600, 0.01
+STEPS, LR, MIN_DT, BARRIER_WIDTH = 600, 0.01, 0.002, 0.05
+CONTROL_POINT_FACTOR = 0.02
+EXPLOITATION_EXPLORATION_FACTOR, BARRIER = 1.0, 10.0
 
 
-def bspline(u, points):
-    """Uniform cubic B-spline ``q(u)`` for ``u`` in [0,1], control ``points`` (m, 6).
-
-    Differentiable in both, which is why the basis is spelled out rather than taken
-    from scipy: ``u`` itself carries gradient. Repeating an end point three times
-    pins the curve to it with zero velocity and acceleration.
-    """
-    m = points.shape[0]
-    x = u.clamp(0.0, 1.0) * (m - 3)
-    k = x.floor().clamp(0, m - 4).long()
-    s = (x - k)[:, None]
-    b = torch.stack([(1 - s) ** 3, 3 * s ** 3 - 6 * s ** 2 + 4,
-                     -3 * s ** 3 + 3 * s ** 2 + 3 * s + 1, s ** 3]) / 6.0
-    return sum(b[i] * points[k + i] for i in range(4))
+def inverse_softplus(x):
+    return x + torch.log(-torch.expm1(-x))
 
 
-def zeroed(interior):
-    """Control points for an offset that starts and ends at nothing."""
-    return torch.cat([torch.zeros(3, N_JOINTS), interior, torch.zeros(3, N_JOINTS)])
+def resample(q, dt):
+    """Uniform-DT samples of piecewise-linear waypoints ``q`` and intervals ``dt``."""
+    ends = torch.cat([torch.zeros(1), dt.cumsum(0)])
+    t = torch.arange(max(3, int(torch.ceil(ends[-1].detach() / DT)) + 1)) * DT
+    t = t.to(q).clamp_max(ends[-1])
+    i = torch.searchsorted(ends.detach().contiguous(), t.contiguous(), right=True)
+    i = i.clamp(1, len(q) - 1)
+    f = ((t - ends[i - 1]) / (ends[i] - ends[i - 1]).clamp_min(1e-8))[:, None]
+    return q[i - 1].lerp(q[i], f)
 
 
-def movable(q_ref, dt: float = DT):
-    """1 where the reference is moving, 0 where it stands still, per row.
-
-    The offset is multiplied by this, so the waypoints the script holds are kept
-    exactly while the moves between them are free. A structural constraint rather
-    than another penalty term: nothing to weigh against the rest of the loss.
-    """
-    return torch.as_tensor(
-        (np.abs(np.gradient(q_ref, dt, axis=0)).max(1) > 0.01).astype(np.float32))
+def barrier(value, limit):
+    """A smooth, increasingly steep cost around each physical limit."""
+    ratio = value / torch.as_tensor(limit, dtype=value.dtype, device=value.device)
+    return (BARRIER_WIDTH * F.softplus((ratio - 1) / BARRIER_WIDTH)).square().mean()
 
 
-def sample(ref, u):
-    """Linear interpolation of ``ref`` (m, c) at phases ``u`` in [0,1]."""
-    x = u.clamp(0.0, 1.0) * (len(ref) - 1)
-    i = x.floor().long().clamp(0, len(ref) - 2)
-    f = (x - i)[:, None]
-    return ref[i] * (1 - f) + ref[i + 1] * f
-
-
-def phase(theta, T0: float, dt: float):
-    """``(t, u, T)``: the time grid, the phase along the path, and the cycle time.
-
-    Slice k of the path gets ``exp(theta_k)`` times the time it takes in the
-    reference, so all-zeros replays it unchanged. The cycle time is what the slices
-    add up to rather than a parameter of its own, which is what lets a pause be cut
-    without touching the moves: one global duration would speed those up too and run
-    straight into the tool-speed cap, and the optimizer could never get started.
-    """
-    tk = torch.cat([torch.zeros(1), torch.cumsum((T0 / len(theta)) * theta.exp(), 0)])
-    t = torch.arange(int(tk[-1].item() / dt) + 1, dtype=torch.float32) * dt
-    uk = torch.linspace(0.0, 1.0, len(theta) + 1)
-    i = torch.searchsorted(tk.detach().contiguous(), t.contiguous()).clamp(1, len(theta))
-    u = uk[i - 1] + (t - tk[i - 1]) / (tk[i] - tk[i - 1]).clamp_min(1e-6) / len(theta)
-    return t, u.clamp(0.0, 1.0), tk[-1]
-
-
-def error(model, q):
-    """Per-row ``|actual_q - q|`` (rad), widened by ``K`` sd of the model's own
-    uncertainty so that trajectories it has never seen are not free."""
-    mx, sx, my, sy = (torch.as_tensor(s, dtype=torch.float32) for s in model.stats)
-    x = ((features(q, DT, model.pad) - mx) / sx).clamp(-X_CLIP, X_CLIP)
-    mu, lv = model.forward(x.T[None])
-    gap = (mu.mean(0)[0].T * sy + my).abs()
-    var = (torch.exp(lv).mean(0) + mu.var(0, unbiased=False))[0].T * sy ** 2
-    return gap + K * var.sqrt()
-
-
-def penalty(q, robot: Robot):
-    """Mean overshoot of the speed, acceleration and tool-speed ceilings, a fraction.
-
-    0 for a path the controller can run as written. Explicit rather than left to the
-    model: outside the envelope the model extrapolates, and a confident wrong answer
-    there costs nothing. The Jacobian is taken at the current poses, refreshed each
-    step from the detached trajectory, so the tool speed stays right as the path
-    moves; only the speed carries gradient.
-    """
+def penalties(q, robot):
     qd = (q[2:] - q[:-2]) / (2 * DT)
     qdd = (q[2:] - 2 * q[1:-1] + q[:-2]) / DT ** 2
-    jac = torch.as_tensor(robot.jacobians(q.detach().numpy())[1:-1], dtype=torch.float32)
-    tool = torch.linalg.norm((jac @ qd[..., None])[..., 0], dim=1)
-    over = lambda z, lim: torch.relu(
-        z.abs() / torch.as_tensor(lim, dtype=torch.float32) - 1).mean()
-    return over(qd, robot.v_joint) + over(qdd, robot.a_joint) + over(tool, robot.v_tcp)
+    jac = torch.as_tensor(robot.jacobians(q.detach().cpu().numpy())[1:-1], dtype=q.dtype)
+    tool = torch.linalg.vector_norm((jac @ qd[..., None])[..., 0], dim=1)
+    return {
+        "position": barrier(q.abs(), robot.q_joint),
+        "joint_speed": barrier(qd.abs(), robot.v_joint),
+        "joint_acceleration": barrier(qdd.abs(), robot.a_joint),
+        "tool_speed": barrier(tool, robot.v_tcp),
+    }
 
 
-def loss(model, robot, q, T, T0, before):
-    """``(loss, error, limits)`` for a candidate path, everything relative to the
-    recorded one, which therefore scores ``1 + ALPHA``."""
-    err = error(model, q).mean()
-    pen = penalty(q, robot)
-    return err / before + ALPHA * T / T0 + LIMIT * pen, err, pen
+def objective(model, robot, q, dt, cycle_time_per_gap_rmse):
+    path = resample(q, dt)
+    gap, var = model.gap(path)
+    gap_rmse = torch.sqrt((gap.square() + EXPLOITATION_EXPLORATION_FACTOR * var).mean())
+    costs = penalties(path, robot)
+    penalty = sum(costs.values())
+    total = dt.sum() + cycle_time_per_gap_rmse * gap_rmse + BARRIER * penalty
+    return total, gap_rmse, penalty, costs
 
 
-def optimize(model, q_ref, robot: Robot, run: str = None):
-    """Optimize a whole path. Returns the best ``(q, T, error, offset)`` seen and
-    the recorded path's own error, which is what they are measured against."""
+def nodes(reference, mode):
+    if mode == "retime":
+        return reference
+    k = max(2, round(CONTROL_POINT_FACTOR * len(reference)))
+    return reference[torch.linspace(0, len(reference) - 1, k).round().long()]
+
+
+def snapshot(total, q, dt, gap, penalty):
+    return {
+        "total": float(total.detach()),
+        "q": q.detach().numpy(),
+        "dt": dt.detach().numpy(),
+        "gap": float(gap.detach()),
+        "penalty": float(penalty.detach()),
+    }
+
+
+def optimize(model, q_ref, dt_ref, robot, mode="retime", run=None):
     ref = torch.as_tensor(np.asarray(q_ref, np.float32))
-    free = movable(q_ref)[:, None]
-    T0 = (len(ref) - 1) * DT
+    q0 = nodes(ref, mode)
+    moving = (q0[1:] - q0[:-1]).abs().amax(1) > 1e-7
+    min_dt = (torch.full_like(moving, MIN_DT, dtype=torch.float32)
+              if mode == "reshape" else MIN_DT * moving)
+    base_dt = (torch.as_tensor(dt_ref, dtype=torch.float32) if mode == "retime"
+               else torch.full((len(q0) - 1,), float(np.sum(dt_ref)) / (len(q0) - 1)))
+    raw_dt = torch.nn.Parameter(inverse_softplus((base_dt - min_dt).clamp_min(1e-5)))
+    interior = torch.nn.Parameter(q0[1:-1].clone()) if mode == "reshape" else None
+    params = [raw_dt] + ([] if interior is None else [interior])
+    opt = torch.optim.Adam(params, lr=LR)
+    log, best = (SummaryWriter(run) if run else None), None
     with torch.no_grad():
-        before = float(error(model, ref).mean())
-
-    offset = torch.zeros(POINTS, N_JOINTS, requires_grad=True)
-    theta = torch.zeros(KNOTS, requires_grad=True)
-    opt = torch.optim.Adam([offset, theta], lr=LR)
-    log = SummaryWriter(run) if run else None
-    best = None
-    for i in range(STEPS + 1):
-        t, u, T = phase(theta, T0, DT)
-        q = sample(ref, u) + sample(free, u) * bspline(u, zeroed(offset))
-        total, err, pen = loss(model, robot, q, T, T0, before)
-        if best is None or float(total.detach()) < best[0]:
-            best = (float(total.detach()), q.detach().numpy(), float(T.detach()),
-                    float(err.detach()), float((q - sample(ref, u)).abs().max().detach()))
+        base_path = resample(q0, F.softplus(raw_dt) + min_dt)
+        base_gap, base_var = model.gap(base_path)
+        baseline = torch.sqrt(
+            (base_gap.square() + EXPLOITATION_EXPLORATION_FACTOR * base_var).mean()).clamp_min(1e-8)
+        cycle_time_per_gap_rmse = float(base_dt.sum() / baseline)
+    for step in range(STEPS + 1):
+        q = q0 if interior is None else torch.cat([q0[:1], interior, q0[-1:]])
+        dt = F.softplus(raw_dt) + min_dt
+        total, gap, penalty, costs = objective(
+            model, robot, q, dt, cycle_time_per_gap_rmse)
+        if best is None or float(total.detach()) < best["total"]:
+            best = snapshot(total, q, dt, gap, penalty)
         if log:
-            for key, v in (("loss/total", total - LIMIT * pen), ("loss/error", err),
-                           ("loss/time", T), ("loss/limits", pen)):
-                log.add_scalar(key, float(v.detach()), i)
-        if i < STEPS:
+            values = {"loss/total": total, "loss/gap_rmse": gap,
+                      "loss/cycle_time": dt.sum(), "loss/penalties": penalty,
+                      **{f"penalty/{k}": v for k, v in costs.items()}}
+            for key, value in values.items():
+                log.add_scalar(key, float(value.detach()), step)
+        if step < STEPS:
             opt.zero_grad(set_to_none=True)
             total.backward()
-            torch.nn.utils.clip_grad_norm_([offset, theta], 1.0)   # keep Adam settled
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
-        if i % 100 == 0:
-            print(f"    step {i:4d}  loss {float(total.detach()):6.3f}  err "
-                  f"{float(err.detach()) * 1000:6.3f} mrad  T {float(T.detach()):5.3f}s  "
-                  f"over limits {float(pen.detach()) * 100:5.2f}%")
+        if step % 100 == 0:
+            print(f"    step {step:4d}  loss {float(total.detach()):6.3f}  gap "
+                  f"{float(gap.detach()) * 1000:6.3f} mrad  T {float(dt.sum().detach()):5.3f}s  "
+                  f"penalty {float(penalty.detach()):.4f}")
     if log:
         log.close()
-    return best[1], best[2], best[3], best[4], before
+    return best
+
+
+def executable(q, dt, mode):
+    """Drop only effectively-zero waits: URScript ``servoj`` time itself cannot be 0."""
+    keep = np.ones(len(dt), bool)
+    if mode == "retime":
+        keep = ~((np.abs(q[1:] - q[:-1]).max(1) < 1e-7) & (dt < MIN_DT))
+    return np.vstack([q[:1], q[1:][keep]]), dt[keep]
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Optimize a recorded path against the model.")
+    ap = argparse.ArgumentParser(description="Optimize a path against the distilled model.")
     ap.add_argument("--path", required=True, help="path CSV from convert.py")
     ap.add_argument("--model", required=True, help="distilled model pickle")
-    ap.add_argument("--robot", required=True, choices=list(Robot.MODELS),
-                    help="which arm's kinematics and limits to hold the path to")
-    ap.add_argument("--out", default=None, help="default: <path>.optimized.path")
+    ap.add_argument("--robot", required=True, choices=list(Robot.MODELS))
+    ap.add_argument("--mode", choices=("retime", "reshape"), default="retime")
+    ap.add_argument("--out", default=None, help="default: <path>.<mode>.path")
     args = ap.parse_args()
 
-    robot = Robot(args.robot)
-    model = DistillModel.load(args.model)
+    rows = np.asarray(load_path(args.path), float)
+    if len(rows) < 3 or rows.shape[1] < N_JOINTS:
+        raise SystemExit("path needs at least three joint setpoints")
+    q_ref = rows[:, :N_JOINTS]
+    dt_ref = rows[1:, N_JOINTS] if rows.shape[1] > N_JOINTS else np.full(len(rows) - 1, DT)
+    if np.any(dt_ref <= 0):
+        raise SystemExit("input path has a non-positive dt")
+    model, robot = DistillModel.load(args.model), Robot(args.robot)
+    if model.predicts() != ["actual_q"]:
+        raise SystemExit("optimizer currently requires a model trained for actual_q")
     for p in model.parameters():
-        p.requires_grad_(False)              # only the trajectory is optimized
-    rows = np.array(load_path(args.path), float)
-    q_ref, T0 = rows[:, :N_JOINTS], (len(rows) - 1) * DT
-    tensorboard_path = f"runs/optimize/{time.strftime('%Y%m%d-%H%M%S')}"
-    print(f"  {len(rows)} setpoints, {T0:.2f} s at {DT * 1000:.2f} ms; "
-          f"logging to {tensorboard_path}")
-
-    q, T, after, off, before = optimize(model, q_ref, robot, tensorboard_path)
-    score, base = after / before + ALPHA * T / T0, 1 + ALPHA
-    v = robot.tcp_speed(q).max()
-    print(f"\n  error {before * 1000:.3f} -> {after * 1000:.3f} mrad   cycle {T0:.3f} -> {T:.3f} s"
-          f"\n  score {score:.3f} vs {base:.3f} for the recorded path: "
-          f"{'better' if score < base else 'NOT an improvement'}"
-          f"\n  up to {off * 1000:.1f} mrad off it, peak tool speed {v:.3f} m/s"
-          f"{'  ** over the cap' if v > robot.v_tcp else ''}")
-
-    out = args.out or args.path.rsplit(".", 1)[0] + ".optimized.path"
-    write_path(out, q, DT)
-    print(f"wrote {out} ({len(q)} setpoints)\n"
-          f"  run it: python send.py {out} --robot-ip <ip> --loop 5")
+        p.requires_grad_(False)
+    run = f"runs/optimize/{time.strftime('%Y%m%d-%H%M%S')}"
+    print(f"  {args.mode}: {len(q_ref)} input setpoints, {dt_ref.sum():.3f} s; logging to {run}")
+    best = optimize(model, q_ref, dt_ref, robot, args.mode, run)
+    q, dt = executable(best["q"], best["dt"], args.mode)
+    out = args.out or args.path.rsplit(".", 1)[0] + f".{args.mode}.path"
+    write_path(out, q, np.r_[MIN_DT, dt])
+    print(f"\n  gap RMSE {best['gap'] * 1000:.3f} mrad, penalty {best['penalty']:.4f}, cycle {dt_ref.sum():.3f} -> "
+          f"{dt.sum():.3f} s\n  wrote {out}: {len(q)} commands")
 
 
 if __name__ == "__main__":

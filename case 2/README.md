@@ -51,14 +51,16 @@ python convert.py scripts/triangle.script --robot-ip 127.0.0.1
 python convert.py data/ur5e/heldout/T10_medium_r1.csv --out scripts/T10_medium.path
 
 # 3. optimize that path against the model (logs to runs/optimize/)
-python optimize.py --path scripts/triangle.path --model models/distill-ur5e.pkl --robot UR5e
+python optimize.py --path scripts/triangle.path --model models/distill-ur5e.pkl --robot UR5e --mode retime
+# Or reduce it to a direct, piecewise-linear route between the same endpoints.
+python optimize.py --path scripts/triangle.path --model models/distill-ur5e.pkl --robot UR5e --mode reshape
 
 # 4. run both on the robot (each records to <path name>.csv)
 python send.py scripts/triangle.path --robot-ip 127.0.0.1 --loop 5
-python send.py scripts/triangle.optimized.path --robot-ip 127.0.0.1 --loop 5
+python send.py scripts/triangle.retime.path --robot-ip 127.0.0.1 --loop 5
 
 # 5. compare them: one plot, and the measured error / cycle time side by side
-python analysis.py --csv scripts/triangle.csv scripts/triangle.optimized.csv \
+python analysis.py --csv scripts/triangle.csv scripts/triangle.retime.csv \
     --model models/distill-ur5e.pkl
 ```
 
@@ -89,20 +91,19 @@ recordings.
 ```
 URScript ──► the controller ──► recorded target_q                (convert.py)
                                        │
-    offset, retiming ──► reference path + B-spline offset ──► commanded q(t)
+ retime: original q + new dt; reshape: direct linear waypoints ──► commanded q(t)
                                        │
                    common.features (sin/cos q, qd, qdd, qddd)
                                        │
                     CNNModel ──► predicted actual q, and its uncertainty
                                        │
-      loss = |actual - commanded|/base + k·sd + α·T/base + limits
+ loss = cycle time + c·sqrt(mean(gap² + exploration·variance)) + smooth barriers
                                        │
                                  .backward()
 ```
 
-Both parameter groups start at zero, which reproduces the recorded path *exactly* —
-so the optimizer can leave it alone if that is already best, and every number is
-reported against it.
+`retime` starts from the recorded timing. `reshape` uses
+`CONTROL_POINT_FACTOR` of the recorded poses, with its first and last pose pinned.
 
 **What runs now (all of it is yours to change):**
 
@@ -116,13 +117,11 @@ reported against it.
 - **`convert.py`**: runs the script twice and keeps the second pass, which starts
   where the first ended — the cycle in its steady state, closing on itself so it can
   be looped, and independent of where the robot happened to be.
-- **`optimize.py`**: a B-spline offset added to the reference, plus a retiming that
-  gives each slice of the path its own duration (so a pause can be cut without
-  speeding up the moves). The offset is masked to zero wherever the reference stands
-  still, so the waypoints the script holds are kept exactly while the moves between
-  them are free — a constraint by construction rather than another penalty to weigh.
-  The knobs are constants at the top of the file: `ALPHA` (time against error), `K`
-  (uncertainty added to the error), `LIMIT`, and the spline/retiming sizes.
+- **`optimize.py`**: `retime` learns one direct interval per original edge; only an
+  exact stationary edge may shrink towards zero. `reshape` learns direct interior
+  waypoints and intervals for a small linear path, retaining only the endpoints.
+  Both are interpolated to the model's 8 ms grid and use smooth barriers for joint
+  position, joint speed, acceleration, and TCP speed.
 - **`utils.Robot`**: `Robot("UR5e")` swaps the DH table and the joint speed limits.
   The distilled model is *not* interchangeable — it is trained on one arm's
   recordings, so each arm has its own folder and its own pickle
@@ -136,21 +135,16 @@ reported against it.
   the stream for, what the model is trained on, and what a path is written at. 8 ms
   divides both control cycles UR ships (2 ms e-Series, 8 ms CB3). `MoveDataset`
   refuses a recording made at another rate. A path's `dt` column may still differ per
-  row and is honoured from at least 1 ms to 50 ms, but below the controller's 2 ms
+  row and is honoured from 2 ms to 50 ms, but below the controller's 2 ms
   cycle it cannot act on each setpoint separately.
 - `analysis.py` reports what a run actually took, not what its path asked for. On
   URSim the two agree to within a few percent, at 8, 16 and 32 ms per setpoint.
-- The limit penalty is soft, so the result can sit a percent or two above the
-  controller's own tool-speed cap of 1.35 m/s — still far below the safety limit that
-  stops the robot, and `optimize.py` prints the peak either way. Raise `LIMIT` to
-  hold it tighter, at some cost in convergence.
+- A smooth barrier is not a safety controller. Check the emitted path independently
+  before running it on hardware; UR5e uses the 1.5 m/s and 191°/s limits here.
 - The joint acceleration ceilings are measured, not specified — UR publishes none —
   and the UR5e reuses the UR10e's for want of anything better.
-- **The optimizer finds a local optimum.** On `scripts/triangle.script` it scores
-  1.72 against the recorded path's 2.00 (−12% tracking error, −16% cycle time), but
-  a hand-built solution that simply deletes the pauses scores 1.45 — the model says
-  the pauses buy only 1.4% of error for 2.4 s of cycle time, and gradient descent
-  does not get there from the reference.
+- `reshape` is intentionally low-dimensional, but it can still find a local optimum.
+  Adjust `CONTROL_POINT_FACTOR` in `optimize.py` for a simpler or more detailed route.
 - The tool-speed limit uses the Jacobian at the current trajectory, refreshed each
   step from detached poses: the value is right, the gradient is the speed's alone.
 

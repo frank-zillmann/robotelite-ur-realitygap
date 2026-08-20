@@ -37,7 +37,7 @@ import torch
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
-from common import RESIDUAL, N_FEAT, blocks, features, loaders, standardize
+from common import RESIDUAL, N_FEAT, X_CLIP, blocks, features, loaders, standardize
 from utils import DT, N_JOINTS, get_block
 
 
@@ -152,6 +152,23 @@ class CNNModel(DistillModel):
         out = torch.stack([net(x)[..., self.pad:] for net in self.nets])
         return out[:, :, :self.n_out], out[:, :, self.n_out:].clamp(*LOGVAR)
 
+    def outputs(self, mu, lv):
+        """De-standardise ensemble outputs to their learned physical units."""
+        my, sy = (torch.as_tensor(v, dtype=mu.dtype, device=mu.device)[:, None]
+                  for v in self.stats[2:])
+        mean = mu.mean(0) * sy + my
+        aleatoric = torch.exp(lv).mean(0) * sy ** 2
+        epistemic = mu.var(0, unbiased=False) * sy ** 2
+        return mean, aleatoric, epistemic
+
+    def gap(self, q, dt: float = DT):
+        """Predicted residual mean and variance for a differentiable path."""
+        mx, sx = (torch.as_tensor(v, dtype=q.dtype, device=q.device)
+                  for v in self.stats[:2])
+        x = ((features(q, dt, self.pad) - mx) / sx).clamp(-X_CLIP, X_CLIP)
+        mean, aleatoric, epistemic = self.outputs(*self.forward(x.T[None]))
+        return mean[0].T, (aleatoric + epistemic)[0].T
+
     def loss(self, xb, yb, mask, warmup: bool):
         """``(objective, info)`` for one batch, averaged over the real rows.
 
@@ -170,22 +187,23 @@ class CNNModel(DistillModel):
         """
         mu, lv = self.forward(xb)
         w = mask[:, None].expand_as(yb)             # padded rows count for nothing
-        mean = lambda z: (z * w).sum() / w.sum()
-        sq = mean((0.5 * (yb - mu) ** 2 * torch.exp(-lv)).mean(0))
-        logvar = mean(0.5 * lv.mean(0))
-        mse = mean(((yb - mu) ** 2).mean(0))
+        masked_mean = lambda z: (z * w).sum() / w.sum()
+        sq = masked_mean((0.5 * (yb - mu) ** 2 * torch.exp(-lv)).mean(0))
+        logvar = masked_mean(0.5 * lv.mean(0))
+        mse = masked_mean(((yb - mu) ** 2).mean(0))
         objective = mse if warmup else sq + logvar
         # Ensemble mixture: mean of variances (aleatoric) + variance of means. The
         # label std turns a standardised difference back into the real unit.
-        sy = torch.as_tensor(self.stats[3])[:, None]
-        err = (yb - mu.mean(0)).abs() * sy
-        std = torch.sqrt(torch.exp(lv).mean(0) + mu.var(0, unbiased=False)) * sy
+        out_mean, aleatoric, epistemic = self.outputs(mu, lv)
+        my, sy = (torch.as_tensor(v, dtype=yb.dtype)[:, None] for v in self.stats[2:])
+        err = (yb * sy + my - out_mean).abs()
+        std = torch.sqrt(aleatoric + epistemic)
         return objective, {
             "loss/objective": objective, "loss/sq": sq, "loss/logvar": logvar,
             "loss/nll": sq + logvar, "loss/mse": mse,
-            "err/mean": mean(err), "err/std": mean((std - err).abs()),
-            "err/coverage": mean((err <= std).float()),
-            "err/disagreement": mean(mu.std(0, unbiased=False) * sy)}
+            "err/mean": masked_mean(err), "err/std": masked_mean((std - err).abs()),
+            "err/coverage": masked_mean((err <= std).float()),
+            "err/disagreement": masked_mean(mu.std(0, unbiased=False) * sy)}
 
     def _epoch(self, loader, warmup, opt=None, sched=None):
         """One pass over ``loader``, optimizing if ``opt`` is given. Mean of ``info``."""
@@ -244,7 +262,6 @@ class CNNModel(DistillModel):
     def predict(self, df):
         if self.stats is None:
             raise RuntimeError("not fitted: call fit() or load a pickle")
-        _, _, my, sy = self.stats
         out = []
         for sl in blocks(df): # never filter across a script seam
             # ``df`` must be sampled at ``train_dt``: a learned temporal filter only
@@ -253,12 +270,8 @@ class CNNModel(DistillModel):
                                      self.pad).numpy(), self.stats)
             with torch.inference_mode():
                 mu, lv = self.forward(torch.from_numpy(x.T[None]).float())
-                # Mixture of the members' Gaussians: mean of their variances is the
-                # aleatoric half, the variance of their means the epistemic one.
-                out.append([z[0].T.numpy() for z in
-                            (mu.mean(0), torch.exp(lv).mean(0), mu.var(0, unbiased=False))])
+                out.append([z[0].T.numpy() for z in self.outputs(mu, lv)])
         gap, ale, epi = (np.vstack(v) for v in zip(*out))
-        gap, ale, epi = gap * sy + my, ale * sy ** 2, epi * sy ** 2   # real units
         cols = lambda k: slice(k * N_JOINTS, (k + 1) * N_JOINTS)
         split = lambda z: {b: z[:, cols(k)] for k, b in enumerate(self.targets)}
         return {"mean": {b: v + get_block(df, RESIDUAL[b])

@@ -127,8 +127,8 @@ def features(q, dt: float = DT, pad: int = 0):
 
     Everything is differentiated from ``q`` rather than read from ``target_qd``, so
     a trajectory the optimizer invents is turned into inputs exactly the way a
-    recording is. Torch throughout, so ``motion.bspline`` can be optimized through
-    it. Not ``target_current``: nothing models torque any more.
+    recording is. Torch throughout, so the optimizer can differentiate through it.
+    Not ``target_current``: nothing models torque any more.
     """
     q = q if torch.is_tensor(q) else torch.as_tensor(np.asarray(q, np.float32))
     qd = _diff(q, dt)
