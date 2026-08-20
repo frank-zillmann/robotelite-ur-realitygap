@@ -27,6 +27,7 @@ pip install -r requirements.txt
   The container is in `simulation environment/`; pick the arm when you start it, and
   pass the same one to `optimize.py`:
   ```bash
+  +
   docker compose up -d                     # UR10, the default
   ROBOT_TYPE=UR5 docker compose up -d      # a UR5e instead
   ```
@@ -56,8 +57,9 @@ python optimize.py --path scripts/triangle.path --model models/distill-ur5e.pkl 
 python optimize.py --path scripts/triangle.path --model models/distill-ur5e.pkl --robot UR5e --mode reshape
 
 # 4. run both on the robot (each records to <path name>.csv)
-python send.py scripts/triangle.path --robot-ip 127.0.0.1 --loop 5
-python send.py scripts/triangle.retime.path --robot-ip 127.0.0.1 --loop 5
+# --engine script on URSim, --engine ur_rtde on real hardware (see Known gaps)
+python send.py scripts/triangle.path --robot-ip 127.0.0.1 --engine script --loop 5
+python send.py scripts/triangle.retime.path --robot-ip 127.0.0.1 --engine script --loop 5
 
 # 5. compare them: one plot, and the measured error / cycle time side by side
 python analysis.py --csv scripts/triangle.csv scripts/triangle.retime.csv \
@@ -131,6 +133,18 @@ URScript ──► the controller ──► recorded target_q                (co
 ## Known gaps
 
 - `convert.py` needs the controller in Remote Control and *moves the robot*.
+- `send.py`'s `.path` streaming needs `--engine script` (URSim) or
+  `--engine ur_rtde` (real hardware) -- there's no single engine that works on
+  both. "script" embeds the whole path as one program, like a `.script` run;
+  fine on URSim, but a real controller silently drops any program over ~30 KB
+  of text. "ur_rtde" streams it live via the `ur_rtde` package instead
+  (verified working on real hardware); it does not work against the
+  PolyScope X URSim in `simulation environment/` (`RTDEControlInterface`
+  fails to connect -- that simulator image doesn't seem to implement the
+  real-time control handshake yet, though `RTDEReceiveInterface` alone does
+  work against it). A hand-rolled real-time protocol over raw sockets was
+  tried as a single cross-target approach and dropped: Python/OS scheduling
+  cannot reliably hit servoJ's timing, and it caused a fault on real hardware.
 - Everything runs on `utils.DT`, one 8.00 ms grid (125 Hz): what `record.py` asks
   the stream for, what the model is trained on, and what a path is written at. 8 ms
   divides both control cycles UR ships (2 ms e-Series, 8 ms CB3). `MoveDataset`

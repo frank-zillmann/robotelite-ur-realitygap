@@ -11,19 +11,21 @@ when the program finishes.
     python send.py scripts/shoulder_swing.script --loop 10
 
 
-A ``.path`` argument streams a servoj path (a CSV of joint setpoints) instead of
-running a script, one ``servoj`` per row:
+A ``.path`` argument streams a servoj path (a CSV of joint setpoints, optionally
+with a per-row servoj time as a 7th column) instead of running a script, via
+one of two required ``--engine`` choices:
 
-    python send.py scripts/shoulder_swing.path --dt 0.008
+    python send.py scripts/shoulder_swing.path --engine script    # URSim
+    python send.py scripts/shoulder_swing.path --engine ur_rtde   # real hardware
 
-Auto-stop: the wrapper flips a float register to 1 on the program's last line,
-and recording stops when that register reads 1, so the program must end for it
-to fire (run-once or --loop N both end). Ctrl-C stops and keeps the data so far.
+"script" embeds the whole path as one program, same as a ``.script`` run --
+simple, but a real controller silently drops any program over ~30 KB of text.
+"ur_rtde" streams it live via the ``ur_rtde`` package instead (only imported
+for this engine); see ``record_path``.
 
-Requires Remote Control mode on the robot/URSim; otherwise the controller
-accepts the socket but does not run the script.
-
-Pure Python standard library. Recording uses record.py's RTDE code.
+Requires Remote Control mode on the robot/URSim, powered on with brakes
+released, and no active protective/safety stop; otherwise the controller
+accepts the connection but does not run anything.
 """
 from __future__ import annotations
 
@@ -37,12 +39,36 @@ from record import build_recipe, open_stream, parse_registers, record_stream
 from utils import DT, load_script
 
 SCRIPT_PORT = 30002       # UR secondary client interface: accepts URScript programs
+DASHBOARD_PORT = 29999    # UR dashboard server: plain-text status queries
 RUNTIME_PLAYING = 2       # RTDE runtime_state while a program is running
 START_TIMEOUT_S = 5.0     # how long to wait for the program to start playing
 DONE_REG = 3              # output float register we flip to 1 when the program ends
 DONE_FIELD = f"output_double_register_{DONE_REG}"
 SERVO_LOOKAHEAD = 0.1     # servoj lookahead_time (s): smooths the streamed path
 SERVO_GAIN = 300          # servoj gain: how hard it tracks each setpoint
+STREAM_HZ = 500.0         # record_path's servoJ tick rate (e-Series native cycle)
+
+
+def dashboard_query(host: str, cmd: str, port: int = DASHBOARD_PORT) -> str:
+    """Send one line to the dashboard server (29999) and return its reply."""
+    with socket.create_connection((host, port), timeout=5) as s:
+        s.recv(4096)                       # welcome banner
+        s.sendall((cmd + "\n").encode())
+        return s.recv(4096).decode(errors="replace").strip()
+
+
+def preflight(host: str) -> None:
+    """Print the dashboard states that gate whether a sent program actually runs:
+    power/brakes (robotmode), protective stops (safetymode), and Remote Control.
+    A script sent to 30002 is accepted and silently dropped if any of these
+    isn't right, so a timed-out start is otherwise indistinguishable between them.
+    """
+    for cmd in ("robotmode", "safetymode", "is in remote control"):
+        try:
+            print(f"  {cmd}: {dashboard_query(host, cmd)}")
+        except OSError as exc:
+            print(f"note: dashboard server unreachable ({exc}), skipping preflight check")
+            return
 
 
 def _is_assignment(line: str) -> bool:
@@ -156,9 +182,10 @@ def wrap_path(rows, dt: float, loop: int | None = None) -> str:
     """Wrap a list of joint setpoints into a servoj-streaming program.
 
     Each row is six joint values, optionally followed by a per-row servoj time
-    (a 7th column); rows without it use ``dt``. The program streams the setpoints
-    with ``servoj``. Same done-flag auto-stop as ``wrap_program``; ``loop``
-    repeats the whole path.
+    (a 7th column); rows without it use ``dt``. Embeds every setpoint as a
+    literal ``servoj()`` line -- fine on URSim, but a real controller silently
+    drops any program over roughly 30 KB of text (see ``record_path``'s
+    "script" vs "ur_rtde" engines).
     """
     IND = "  "
     body = []
@@ -253,6 +280,7 @@ def record_run(host, script, out, hz=125.0, registers=("1", "vel", "2", "acc"),
     Loads the script, wraps it as a program, builds the RTDE recipe (the
     requested registers plus the done-flag), and records to ``out``.
     """
+    preflight(host)
     regs = parse_registers(list(registers)) + [(DONE_REG, "_done")]
     recipe = build_recipe(regs)
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
@@ -260,17 +288,97 @@ def record_run(host, script, out, hz=125.0, registers=("1", "vel", "2", "acc"),
     return run_and_record(host, program, out, hz, recipe, port)
 
 
-def record_path(host, path, out, dt=0.008, hz=125.0, loop=None, port=SCRIPT_PORT):
-    """Stream a servoj path file on the robot once (or ``loop`` times) and record it.
+_UR_RTDE_INDEX = re.compile(r"_(\d+)$")  # ur_rtde names channels target_q_0; we use target_q0
 
-    Like ``record_run`` but for a path CSV: wrap the setpoints as a servoj
-    program at ``dt`` s per row. Only the done-flag register is logged (a servoj
-    path carries no vel/acc registers).
+
+def _reshape_recording(raw: str, out: str) -> int:
+    """Turn ur_rtde's own recording CSV into record.py's column schema, so
+    analysis.py can load it like any other recording: target_q_0 -> target_q0,
+    and its absolute controller ``timestamp`` -> ``t`` seconds since the first
+    row. Returns the row count.
+    """
+    with open(raw, newline="") as f:
+        header, *data = csv.reader(f)
+    cols = ["t" if c == "timestamp" else _UR_RTDE_INDEX.sub(r"\1", c) for c in header]
+    ti = header.index("timestamp")
+    t0 = float(data[0][ti]) if data else 0.0
+    for row in data:
+        row[ti] = f"{float(row[ti]) - t0:.6f}"
+    with open(out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        w.writerows(data)
+    os.remove(raw)
+    return len(data)
+
+
+def _record_path_script(host, rows, out, dt, hz, loop, port):
+    """Embed the whole path as literal servoj() text in one program, sent like
+    a .script run. Simple, no extra dependency, but a real controller silently
+    drops any program over ~30 KB of text; fine on URSim.
     """
     recipe = build_recipe([(DONE_REG, "_done")])
-    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    program = wrap_path(load_path(path), dt, loop)
+    program = wrap_path(rows, dt, loop)
     return run_and_record(host, program, out, hz, recipe, port)
+
+
+def _record_path_rtde(host, rows, out, dt):
+    """Stream the path live: RTDEControlInterface for servoJ,
+    RTDEReceiveInterface for recording (the pairing its own examples use). A
+    hand-rolled real-time protocol over raw sockets can't reliably hit an 8 ms
+    deadline from Python and is not an alternative (see README's Known gaps).
+    A safety-limited moveJ reaches the path's start first: servoJ only tracks
+    small per-tick corrections, not an arbitrary jump.
+
+    RTDEControlInterface paces ``waitPeriod`` to its own fixed ``frequency``,
+    not to the ``t`` passed to servoJ, so a row's own ``dt`` (uniform, or
+    varying when optimize.py has retimed it) can't be handed to servoJ
+    directly -- the loop ticks at the fixed STREAM_HZ instead, and each row's
+    servoJ call repeats for as many ticks as its own ``dt`` needs.
+    """
+    import rtde_control    # heavy optional dependency: only needed for this engine
+    import rtde_receive
+
+    period = 1.0 / STREAM_HZ
+    c = rtde_control.RTDEControlInterface(host, frequency=STREAM_HZ)
+    r = rtde_receive.RTDEReceiveInterface(host)
+    raw = out + ".raw"
+    r.startFileRecording(raw)
+    print(f"streaming {host} -> {out}  ({len(rows)} rows)")
+    stop = "path finished"
+    try:
+        c.moveJ(rows[0][:6])    # a safety-limited move to the path's start, same
+                                 # as exercise01/ur_servoJ.py -- servoJ handles only
+                                 # small per-tick corrections, not an initial jump
+        for row in rows:
+            q, row_dt = row[:6], (row[6] if len(row) > 6 else dt)
+            for _ in range(max(1, round(row_dt / period))):
+                t_start = c.initPeriod()
+                c.servoJ(q, 0.0, 0.0, period, SERVO_LOOKAHEAD, SERVO_GAIN)
+                c.waitPeriod(t_start)
+    except KeyboardInterrupt:
+        stop = "Ctrl-C"
+    finally:
+        c.servoStop()
+        c.stopScript()
+        r.stopFileRecording()
+    return _reshape_recording(raw, out), stop
+
+
+def record_path(host, path, out, engine, dt=DT, hz=125.0, loop=None, port=SCRIPT_PORT):
+    """Stream a servoj path file on the robot once (or ``loop`` times) and record it.
+
+    ``engine`` is "script" (embed the whole path as one program; see
+    ``_record_path_script`` -- fine on URSim, but a real controller silently
+    drops any program over ~30 KB) or "ur_rtde" (stream live via the ur_rtde
+    library; see ``_record_path_rtde`` -- needed on real hardware).
+    """
+    preflight(host)
+    rows = load_path(path)
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    if engine == "script":
+        return _record_path_script(host, rows, out, dt, hz, loop, port)
+    return _record_path_rtde(host, rows * (loop or 1), out, dt)
 
 
 def main():
@@ -290,12 +398,16 @@ def main():
                     help="script interface port (30002 secondary, 30001 primary)")
     ap.add_argument("--loop", type=int, default=None,
                     help="repeat N times then stop (default: run once)")
+    ap.add_argument("--engine", choices=["script", "ur_rtde"],
+                    help="how to stream a .path: script (URSim) or ur_rtde (real hardware)")
     args = ap.parse_args()
     out = args.out or args.source.rsplit(".", 1)[0] + ".csv"
 
     if args.source.endswith(".path"):        # stream a servoj path
-        n, stop = record_path(args.robot_ip, args.source, out, args.dt,
-                              args.hz, args.loop, args.port)
+        if args.engine is None:
+            raise SystemExit("--engine script|ur_rtde is required for a .path")
+        n, stop = record_path(args.robot_ip, args.source, out, args.engine,
+                              args.dt, args.hz, args.loop, args.port)
     else:                                    # run a URScript
         n, stop = record_run(args.robot_ip, args.source, out, args.hz,
                              args.float_register, args.loop, args.port)
