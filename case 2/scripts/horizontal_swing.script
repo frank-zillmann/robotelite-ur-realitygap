@@ -1,15 +1,20 @@
-# Horizontal swing - one cycle: swing there and back.
+# T01 horizontal_swing - one cycle: swing there and back.
 #
 # The arm lies down flat (shoulder and elbow at 0, so a straight bar out to the
 # side) and the base (joint 0) rotates it from 0 to -180 degrees and back, sweeping
 # a half turn horizontally. Analyze it with --joint 0.
 #
-# Edit vel and acc below, then run it with send.py (--loop N repeats the cycle).
-# Plain assignments (no `global`): send.py wraps this in a repeat loop, and
-# URScript does not allow a `global` declaration inside a loop.
+# Edit vel and acc below (rad/s, rad/s^2 -- movej's native units), then run it
+# with send.py (--loop N repeats the cycle). Plain assignments (no `global`):
+# send.py wraps this in a repeat loop, and URScript does not allow a `global`
+# declaration inside a loop.
 
-vel = 999
-acc = 999
+# UNITS: movej `v` is rad/s and `a` is rad/s^2. The controller clamps anything
+# above the joint limit (~3.14 rad/s / 180 deg/s, uniform across every joint on
+# the UR5e), so a big number here means every run records at the same maximum
+# speed. 1.05 / 1.4 are the URScript movej defaults.
+vel = 1.05
+acc = 1.4
 
 # Two poses [rad], arm laid down flat (shoulder and elbow 0); the base swings.
 POSE_SIDE_A = [ 0.0,    0.0, 0.0, -1.5708, -1.5708, 0.0]  # base 0 deg

@@ -1,0 +1,31 @@
+# T10 all_joints_combo -- HELD OUT. Do not use this script's recordings for
+# distillation or RL training; it is reserved for final generalization testing.
+#
+# One cycle: ALL SIX joints move together, and the arm also extends toward
+# T08's longer-reach region. No training script (T01-T08) combines every axis
+# at once or pairs reach-extension with wrist motion -- this is the hardest
+# generalization test in the set, by design.
+#
+# SAFETY: the highest-novelty pose here -- combines extended reach (as T08)
+# with wrist1/wrist2/wrist3 all away from their usual -90/-90/0 rad rest
+# position (as T06/T07). Check clearance for the full range of motion,
+# including tool/cable clearance for the wrist rotation, before running this
+# on real hardware.
+#
+# Edit vel and acc below (rad/s, rad/s^2), then run it with send.py (--loop N
+# repeats the cycle). Plain assignments (no `global`): send.py wraps this in a
+# repeat loop, and URScript does not allow a `global` declaration inside a loop.
+
+vel = 0.6000
+acc = 1.2000
+
+# Two joint poses [rad]; every joint moves between them.
+POSE_A = [ 0.0, -1.3, 1.3, -1.5708, -1.5708, 0.0]
+POSE_B = [-0.8, -0.9, 0.7, -1.2,    -1.9,    1.2]
+
+write_output_float_register(1, vel)
+write_output_float_register(2, acc)
+movej(POSE_A, a=acc, v=vel)
+sleep(0.8)
+movej(POSE_B, a=acc, v=vel)
+sleep(0.8)

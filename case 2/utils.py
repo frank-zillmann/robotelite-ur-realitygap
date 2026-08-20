@@ -3,7 +3,7 @@
 - constants: joint count/names and the CSV column names.
 - `Robot`: numpy-only kinematics (FK, Jacobian) and the controller's speed and
   acceleration ceilings, for a UR10e or a UR5e.
-- `load_script`: read a `.script` file.
+- `load_script` / `set_param`: read a `.script`, retune its `vel`/`acc`.
 """
 from __future__ import annotations
 
@@ -135,3 +135,15 @@ def load_script(path: str) -> str:
     """Read a URScript file to text."""
     with open(path) as f:
         return f.read()
+
+
+def set_param(text: str, name: str, value: float) -> str:
+    """Replace a `<name> = <number>` line in URScript text, e.g. `vel`/`acc`.
+
+    Used by collect_data.py to run one motion at several speeds.
+    """
+    pattern = r"((?:global\s+)?" + name + r"\s*=\s*)([0-9]+(?:\.[0-9]+)?)"
+    new, n = re.subn(pattern, lambda m: f"{m.group(1)}{value:g}", text)
+    if not n:
+        raise ValueError(f"no `{name} = ...` line in the script")
+    return new

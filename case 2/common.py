@@ -3,7 +3,7 @@
 ``segments`` is the one shared definition of "a move", used by the distillation and
 the RL stages so both cut a recording the same way:
 
-    for seg in segments(Recording("data/test-4.csv")):
+    for seg in segments(Recording("data/ur5e/T01_fast_r1.csv")):
         print(seg.joint, seg.i0, seg.i1, seg.i2, seg.dist)
 
 The rest is the data preparation the distilled models share, so a new architecture

@@ -23,38 +23,41 @@ modelled — `convert.py` records it from the controller.
 pip install -r requirements.txt
 ```
 
-- **URSim or a UR robot** in **Remote Control** mode at `--robot-ip` (default
-  `127.0.0.1`). The container is in `simulation environment/`; pick the arm when you
-  start it, and pass the same one to `optimize.py`:
+- **URSim or a UR robot** in **Remote Control** mode, reachable at `--robot-ip`.
+  The container is in `simulation environment/`; pick the arm when you start it, and
+  pass the same one to `optimize.py`:
   ```bash
   docker compose up -d                     # UR10, the default
   ROBOT_TYPE=UR5 docker compose up -d      # a UR5e instead
   ```
-- **Recorded runs** in `data/`, one CSV per run. Use the provided ones or record
-  your own — `record.py` only logs, it never moves the robot:
+- **Recorded runs**, one folder per arm: `data/ur5e` (115 runs, 11 trajectories at
+  three speeds, on real hardware) and `data/ur10e` (7 runs). `data/ur5e/heldout/` is
+  set aside on purpose and never trained on. Record more with `collect_data.py`, or
+  a single run with `record.py`, which only logs and never moves the robot:
   ```bash
-  python record.py --robot-ip <ip> --out data/test-1.csv --float-register 1 vel 2 acc
+  python collect_data.py --robot-ip <ip> --list        # preview the matrix
+  python record.py --robot-ip <ip> --out data/ur5e/my-run.csv
   ```
 
 ## How to run
 
 ```bash
-# 1. distill the gap model from every run in data/ (logs to runs/distill/)
-python train_distillation_model.py --out models/distill.pkl
+# 1. distill the gap model from one arm's recordings (logs to runs/distill/)
+python train_distillation_model.py --data data/ur5e --out models/distill-ur5e.pkl
 
 # 2. run the script on the controller, keep the trajectory it commanded
-python convert.py --script scripts/triangle.script --out scripts/triangle.path
+python convert.py --script scripts/triangle.script --robot-ip 127.0.0.1 --out scripts/triangle.path
 
 # 3. optimize that path against the model (logs to runs/optimize/)
-python optimize.py --path scripts/triangle.path --model models/distill.pkl --robot UR10e
+python optimize.py --path scripts/triangle.path --model models/distill-ur5e.pkl --robot UR5e
 
 # 4. run both on the robot and compare
 python send.py --robot-ip 127.0.0.1 --path scripts/triangle.path --loop 5 --out baseline.csv
 python send.py --robot-ip 127.0.0.1 --path scripts/triangle.optimized.path --loop 5 --out optimized.csv
 
 # 5. look at them, with the model's prediction and its uncertainty band
-python analysis.py --csv baseline.csv --model models/distill.pkl
-python analysis.py --csv optimized.csv --model models/distill.pkl
+python analysis.py --csv baseline.csv --model models/distill-ur5e.pkl
+python analysis.py --csv optimized.csv --model models/distill-ur5e.pkl
 ```
 
 `tensorboard --logdir runs` shows both stages. Step 4 is the test that matters: if
@@ -66,6 +69,7 @@ if not, it was missing something, which sends you back to step 1.
 | File | Role |
 |------|------|
 | `record.py` | passive RTDE logger: stream robot state to a CSV, never moves the robot |
+| `collect_data.py` | record a whole matrix of trajectories x speeds x reps, with a manifest |
 | `send.py` | send a URScript (or a `servoj` path) to the robot, run it, record it |
 | `convert.py` | run a script on the controller, keep the trajectory it commanded |
 | `optimize.py` | differentiate a score through the model down to the path's parameters |
@@ -73,6 +77,10 @@ if not, it was missing something, which sends you back to step 1.
 | `common.py` | `segments` (split a recording into moves), `features`, `MoveDataset`/`loaders` |
 | `analysis.py` | `Recording` (shared CSV loader) + a plotly target/actual/model viewer |
 | `utils.py` | constants, `Robot` (UR10e/UR5e kinematics + the controller's ceilings), URScript load/edit |
+
+`scripts/` holds the URScript motions (`_generated/` the speed variants
+`collect_data.py` writes), `models/` the trained models, `data/<arm>/` the
+recordings.
 
 ## How it flows
 
@@ -115,7 +123,9 @@ reported against it.
   (uncertainty added to the error), `LIMIT`, and the spline/retiming sizes.
 - **`utils.Robot`**: `Robot("UR5e")` swaps the DH table and the joint speed limits.
   The distilled model is *not* interchangeable — it is trained on one arm's
-  recordings, so a different arm needs its own `data/` and its own `models/`.
+  recordings, so each arm has its own folder and its own pickle
+  (`models/distill-ur5e.pkl`, `models/distill-ur10e.pkl`). Keep `--data`, `--model`
+  and `--robot` pointing at the same arm.
 
 ## Known gaps
 

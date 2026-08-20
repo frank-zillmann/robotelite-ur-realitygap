@@ -1,0 +1,39 @@
+# T09 four_point_star -- HELD OUT. Do not use this script's recordings for
+# distillation or RL training; it is reserved for final generalization testing
+# (like scripts/triangle.script is used in run.py's step 3, but held out from
+# the start rather than trained-around).
+#
+# One cycle: four waypoints combining base, shoulder and elbow in a pattern not
+# seen in T01-T08 (crosses joint-space regions none of the training scripts
+# visit together). W3 also dips into T08's straighter-elbow reach region, so
+# this held-out set tests reach generalization too, not just shape. Analyze a
+# joint with --joint.
+#
+# SAFETY: W3's elbow (1.0 rad) is straighter than T01-T07 ever use -- same
+# clearance caveat as T08.
+#
+# Edit vel and acc below (rad/s, rad/s^2), then run it with send.py (--loop N
+# repeats the cycle). Plain assignments (no `global`): send.py wraps this in a
+# repeat loop, and URScript does not allow a `global` declaration inside a loop.
+
+vel = 1.0000
+acc = 2.0000
+
+# Four waypoints [rad]; the cycle is W1 -> W2 -> W3 -> W4 -> W1.
+W1 = [ 0.0, -1.2, 1.2, -1.5708, -1.5708, 0.0]
+W2 = [-0.6, -1.8, 0.9, -1.5708, -1.5708, 0.0]
+W3 = [ 0.4, -1.0, 1.0, -1.5708, -1.5708, 0.0]
+W4 = [-0.3, -1.6, 1.0, -1.5708, -1.5708, 0.0]
+
+write_output_float_register(1, vel)
+write_output_float_register(2, acc)
+movej(W1, a=acc, v=vel)
+sleep(0.8)
+movej(W2, a=acc, v=vel)
+sleep(0.8)
+movej(W3, a=acc, v=vel)
+sleep(0.8)
+movej(W4, a=acc, v=vel)
+sleep(0.8)
+movej(W1, a=acc, v=vel)
+sleep(0.8)

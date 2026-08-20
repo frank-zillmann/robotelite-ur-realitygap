@@ -14,13 +14,14 @@ trajectory's gradient back through it.
 ``CNNModel``, the one implementation here, is a causal temporal CNN over a whole
 move.
 
-    m = CNNModel().fit([Recording("data/test-4.csv"), Recording("data/test-6.csv")])
-    m.save("models/distill.pkl")
+    m = CNNModel().fit(load_recordings("data/ur5e"))
+    m.save("models/distill-ur5e.pkl")
     m.predict(frame)["mean"]["actual_q"]  # what the robot would really do
 
-As a script: train on every run in ``data/``, log to ``runs/distill/``, save the pickle.
+As a script: train on every recording in a data folder, log to ``runs/distill/``,
+and save the pickle.
 
-    python train_distillation_model.py --out models/distill.pkl
+    python train_distillation_model.py --data data/ur5e --out models/distill-ur5e.pkl
 """
 from __future__ import annotations
 
@@ -264,17 +265,41 @@ class CNNModel(DistillModel):
                 "var_epistemic": split(epi)}
 
 
+def load_recordings(folder: str):
+    """Every recording directly in ``folder``, skipping what is not one.
+
+    A data folder also holds a manifest and pooled copies, and subfolders such as
+    ``heldout/`` are left alone on purpose -- so anything that will not load as a
+    run at ``utils.DT`` is reported and passed over rather than silently ruining
+    the fit.
+    """
+    from analysis import Recording
+    out = []
+    for p in sorted(glob.glob(f"{folder}/*.csv")):
+        try:
+            rec = Recording(p)
+            if abs(rec.dt - DT) > 0.05 * DT:
+                raise ValueError(f"{rec.dt * 1000:.2f} ms per row, not {DT * 1000:.0f}")
+            out.append(rec)
+        except Exception as e:
+            print(f"  skipping {p}: {type(e).__name__} {e}")
+    if not out:
+        raise SystemExit(f"no usable recordings in {folder}")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description="Train the distillation model.")
-    ap.add_argument("--out", default="models/distill.pkl", help="pickle path")
+    ap.add_argument("--data", required=True, help="folder of recordings, e.g. data/ur5e")
+    ap.add_argument("--out", required=True, help="pickle to write, e.g. models/distill-ur5e.pkl")
     args = ap.parse_args()
 
     # Import under the real module name (not "__main__") so the pickle loads
     # cleanly in optimize.py and analysis.py.
     from train_distillation_model import CNNModel
-    from analysis import Recording
 
-    recordings = [Recording(p) for p in sorted(glob.glob("data/test-*.csv"))]
+    recordings = load_recordings(args.data)
+    print(f"{len(recordings)} recordings from {args.data}")
     CNNModel().fit(recordings).save(args.out)
     print(f"saved {args.out}")
 

@@ -8,7 +8,7 @@ Loads a CSV from ``record.py`` and plots up to three sources of one quantity:
                     (``--model``), with a band of ``--sd-factor`` standard
                     deviations, aleatoric and with the ensemble's disagreement added
 
-    python analysis.py --csv data/test-4.csv --model models/distill.pkl --joint 1
+    python analysis.py --csv data/ur5e/T01_fast_r1.csv --model models/distill-ur5e.pkl
 
 Only the first ``--max-points`` rows are plotted, at the recording's full rate.
 
@@ -152,7 +152,7 @@ def view(rec: Recording, quantity: str = "angle q", joint: int = 1, model=None,
 
 def main():
     ap = argparse.ArgumentParser(description="Interactive plot of a recorded UR run.")
-    ap.add_argument("--csv", default="data/test-4.csv", help="recorded run CSV")
+    ap.add_argument("--csv", required=True, help="recorded run CSV")
     ap.add_argument("--quantity", choices=list(QUANTITIES), default="angle q",
                     help="which channel to plot")
     ap.add_argument("--joint", type=int, default=1, choices=range(N_JOINTS),

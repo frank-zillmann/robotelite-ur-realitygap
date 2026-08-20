@@ -16,7 +16,8 @@ Steps go to ``runs/optimize/<stamp>``: ``loss/total`` (without the limit penalty
 which would swamp it), ``loss/error`` in rad, ``loss/time`` in s, and
 ``loss/limits``, the overshoot of the ceilings, 0 meaning the controller can run it.
 
-    python optimize.py --path scripts/triangle.path --model models/distill.pkl
+    python optimize.py --path scripts/triangle.path --model models/distill-ur5e.pkl \\
+        --robot UR5e
 """
 from __future__ import annotations
 
