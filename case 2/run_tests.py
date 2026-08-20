@@ -124,6 +124,11 @@ def summarize(csv: str, expect_s: float) -> dict:
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--robot-ip", default="127.0.0.1")
+    ap.add_argument("--hz", type=float, default=125.0,
+                    help="RTDE sample rate for the readiness-poll connection; lower "
+                         "this if you see repeated 'RTDE dropped ... try a lower "
+                         "--hz' messages (the controller drops a client that can't "
+                         "keep up, e.g. over a slow/high-latency link)")
     ap.add_argument("--dir", default="optimized", help="folder of pairs")
     ap.add_argument("--form", choices=["script", "path"], default="script")
     ap.add_argument("--loop", type=int, default=5, help="cycles per run")
@@ -135,7 +140,7 @@ def main():
                          "not a reason to discard the remaining twenty.")
     args = ap.parse_args()
 
-    state = State(args.robot_ip)
+    state = State(args.robot_ip, hz=args.hz)
     try:
         mode = state.mode()
     except OSError as e:
@@ -181,7 +186,7 @@ def main():
                 if not state.wait_idle():
                     raise RuntimeError("controller never went idle; a program is still "
                                        "running -- stop it on the pendant")
-                kw = dict(host=args.robot_ip, out=out, loop=args.loop)
+                kw = dict(host=args.robot_ip, out=out, loop=args.loop, hz=args.hz)
                 expect = None
                 # send.py streams progress to stdout; it would land in the middle of
                 # the results table, so it goes to the log file instead.
