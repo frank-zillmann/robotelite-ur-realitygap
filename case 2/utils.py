@@ -55,24 +55,26 @@ class Robot:
         r.fk(q)                  # 4x4 base -> flange pose
         r.jacobian(q)            # 6x6 geometric Jacobian, [v; w] = J(q) @ qd
         r.tcp_speed(q, dt)       # tool speed (m/s) along a trajectory
-        r.v_joint, r.a_joint, r.v_tcp
+        r.q_joint, r.v_joint, r.a_joint, r.v_tcp
     """
 
-    ALPHA = np.array([np.pi / 2, 0.0, 0.0, np.pi / 2, -np.pi / 2, 0.0])
-    A_JOINT = np.array([25.0, 65.0, 60.0, 45.0, 35.0, 35.0])      # rad/s^2
-    V_TCP = 1.35                                                  # m/s
     # The speed ceilings are checked by differencing q, which overshoots by about a
     # percent at the corners of a profile, so they get that much headroom. Without
     # it the controller's own paths score as violations and the optimizer only ever
     # slows down. The recordings sit exactly on the spec: 2.094 and 3.142 rad/s.
-    MARGIN = 1.02
     MODELS = {
-        "UR10e": dict(a=[0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0],
-                      d=[0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655],
-                      v_deg=[120, 120, 180, 180, 180, 180]),
-        "UR5e": dict(a=[0.0, -0.425, -0.3922, 0.0, 0.0, 0.0],
-                     d=[0.1625, 0.0, 0.0, 0.1333, 0.0997, 0.0996],
-                     v_deg=[180, 180, 180, 180, 180, 180]),
+        "UR10e": dict(
+            a=[0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0],
+            d=[0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655],
+            alpha=[90, 0, 0, 90, -90, 0],
+            q_deg=[360] * 6, v_deg=[120, 120, 180, 180, 180, 180],
+            a_joint=[25, 65, 60, 45, 35, 35], v_tcp=1.35),
+        "UR5e": dict(
+            a=[0.0, -0.425, -0.3922, 0.0, 0.0, 0.0],
+            d=[0.1625, 0.0, 0.0, 0.1333, 0.0997, 0.0996],
+            alpha=[90, 0, 0, 90, -90, 0],
+            q_deg=[363] * 6, v_deg=[191] * 6,
+            a_joint=[25, 65, 60, 45, 35, 35], v_tcp=1.5),
     }
 
     def __init__(self, model: str = "UR10e"):
@@ -81,8 +83,11 @@ class Robot:
         p = self.MODELS[model]
         self.model = model
         self.a, self.d = np.array(p["a"]), np.array(p["d"])
-        self.v_joint = np.deg2rad(p["v_deg"]) * self.MARGIN
-        self.a_joint, self.v_tcp = self.A_JOINT, self.V_TCP * self.MARGIN
+        self.alpha = np.deg2rad(p["alpha"])
+        self.q_joint = np.deg2rad(p["q_deg"])
+        self.v_joint = np.deg2rad(p["v_deg"])
+        self.a_joint = np.array(p["a_joint"])
+        self.v_tcp = p["v_tcp"]
 
     @staticmethod
     def _dh(theta: float, a: float, d: float, alpha: float) -> np.ndarray:
@@ -99,7 +104,7 @@ class Robot:
         q = np.asarray(q, dtype=float)
         frames = [np.eye(4)]
         for i in range(N_JOINTS):
-            frames.append(frames[-1] @ self._dh(q[i], self.a[i], self.d[i], self.ALPHA[i]))
+            frames.append(frames[-1] @ self._dh(q[i], self.a[i], self.d[i], self.alpha[i]))
         return frames
 
     def fk(self, q) -> np.ndarray:
