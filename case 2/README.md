@@ -51,14 +51,16 @@ python convert.py scripts/triangle.script --robot-ip 127.0.0.1
 # 3. optimize that path against the model (logs to runs/optimize/)
 python optimize.py --path scripts/triangle.path --model models/distill-ur5e.pkl --robot UR5e
 
-# 4. run both on the robot (each records to <path name>.<engine>.csv)
-# --engine batch on URSim, --engine stream on real hardware (see Known gaps)
+# 4a. run both on URSim to verify safety (--engine batch for URSim)
 python send.py scripts/triangle.path --robot-ip 127.0.0.1 --engine batch --loop 5
 python send.py scripts/triangle.retime.path --robot-ip 127.0.0.1 --engine batch --loop 5
 
+# 4b. run both on a real robot to verify the improvement holds (--engine stream for real)
+python send.py scripts/triangle.path --robot-ip 192.168.1.100 --engine stream --loop 5
+python send.py scripts/triangle.retime.path --robot-ip 192.168.1.100 --engine stream --loop 5
+
 # 5. compare them: one plot, and the optimizer objective side by side
-python analysis.py --csv scripts/triangle.batch.csv scripts/triangle.retime.batch.csv \
-    --model models/distill-ur5e.pkl --robot UR5e
+python analysis.py --csv scripts/triangle.stream.csv scripts/triangle.retime.stream.csv --path scripts/triangle.path scripts/triangle.retime.path --model models/distill-ur5e.pkl --robot UR5e
 ```
 
 `tensorboard --logdir runs` shows both stages. Step 4 is the test that matters: if

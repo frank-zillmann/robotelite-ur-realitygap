@@ -11,11 +11,12 @@ Loads a CSV from ``record.py`` and plots up to three sources of one quantity:
 Each run gets one colour; within it the target is dashed, the measured actual solid,
 and the model pale and thick behind them.
 
-    python analysis.py --csv baseline.csv optimized.csv --model models/distill-ur5e.pkl --robot UR5e
+    python analysis.py --csv baseline.csv optimized.csv --path baseline.path optimized.path \
+        --model models/distill-ur5e.pkl --robot UR5e
 
 Several runs can be given at once; their optimizer objective is printed for
-comparison. Cycle time comes from the matching `.path`, while the learned gap and
-barriers are evaluated over all recorded target rows.
+comparison. Cycle time comes from ``--path`` (one entry per ``--csv``, same
+order), while the learned gap is evaluated over all recorded target rows.
 
 Only the first ``--max-points`` rows are plotted, at the recording's full rate.
 
@@ -112,14 +113,18 @@ PALETTE = ("#d62728", "#2ca02c", "#1f77b4", "#ff7f0e", "#9467bd", "#8c564b")
 _rgba = lambda c, a: f"rgba({int(c[1:3], 16)},{int(c[3:5], 16)},{int(c[5:7], 16)},{a})"
 
 
-def cycle_time(csv: str) -> float:
-    """One commanded cycle, from the `.path` next to its recorded `.csv`."""
-    rows = np.asarray(load_path(csv.rsplit(".", 1)[0] + ".path"), float)
+def cycle_time(path: str) -> float:
+    """One commanded cycle, from a `.path` file."""
+    rows = np.asarray(load_path(path), float)
     return float(rows[:, N_JOINTS].sum()) if rows.shape[1] > N_JOINTS else len(rows) * DT
 
 
-def stats(recs, model, robot):
+def stats(recs, paths, model, robot):
     """Print predicted gap and cycle time for the complete recorded trajectories.
+
+    ``paths`` is the `.path` matching each recording, one-to-one -- a run's `.csv`
+    no longer implies its `.path` by name (e.g. send.py names a stream/batch run
+    `foo.stream.csv`, not `foo.csv`), so it has to be given explicitly.
 
     The barrier is an optimization device, not something to score a finished
     trajectory by (it's already known to respect the limits, or it wouldn't have
@@ -129,7 +134,7 @@ def stats(recs, model, robot):
     from optimize import measures, objective
 
     q = [torch.as_tensor(rec.target_q, dtype=torch.float32) for rec in recs]
-    times = [cycle_time(rec.path) for rec in recs]
+    times = [cycle_time(p) for p in paths]
     with torch.no_grad():
         base_gap, _, _ = measures(model, robot, q[0], weight=0)
         scale = times[0] / float(base_gap.clamp_min(1e-8))
@@ -209,6 +214,8 @@ def main():
     ap = argparse.ArgumentParser(description="Interactive plot of recorded UR runs.")
     ap.add_argument("--csv", required=True, nargs="+",
                     help="recorded run CSVs; the first is the one the rest are scored against")
+    ap.add_argument("--path", required=True, nargs="+",
+                    help="the .path matching each --csv, one-to-one and in the same order")
     ap.add_argument("--quantity", choices=list(QUANTITIES), default="angle q",
                     help="which channel to plot")
     ap.add_argument("--joint", type=int, default=0, choices=range(N_JOINTS),
@@ -217,20 +224,22 @@ def main():
     ap.add_argument("--model", required=True,
                     help="distilled model pickle")
     ap.add_argument("--robot", required=True, choices=("UR5e", "UR10e"),
-                    help="arm whose limits score the barriers")
+                    help="arm whose kinematics/limits the model's predictions are checked against")
     ap.add_argument("--sd-factor", type=float, default=1.0,
                     help="width of the uncertainty bands, in standard deviations")
     ap.add_argument("--max-points", type=int, default=10000,
                     help="rows drawn per trace, from the start of the run; the page "
                          "grows by ~0.2 MB per 1000 rows and trace")
     args = ap.parse_args()
+    if len(args.path) != len(args.csv):
+        raise SystemExit(f"--path needs one entry per --csv ({len(args.csv)}), got {len(args.path)}")
 
     from train_distillation_model import DistillModel      # pulls in torch
     from utils import Robot
 
     recs = [Recording(p) for p in args.csv]
     model = DistillModel.load(args.model)
-    stats(recs, model, Robot(args.robot))
+    stats(recs, args.path, model, Robot(args.robot))
     show(view(recs, args.quantity, args.joint, model, args.sd_factor, args.max_points))
 
 
