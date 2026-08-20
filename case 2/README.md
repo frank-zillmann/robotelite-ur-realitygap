@@ -55,9 +55,8 @@ python optimize.py --path scripts/triangle.path --model models/distill-ur5e.pkl 
 python send.py --robot-ip 127.0.0.1 --path scripts/triangle.path --loop 5 --out baseline.csv
 python send.py --robot-ip 127.0.0.1 --path scripts/triangle.optimized.path --loop 5 --out optimized.csv
 
-# 5. look at them, with the model's prediction and its uncertainty band
-python analysis.py --csv baseline.csv --model models/distill-ur5e.pkl
-python analysis.py --csv optimized.csv --model models/distill-ur5e.pkl
+# 5. compare them: one plot, and the measured error / cycle time side by side
+python analysis.py --csv baseline.csv optimized.csv --model models/distill-ur5e.pkl
 ```
 
 `tensorboard --logdir runs` shows both stages. Step 4 is the test that matters: if
@@ -75,7 +74,7 @@ if not, it was missing something, which sends you back to step 1.
 | `optimize.py` | differentiate a score through the model down to the path's parameters |
 | `train_distillation_model.py` | `DistillModel` interface + `CNNModel`: predict the actual channels |
 | `common.py` | `segments` (split a recording into moves), `features`, `MoveDataset`/`loaders` |
-| `analysis.py` | `Recording` (shared CSV loader) + a plotly target/actual/model viewer |
+| `analysis.py` | `Recording` (shared CSV loader) + a plotly viewer and the measured error/cycle-time table |
 | `utils.py` | constants, `Robot` (UR10e/UR5e kinematics + the controller's ceilings), URScript load/edit |
 
 `scripts/` holds the URScript motions (`_generated/` the speed variants
