@@ -9,7 +9,7 @@
 # Plain assignments (no `global`): send.py wraps this in a repeat loop, and
 # URScript does not allow a `global` declaration inside a loop.
 
-vel = 3
+vel = 1.5
 acc = 3
 
 # Three corners of the triangle [rad]; the cycle is C1 -> C2 -> C3 -> C1.
