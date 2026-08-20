@@ -114,10 +114,19 @@ decision-making across a trajectory — each move is scored independently.
   every channel the distill model predicts, plus the baseline `score` —
   built by `observe()`. The agent sees "what does this move look like and
   how did it do at its original speed" before picking an action.
-- **Action bounds** (`GapEnv`): `VEL_BOUNDS = (20, 180)` deg/s,
-  `ACC_BOUNDS = (40, 600)` deg/s² — the upper end is chosen so a `movej`
-  speed above the joint limit (~180 deg/s = π rad/s) clamps anyway, so the
-  useful range stays below where clamping would make the action meaningless.
+- **Action bounds** (`GapEnv`): `VEL_BOUNDS = (1, 179)` deg/s,
+  `ACC_BOUNDS = (1, 200)` deg/s² (updated 2026-08-20 — see Changelog; were
+  `(20, 180)`/`(40, 600)`). The vel ceiling is kept just under the user's
+  robot's own measured joint speed limit (191 deg/s), not a generic `~180
+  deg/s = π rad/s` figure — high enough to stay clear of where `movej`
+  would clamp the action to something other than what was chosen, but not
+  pinned right against the limit. The acc ceiling was cut 600 → 200 after
+  the user reported the real robot feels jerky at the old range: 600 deg/s²
+  reaches full `VEL_BOUNDS` speed in ~0.3s (a very sudden torque
+  application) vs. ~0.9s at 200 — and a direct `GapEnv.score()` sweep (real
+  distill model, a real move) showed score wasn't still climbing by
+  250-600 deg/s² either, so there was no measured reason to keep the
+  ceiling that high.
 - **Scoring a candidate** (`_candidate`/`_score_settled`/`evaluate`): places
   the move's geometry at the agent's chosen speed profile, appends
   `SETTLE_S` seconds held at the destination (see §2a), asks
@@ -567,8 +576,91 @@ zip succeeds). `run.py` now imports and uses `load_agent` instead of
 algorithm, confirmed `load_agent` detects each correctly and `.predict()`
 works on all three.
 
+## 8a. PPO and SAC in plain terms — for Q&A (2026-08-20)
+
+§0 has the analogy (student who discards each practice exam vs. one who
+keeps and re-studies them all) and §8 has the technical justification for
+*this* environment. This section is a level below the analogy and a level
+above §8's code-specific detail — what each algorithm actually is, for
+fielding a question that goes past the analogy.
+
+**PPO (Proximal Policy Optimization)** — OpenAI, 2017; the field's default
+general-purpose choice.
+- **On-policy**: only ever learns from data its *current* policy just
+  collected; each batch gets used for one small update, then is discarded.
+- **How it updates**: an actor-critic policy-gradient method — one network
+  picks the action, a second scores how good the situation was, used to
+  steady the update. The "proximal" part *clips* how far one update can
+  move the policy, so a single bad batch can't wreck training — the reason
+  it's a safe default for noisy or multi-step environments.
+- **Fits best**: environments where the reward is noisy and/or steps depend
+  on each other (games, multi-step robot trajectories) — not this project's
+  shape (§1/§2, §8).
+
+**SAC (Soft Actor-Critic)** — Berkeley, 2018; the standard off-policy choice
+for continuous actions.
+- **Off-policy**: keeps every transition it's ever seen in a replay buffer
+  and reuses old data repeatedly, not just once.
+- **How it updates**: an actor-critic like PPO, but learns two Q-value
+  networks ("twin critics," to avoid overestimating an action's value) plus
+  a stochastic policy, and adds an **entropy bonus** — extra reward for
+  staying somewhat random — so it keeps exploring instead of committing to
+  one guess too early.
+- **Fits best**: environments where samples are slow/expensive to collect
+  and old samples never go stale — this project's case exactly, since every
+  `(move, action)` score is a deterministic calculation (§8), not a noisy
+  real robot reading.
+
+**One-liner**: PPO learns once from each fresh batch and moves on; SAC
+keeps a notebook of everything it's tried and re-studies the whole thing —
+so on a fixed, deterministic environment like this one, SAC gets more
+learning out of the same number of samples.
+
+**Likely questions**:
+- *"Why not start with SAC?"* — PPO is RL tooling's usual first choice; this
+  project started there, and switched once this environment's specific
+  shape (one-step, deterministic, no sequencing) made off-policy reuse a
+  clear win, not from a general "SAC beats PPO" claim.
+- *"Is SAC always better?"* — No. With real robot noise or true multi-step
+  credit assignment, reused old data can go stale or misleading — PPO's
+  discard-and-move-on approach is the safer default there. That risk is
+  absent here because every score is an offline calculation, not a live
+  reading.
+- *"Have you actually confirmed SAC trains a better policy here?"* — The
+  switch is confirmed working end-to-end (loads, trains, saves, `run.py`
+  compatible — §8). A real side-by-side comparison of trained policy
+  quality is the next step (§7) — this is a reasoned bet, not yet a proven
+  result, and worth saying plainly if asked.
+- *"What's a replay buffer?"* — A log of every `(state, action, reward,
+  next state)` the agent has observed; off-policy algorithms sample from it
+  at random to keep training, instead of needing brand-new data every step.
+- *"What does the entropy bonus in SAC do?"* — Rewards the policy for
+  staying a bit random early on, so it explores more of the action space
+  before settling, rather than converging to a mediocre answer too fast.
+- *"Same library for both?"* — Yes, both are `stable-baselines3` with the
+  same `.learn()`/`.predict()`/`.save()`/`.load()` interface — switching was
+  a one-flag change (`--algo`), not a rewrite (§8).
+
 ## Changelog
 
+- **2026-08-20** — Added §8a: a standalone "what PPO/SAC actually are" primer
+  (on-policy vs. off-policy, actor-critic, PPO's clipped update, SAC's twin
+  critics + entropy bonus) plus a likely-questions list, for presentation
+  Q&A — a level below §8's code-specific justification and a level above
+  §0's analogy.
+- **2026-08-20** — `GapEnv` action bounds recalibrated from user-supplied
+  hardware info, not just measurement: `VEL_BOUNDS` widened `(20, 180) ->
+  (1, 179)` deg/s (ceiling set just under the user's robot's own measured
+  191 deg/s joint speed limit, floor dropped near zero to allow very
+  gentle moves too); `ACC_BOUNDS` narrowed `(40, 600) -> (1, 200)` deg/s²
+  after the user reported the real robot feels jerky at the old ceiling —
+  checked via ramp-time (600 deg/s² reaches full speed in ~0.3s vs. ~0.9s
+  at 200) and a direct `GapEnv.score()` sweep (real distill model, a real
+  move: score was not still climbing by 250-600 deg/s², so nothing measured
+  argued for keeping the higher ceiling). §2 updated to match. Any
+  already-trained agent must be retrained against the new bounds — the
+  action space itself is unchanged ([-1,1]^2), but what a given action now
+  maps to physically is different. Not yet verified by a training run.
 - **2026-08-20** — Added §4b: a real SAC run with §4a's mean-matched
   `SCORE_WEIGHT=10800` still left score flat, root-caused to mean-matching
   balancing average size, not gradient — cycle_time's std/range across the

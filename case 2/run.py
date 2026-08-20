@@ -32,6 +32,7 @@ import ur_style
 from metrics import PositionGapMetric
 from preprocess import default_preprocess
 from train_distillation_model import DistillModel
+from dynamics import DEG2RAD
 from train_rla import GapEnv, PathEnv, build_dataset, load_agent, speed_profile
 from utils import get_param, load_script, set_param
 
@@ -117,12 +118,24 @@ def report(env: GapEnv, moves, vel: float, acc: float, label: str) -> np.ndarray
 
 
 def run_params(args, model, metric, rec, pre, run_dir: str) -> dict:
-    """Optimize the script's vel/acc and write the optimized script."""
+    """Optimize the script's vel/acc and write the optimized script.
+
+    The script's `vel =`/`acc =` lines feed `movej(a=acc, v=vel)` directly --
+    URScript's own units for a joint move, rad/s and rad/s^2 (see
+    dynamics.py's ``MAX_JOINT_SPEED`` comment). ``GapEnv.score``/the agent's
+    ``_unmap`` work in deg/s, deg/s^2 (``VEL_BOUNDS``/``ACC_BOUNDS``). Every
+    read from the script is converted rad -> deg before use here, and the
+    write back to the script is converted deg -> rad -- without that, the
+    optimized script's numbers are off by 180/pi (~57.3x): a `movej` speed
+    that far past the joint limit doesn't scale the motion, it just clamps to
+    the robot's hard max regardless of what the agent actually chose.
+    """
     text = load_script(args.script)
     env = GapEnv(model, metric, rec, pre=pre)
     moves = script_moves(env)
 
-    base_vel, base_acc = get_param(text, "vel"), get_param(text, "acc")
+    base_vel = get_param(text, "vel") / DEG2RAD
+    base_acc = get_param(text, "acc") / DEG2RAD
     base = report(env, moves, base_vel, base_acc, "baseline (from script)")
     vel, acc = search_agent(env, moves, args.agent)
     opt = report(env, moves, vel, acc, "optimized")
@@ -132,7 +145,7 @@ def run_params(args, model, metric, rec, pre, run_dir: str) -> dict:
 
     out = re.sub(r"\.script$", ".optimized.script", args.script)
     with open(out, "w") as f:
-        f.write(set_param(set_param(text, "vel", vel), "acc", acc))
+        f.write(set_param(set_param(text, "vel", vel * DEG2RAD), "acc", acc * DEG2RAD))
     print(f"wrote {out}\n  run it: python send.py --script {out} --out optimized.csv")
 
     return {

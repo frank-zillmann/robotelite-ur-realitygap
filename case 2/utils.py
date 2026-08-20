@@ -356,5 +356,14 @@ def get_param(text: str, name: str) -> float:
 
 
 def set_param(text: str, name: str, value: float) -> str:
-    """Return the script with `<name>` set to ``value`` (rounded int)."""
-    return re.sub(_PARAM.format(name=name), rf"\g<1>{int(round(value))}", text)
+    """Return the script with `<name>` set to ``value``, to 4 decimal places.
+
+    Not rounded to an int: `vel`/`acc` are written here in URScript's own
+    rad/s, rad/s^2 (see run.py's ``run_params``), typically well under 4 --
+    rounding to the nearest whole number would collapse most of that range to
+    0, 1, 2, or 3, silently destroying almost all of the agent's chosen
+    precision (confirmed: this bit when run.py's write path was fixed to
+    convert deg -> rad before writing here, where the old int rounding used
+    to be masked by deg-scale values always being comfortably >> 1).
+    """
+    return re.sub(_PARAM.format(name=name), rf"\g<1>{value:.4f}", text)

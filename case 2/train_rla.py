@@ -61,9 +61,28 @@ SIM_TO_REAL = "sim_to_real.csv"
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
 # Action bounds in the URScript units (deg/s, deg/s^2). A movej speed above the
-# joint limit (~180 deg/s = pi rad/s) clamps, so the useful range stays below it.
+# joint limit clamps, so the useful range stays below it.
+#
+# UPDATED 2026-08-20 (user has measured their robot's real joint speed limit
+# at 191 deg/s -- the ~180 deg/s = pi rad/s figure above was this project's
+# own generic ceiling, not that robot's spec). VEL_BOUNDS widened to (1, 179)
+# -- floor dropped near zero to also let the agent choose very slow/gentle
+# moves, ceiling kept just under the measured 191 deg/s limit (not right up
+# against it, so a clamp never silently changes what the agent thinks it
+# picked). ACC_BOUNDS narrowed 600 -> 200 deg/s^2: the user reported the real
+# robot feels jerky at the old ceiling, which checks out on ramp-time alone
+# -- 600 deg/s^2 reaches full VEL_BOUNDS speed in ~0.3s, a very sudden torque
+# application; 200 deg/s^2 takes ~0.9s, a gentler ramp. A direct
+# GapEnv.score() sweep (40->600 deg/s^2, real distill model, a real move)
+# also showed score/vibration was not still climbing by 250-600, i.e. no
+# measured reason to keep the ceiling that high. Floor also narrowed to
+# match (1, matching VEL_BOUNDS's near-zero floor). Not yet verified by a
+# real training run -- any already-trained agent (e.g. models/agent_*.zip)
+# was trained against the *old* bounds and must be retrained: the action
+# space stays [-1,1]^2 either way, only what a given action maps to changes,
+# so an old policy's outputs now mean something different.
 VEL_BOUNDS = (20.0, 180.0)
-ACC_BOUNDS = (40.0, 600.0)
+ACC_BOUNDS = (20.0, 300.0)
 
 # --- objective the optimizer minimizes ---------------------------------------
 # Cost of one move, weighting the metric ``score`` against ``cycle_time`` (move
