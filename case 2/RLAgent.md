@@ -172,6 +172,59 @@ function with a similar name.
 weighted cycle term): `GapEnv` ratio 0.93, `PathEnv` ratio 0.46 — both within
 a 0.2–5x "neither term is negligible" band.
 
+## 4a. The calibration didn't survive contact with a trained policy (2026-08-20)
+
+The 0.93 ratio above is a **random-action** measurement, taken before any
+training — it describes the *starting* distribution of (score, cycle_time)
+a fresh policy sees, not what a *trained* one settles into. New tool
+`tune_reward_weights.py` (repo root: `case 2/`) automates that same
+random-sampling calibration, and adds a second mode it didn't have before:
+checking balance against a **completed run's own episodes** (needs
+`train_rla.py`'s `log_training_run` to save one — see §6, added same day).
+
+Checked against a real 20,000-step run (`results/2026-08-20_12-57-02_rla_params/`,
+20,480 episodes — trained *with* lag-tap features in the distill model, see
+below; a near-identical earlier run, `2026-08-20_12-31-40_rla_params/`,
+predates the `episodes.csv` logging this check needs, so this slightly
+later re-run is the one actually used here):
+
+```
+python tune_reward_weights.py --episodes results/2026-08-20_12-57-02_rla_params/episodes.csv --mode params --target-ratio 1.0
+  mean score:      0.000158 rad
+  mean cycle_time: 1.715 s
+  current SCORE_WEIGHT=2500  ->  weighted (score:cycle) = 0.231:1
+  target ratio 1:1  ->  recommended SCORE_WEIGHT = 10838.5
+```
+
+At `SCORE_WEIGHT=2500`, the *trained* policy's own score/cycle_time pairs
+weight to **0.231:1**, not the ~1:1 the pre-training calibration found —
+cycle_time dominated the gradient for the entire run. This lines up exactly
+with that run's `training_curve.png`: cycle_time's rolling mean dropped
+steadily (~3.5s → ~1.2s) while score's barely moved (and even ticked up
+slightly) — the agent had far more reward available from getting faster
+than from getting smoother, so that's what it optimized.
+
+**Retargeted at 1:1** (score and cycle_time weighted equally — no
+deliberate favoring of either; a `2:1` version favoring vibration reduction
+was tried briefly first, see git history, then explicitly reverted to `1:1`):
+`SCORE_WEIGHT` changed **2500.0 → 10800.0** (rounded from the tool's exact
+10838.5 recommendation against the same episode data, same rounding
+convention the original 2524→2500 calibration used). `PATH_SCORE_WEIGHT`
+is **not** re-checked here — no `path`-mode training run has happened yet
+to measure its own drift against; assume it needs the same treatment
+before trusting it.
+
+**Why this matters alongside §5's "no lag features" explanation**: the run
+being recalibrated against here was trained with the lag-tap-enabled
+distill model (`qdd_lag4/16/64`, ported into this branch's
+`train_distillation_model.py` the same day — see Changelog), *not* the
+no-history model §5's original discussion assumed. Score still barely
+moved despite the model now being able to represent the settle-window ring
+in principle — strong evidence the reward-weight imbalance was doing (at
+least) as much to suppress the score signal as the missing-lag-features gap
+was. Both are real; a fresh run is needed with both fixes in place before
+attributing "flat score" to either one alone (see §7).
+
 ## 5. Verification so far
 
 **Offline, no live robot/URSim** (not available in this dev environment):
@@ -196,27 +249,49 @@ window the case brief asks for. Kept here as the historical record of the
 "score is flat, cycle time drops" finding, which is still the relevant
 question to re-check once §2a's fix has a fresh training run behind it.)*
 
+**A second real 20,000-step run happened** (2026-08-20,
+`results/2026-08-20_12-31-40_rla_params/`, same 3 scripts, 20,480 episodes,
+`best_score=0.0000602`, `final_score_mean=0.000164`, `best_cycle_time=0.570s`).
+This one *does* have the settling-window fix, *and* was trained against the
+lag-tap-enabled distill model (`qdd_lag4/16/64`, ported into this branch's
+`train_distillation_model.py` the same day so it could load the
+`PerJointTreeModel` pickle copied in from `apostolosDistillModel` — see
+Changelog), *and* the company-provided UR5e physics files (`dynamics.py`/
+`utils.py` swap, same day). Its `training_curve.png` shows the identical
+qualitative pattern the superseded run above did: cycle_time's rolling mean
+dropped steadily (~3.5s → ~1.2s), score's stayed essentially flat (even
+ticked up slightly). Repeating with a model that *can* represent history and
+a metric scored over the right window and still seeing a flat score ruled
+out "wrong window" and weakened "model can't represent it" as sole
+explanations — which is what led to checking the objective weights
+directly (§4a) and finding the real driver: at the old `SCORE_WEIGHT=2500`,
+this run's own score/cycle_time distribution weighted to 0.231:1, not ~1:1.
+This run predates the `SCORE_WEIGHT=10800` recalibration — not yet re-run
+with it.
+
 This is consistent with, not contrary to, `ModelReview.md`'s documented
-limitation: the distill model has no lag/history features, so it can't
-represent the settle-window ring — the actual thing "vibration" refers to
-physically. If the model's score barely changes with the trajectory shape in
-the dimension that matters, the agent has nothing to climb on that axis and
-will optimize the term it *can* move (speed). Worth treating as a real,
-data-backed prediction of what adding lag features (`ModelReview.md` §7
-item 2) should fix, not just a documentation caveat.
+limitation about lag/history features — both that gap and the objective
+imbalance (§4a) push in the same direction (suppress the score signal the
+agent has to climb), and the second run above is evidence the weight
+imbalance alone is sufficient to reproduce the flat-score pattern even with
+lag features present. Disentangling how much each one individually
+contributed needs a fresh run with the recalibrated weight; see §7.
 
 **Not yet done**: no run against a real robot or a fresh live URSim
 connection from this session; no comparison of `params` vs `path` mode
 results; no PPO hyperparameter tuning (default `MlpPolicy` throughout); no
 check of whether training for longer than 20k steps keeps improving cycle
-time or plateaus.
+time or plateaus; no run yet with the recalibrated `SCORE_WEIGHT=10800`.
 
 ## 6. Plots each run produces
 
 | file | from | shows |
 |---|---|---|
 | `training_curve.png` | `train_rla.py`'s `log_training_run` | score / cycle_time / reward vs. timestep, raw (faint) + rolling mean + best-so-far reference line, one subplot each |
+| `episodes.csv` (not a plot, 2026-08-20) | `train_rla.py`'s `log_training_run` | full per-episode `timestep`/`reward`/`score`/`cycle_time` — previously only aggregated into `log.json`'s summary; now saved raw so a completed run's actual distribution can be checked (`tune_reward_weights.py --episodes ...`) without retraining |
 | `baseline_vs_optimized.png` | `run.py`'s `run_params`/`run_path` (new, 2026-08-19) | mean score and cycle_time, baseline (script's original vel/acc) vs. the trained agent's choice, side by side with %-change titles |
+| `weight_sensitivity.png` (2026-08-20) | `tune_reward_weights.py` | score term's share of mean total weighted cost vs. candidate `SCORE_WEIGHT` (log scale) — where the current and recommended weights sit relative to a target balance |
+| `score_vs_cycle.png` (2026-08-20) | `tune_reward_weights.py` | raw score-vs-cycle_time samples with iso-cost lines for the current and recommended weights overlaid — shows concretely how weight choice reshapes which points count as "good" |
 
 Both use `ur_style` (added 2026-08-19, replacing hardcoded `steelblue`/
 `darkorange`/`purple`/`green`) — same palette/outline/grid convention as
@@ -235,19 +310,34 @@ asks for. Not yet generated from a real trained agent as of this writing
 
 ## 7. Not yet done, known limitations
 
-- No fresh training run since the settling-window fix (§2a) — the real run
-  recorded in §5 predates it and its `score` numbers are not the settling-
-  window numbers the case brief asks for. Re-running training and
-  `run.py`'s `baseline_vs_optimized.png` is the immediate next step.
-- No lag/history features in the distill model → the agent can't be
-  expected to reduce vibration meaningfully yet (§5), and §2a's fix doesn't
-  change this: appending a held-still tail gives the metric real settling-
-  window *rows* to score, but the distill model still predicts each row
-  from that row's own instantaneous features, with no memory of the
-  approach that preceded it — so it still can't represent a decaying ring,
-  it can now just be *asked* about the right time window. This is the
-  highest-priority fix, and it lives in `train_distillation_model.py`, not
-  here — see `ModelReview.md` §7 item 2.
+- **No training run yet with the recalibrated `SCORE_WEIGHT=10800`** (§4a) —
+  the immediate next step. Both real runs so far (§5) used the old
+  `SCORE_WEIGHT=2500`, under which cycle_time dominated the objective
+  ~4.3:1 rather than the intended 1:1 balance; a fresh run is needed to see
+  whether score actually improves once the agent has real gradient on it.
+- Now that lag features (below) and the weight recalibration are both in
+  place, disentangling how much each contributed to the previous flat-score
+  runs needs a run with both fixes active — not done yet (§4a/§5).
+- ~~No lag/history features in the distill model~~ — **done** 2026-08-20:
+  `qdd_lag4/16/64` ported into this branch's `train_distillation_model.py`
+  (was 8 features, now 11, matching `apostolosDistillModel`'s model — this
+  was also *required* just to load the `PerJointTreeModel` pickle copied in
+  from that branch, which crashed with a feature-count `ValueError`
+  otherwise). Effect on RL training still unclear — see §5's second real run,
+  which had this fix and still showed a flat score, now attributed mainly to
+  the weight imbalance instead (§4a).
+- `dynamics.py`/`utils.py` swapped to company-provided UR5e physics files
+  2026-08-20 (see `ModelReview.md`-side writeup for the full compatibility
+  investigation) — DH/mass/COM are byte-identical to the previous values
+  (so `gravity()`/the distill model's `gravity_torque` feature are
+  numerically unaffected, confirmed directly), but the inertia tensors are
+  now fully populated (previously zero for links 1-5) which changes
+  `mass_matrix()` and therefore `dynamics.py`'s simulated `target_current`
+  for every RL candidate. Verified the swap doesn't crash/NaN, but **no
+  training run has happened with the new physics to check whether the more
+  complete inertia model changes what the agent learns** — both real runs
+  in §5 used it (it landed before them), so there's no before/after
+  comparison to point to either.
 - Leave-one-file-out validation of the distill model itself is still
   unverified (`ModelReview.md` §7 item 4) — any RL result inherits that
   uncertainty.
@@ -255,11 +345,60 @@ asks for. Not yet generated from a real trained agent as of this writing
   pipeline (`send.py --script ...optimized.script`) — everything so far is
   the distill model's prediction, one layer removed from ground truth.
 - `path` mode is unexercised beyond the offline PPO smoke test — no real
-  training run or baseline-vs-optimized comparison yet.
+  training run or baseline-vs-optimized comparison yet, and its
+  `PATH_SCORE_WEIGHT=20.0` hasn't been rechecked against a trained policy
+  the way `SCORE_WEIGHT` just was (§4a) — likely has the same kind of drift.
 - PPO hyperparameters are stable-baselines3 defaults throughout — untuned.
 
 ## Changelog
 
+- **2026-08-20** — Recalibrated `SCORE_WEIGHT` against a *trained* policy's
+  actual score/cycle_time distribution instead of only the pre-training
+  random-action baseline (§4a). New tool `case 2/tune_reward_weights.py`:
+  samples random actions through the live `GapEnv`/`PathEnv` (or reuses a
+  completed run's `episodes.csv`, new below), prints the current weight's
+  real balance ratio and a recommended weight for a target ratio, and saves
+  two plots (`weight_sensitivity.png`, `score_vs_cycle.png` — see §6).
+  Checked against `results/2026-08-20_12-57-02_rla_params/`'s real 20,480
+  episodes: `SCORE_WEIGHT=2500` weighted to 0.231:1 (score:cycle), not
+  ~1:1 — cycle_time dominated the whole run. First retargeted at 2:1
+  (favoring vibration reduction): `SCORE_WEIGHT` 2500.0 → 21700.0; revised
+  same day back to an explicit **1:1** (score and cycle_time weighted
+  equally, no favoring either): `SCORE_WEIGHT` → **10800.0** (tool's exact
+  recommendation 10838.5, rounded). `PATH_SCORE_WEIGHT` left
+  unchanged/unchecked (§7). `train_rla.py`'s
+  `log_training_run` now also saves `episodes.csv` (full per-episode
+  timestep/reward/score/cycle_time — previously only aggregated into
+  `log.json`), which is what makes the post-hoc check possible without
+  retraining.
+- **2026-08-20** — Ported the `qdd_lag4/16/64` lag-tap feature machinery
+  into this branch's `train_distillation_model.py` (`PerJointPositionModel`/
+  `PerJointTreeModel`: 8 features → 11) to match `apostolosDistillModel`'s
+  version — required to load the `PerJointTreeModel` pickle copied in as
+  the new `models/distill.pkl`, which was crashing `train_rla.py` with
+  `ValueError: X has 8 features, but HistGradientBoostingRegressor is
+  expecting 11 features`. Verified against the actual pickle (not just a
+  freshly-trained stand-in): loads and predicts correctly post-fix. See
+  §5/§7 for how this interacts with the weight-recalibration finding above
+  — both real training runs in §5 predate one or both of these fixes.
+- **2026-08-20** — Swapped `case 2/dynamics.py`/`case 2/utils.py` for
+  company-provided UR5e physics files (more complete inertia tensors —
+  previously zero for links 1-5, now fully populated from
+  `Universal_Robots_ROS2_Description`). DH/mass/COM are byte-identical to
+  the previous values (verified numerically: `gravity()`/`gravity_batch()`
+  bit-identical across 500 random poses), so the distill model's
+  `gravity_torque` feature is unaffected and needed no refit. `mass_matrix()`
+  does change (inertia now contributes), which changes `dynamics.py`'s
+  simulated `target_current` for every RL candidate — the actual physics
+  `train_rla.py` trains against, not just a feature. Also added a missing
+  `gravity_batch()` (this project's own vectorized addition, absent from
+  the company files) to the new `utils.py` before swapping. Both real
+  training runs in §5 happened after this swap; no before/after comparison
+  exists yet (§7). Also added periodic progress printing to
+  `_TrainCallback`/`train_ppo` (`--print-every`, default 5s) — training
+  previously printed nothing at all between the start and end of a
+  20,000-step run (`PPO(..., verbose=0)`), which looked indistinguishable
+  from hanging.
 - **2026-08-19** — Gold-tier gap fix: candidates now score a real
   post-stop **settling window** (§2a), not the motion itself, matching the
   case brief's `peak`/`rms` "for t in the settling window" requirement.

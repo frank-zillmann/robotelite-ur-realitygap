@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from datetime import datetime
 
 import matplotlib
@@ -92,7 +93,24 @@ ACC_BOUNDS = (40.0, 600.0)
 # came out 0.95 (balanced), PathEnv's 79.5 on a first pass with the wrong
 # calibration, ~1 after the fix. CYCLE_WEIGHT/PATH_CYCLE_WEIGHT stay 1.0 as
 # the stable reference the score weight is calibrated against.
-SCORE_WEIGHT = 2500.0
+#
+# RECALIBRATED 2026-08-20 (see tune_reward_weights.py, RLAgent.md §4a): the
+# 0.95 ratio above was measured from *random-action* sampling before any
+# training happened. It doesn't hold once a policy is actually trained --
+# checked against a real 20,000-step run's own episodes.csv (20,480
+# episodes, results/2026-08-20_12-57-02_rla_params/): mean score 0.000158
+# rad, mean cycle_time 1.715s. At the original SCORE_WEIGHT=2500 that's a
+# 0.231:1 (score:cycle) weighted ratio, not ~1:1 -- cycle_time dominated
+# the gradient the whole run, which is exactly why that run's score barely
+# moved (even worsened slightly) while cycle_time dropped ~3s->~1.2s.
+# First retargeted at a deliberate 2:1 ratio (21700, see git history),
+# then explicitly set back to **1:1** (score and cycle_time weighted
+# equally, no deliberate favoring of either) --
+# `python tune_reward_weights.py --episodes <run>/episodes.csv --target-ratio 1.0`
+# recommended 10838.5 against the same episode data; rounded. PATH_SCORE_WEIGHT
+# is unchanged/unverified against this same drift -- no path-mode training
+# run has happened yet to check it against.
+SCORE_WEIGHT = 10800.0
 CYCLE_WEIGHT = 1.0
 OBJECTIVE = lambda score, cycle_time: SCORE_WEIGHT * score + CYCLE_WEIGHT * cycle_time
 
@@ -412,11 +430,25 @@ class PathEnv(_MoveEnv):
 
 
 class _TrainCallback(BaseCallback):
-    """Records per-episode reward, score, and cycle_time during PPO training."""
+    """Records per-episode reward, score, and cycle_time during PPO training,
+    and prints a progress line roughly every ``print_every`` seconds.
 
-    def __init__(self):
+    PPO itself runs with ``verbose=0`` (see ``train_ppo``) and this callback
+    previously only recorded episodes silently -- a run's entire terminal
+    output was one line before training and one line after, with nothing in
+    between regardless of how long ``total_timesteps`` takes. Time-based
+    (not step-count-based) printing, since steps/sec varies a lot with the
+    environment's per-step cost (dynamics/candidate scoring) -- a fixed
+    step-count interval would either flood a fast run or stay silent for a
+    slow one.
+    """
+
+    def __init__(self, total_steps: int, print_every: float = 5.0):
         super().__init__(verbose=0)
         self.records: list[dict] = []
+        self.total_steps = total_steps
+        self.print_every = print_every
+        self._last_print = time.monotonic()
 
     def _on_step(self) -> bool:
         dones   = self.locals.get("dones",   [])
@@ -430,6 +462,15 @@ class _TrainCallback(BaseCallback):
                     "score":      float(info.get("score",      float("nan"))),
                     "cycle_time": float(info.get("cycle_time", float("nan"))),
                 })
+        now = time.monotonic()
+        if self.print_every > 0 and now - self._last_print >= self.print_every:
+            self._last_print = now
+            pct    = 100.0 * self.num_timesteps / self.total_steps if self.total_steps else 0.0
+            recent = self.records[-20:]
+            mean_score = float(np.mean([r["score"] for r in recent])) if recent else float("nan")
+            print(f"  step {self.num_timesteps}/{self.total_steps} ({pct:.0f}%)   "
+                 f"episodes: {len(self.records)}   recent mean score: {mean_score:.4f}",
+                 flush=True)
         return True
 
 
@@ -485,6 +526,15 @@ def log_training_run(mode: str, scripts: list, steps: int, agent_path: str,
     with open(log_path, "w") as f:
         json.dump(log, f, indent=2)
     print(f"[results] log  -> {log_path}")
+
+    # ---- episodes.csv ---------------------------------------------------------
+    # Full per-episode records (log.json only keeps aggregate stats) -- lets a
+    # later run check whether the trained policy's actual score/cycle_time
+    # distribution still balances the way SCORE_WEIGHT was calibrated against
+    # (see tune_reward_weights.py), without retraining.
+    episodes_path = os.path.join(run_dir, "episodes.csv")
+    pd.DataFrame(records).to_csv(episodes_path, index=False)
+    print(f"[results] episodes -> {episodes_path}")
 
     # ---- training_curve.png --------------------------------------------------
     ur_style.apply()
@@ -548,11 +598,13 @@ def log_training_run(mode: str, scripts: list, steps: int, agent_path: str,
 
 
 def train_ppo(env, steps: int, out: str, versioned_out: str = None,
-             seed: int = None) -> tuple:
+             seed: int = None, print_every: float = 5.0) -> tuple:
     """Train a PPO agent on an env, save it, and return (agent, callback).
 
     ``out`` is the standard "latest" path (e.g. models/agent_params.zip).
     ``versioned_out`` is an optional second save path for the timestamped copy.
+    ``print_every`` (seconds) controls how often ``_TrainCallback`` prints a
+    progress line during training; pass ``0`` to go back to silent.
 
     ``seed`` makes the run reproducible: SB3's ``PPO(seed=...)`` seeds the
     policy's weight init and its own RNG *and* seeds ``env`` (python/numpy/
@@ -567,7 +619,7 @@ def train_ppo(env, steps: int, out: str, versioned_out: str = None,
     e.g. by rerunning the *same* model/seed pair to see how much the curve
     naturally wobbles run-to-run before trusting a model-to-model diff.
     """
-    cb    = _TrainCallback()
+    cb    = _TrainCallback(total_steps=steps, print_every=print_every)
     agent = PPO("MlpPolicy", env, verbose=0, seed=seed)
     agent.learn(total_timesteps=steps, callback=cb)
     agent.save(out)
@@ -612,6 +664,9 @@ def main():
                         "it -- see train_ppo's docstring")
     ap.add_argument("--out", default=None,
                     help="agent save path (default: models/agent_<mode>.zip)")
+    ap.add_argument("--print-every", type=float, default=5.0,
+                    help="seconds between training-progress print lines "
+                        "(default: %(default)s; 0 disables)")
     args = ap.parse_args()
     out = args.out or f"models/agent_{args.mode}.zip"
 
@@ -632,7 +687,8 @@ def main():
 
     agent_versioned = os.path.join(run_dir, f"agent_{args.mode}.zip")
     print(f"mode: {args.mode}   training on {len(env.targets)} segments   seed: {args.seed}")
-    _, cb = train_ppo(env, args.steps, out, versioned_out=agent_versioned, seed=args.seed)
+    _, cb = train_ppo(env, args.steps, out, versioned_out=agent_versioned, seed=args.seed,
+                      print_every=args.print_every)
     print(f"trained PPO ({args.mode}) for {args.steps} steps")
     print(f"  latest   -> {out}")
     print(f"  versioned -> {agent_versioned}")

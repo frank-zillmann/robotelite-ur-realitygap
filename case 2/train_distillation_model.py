@@ -92,6 +92,24 @@ def _gravity_block(q: np.ndarray) -> np.ndarray:
     """
     return _UR5E.gravity_batch(q)
 
+
+def _lag_array(x: np.ndarray, k: int) -> np.ndarray:
+    """Causal lag of ``x`` by ``k`` samples: row ``i`` becomes ``x[i - k]``.
+
+    ``x`` is ``(n, ...)`` for one recording only -- callers must lag *before*
+    pooling/concatenating across recordings (see ``_design``), otherwise the
+    first rows of one file would be "lagged" from the tail of the previous
+    file, which isn't a real physical history. The first ``k`` rows have no
+    real history within this recording, so they hold at ``x[0]`` (repeat the
+    initial value) rather than wrap around or leave a gap.
+    """
+    if k <= 0:
+        return x
+    lagged = np.empty_like(x)
+    lagged[:k] = x[0]
+    lagged[k:] = x[:-k]
+    return lagged
+
 # Train on every recorded run; holdout is a row-level fraction, not a set of
 # held-out files. Matches original_train.py's methodology: pool every row of
 # every joint of every recording, mark a deterministic fraction of rows as
@@ -235,8 +253,13 @@ class PerJointPositionModel(DistillModel):
       this is possible without duplicating feature-building logic.
     """
 
-    FEATURE_NAMES = ["target_current", "qd", "qdd", "pos", "gravity_torque",
-                     "vel", "acc", "bias"]
+    FEATURE_NAMES = ["target_current", "qd", "qdd", "qdd_lag4", "qdd_lag16",
+                     "qdd_lag64", "pos", "gravity_torque", "vel", "acc", "bias"]
+
+    # Sample offsets (at the recording rate) for the causal qdd lag taps
+    # above: gives this otherwise-memoryless per-row model some visibility
+    # into the post-move settle-window ring.
+    LAG_SAMPLES = (4, 16, 64)
 
     def __init__(self):
         self.coefs = None                    # (N_JOINTS, len(FEATURE_NAMES)) one row per joint
@@ -248,7 +271,8 @@ class PerJointPositionModel(DistillModel):
 
     # --- features -------------------------------------------------------------
 
-    def _row_features(self, joint: int, tgt_i, pos, qd, qdd, vel, acc, gravity=None) -> np.ndarray:
+    def _row_features(self, joint: int, tgt_i, pos, qd, qdd, vel, acc, gravity=None,
+                      lag_cols=None) -> np.ndarray:
         """Feature row for one joint over a whole trajectory, columns selected
         by ``self.FEATURE_NAMES``, shape ``(n, len(FEATURE_NAMES))``.
 
@@ -260,7 +284,9 @@ class PerJointPositionModel(DistillModel):
         by the caller, since computing it needs the whole pose, not just this
         joint's ``pos`` -- and is only required if ``"gravity_torque"`` is in
         ``self.FEATURE_NAMES``; a subclass that omits it (e.g.
-        ``PerJointTreeModel``) can leave it ``None``.
+        ``PerJointTreeModel``) can leave it ``None``. ``lag_cols`` is this
+        joint's ``{"qdd_lag<k>": array}`` from ``_lag_cols_for_joint`` --
+        already lagged causally and per-recording by the caller.
         """
         tgt_i, pos = np.asarray(tgt_i), np.asarray(pos)
         qd, qdd = np.asarray(qd), np.asarray(qdd)
@@ -270,7 +296,30 @@ class PerJointPositionModel(DistillModel):
                 "vel": vel, "acc": acc, "bias": bias}
         if gravity is not None:
             cols["gravity_torque"] = np.asarray(gravity)
+        if lag_cols:
+            cols.update(lag_cols)
         return np.column_stack([cols[name] for name in self.FEATURE_NAMES])
+
+    def _lag_block(self, qdd: np.ndarray) -> dict:
+        """``{k: causally-lagged qdd}`` for every ``k`` in ``self.LAG_SAMPLES``
+        actually used by ``self.FEATURE_NAMES`` -- mirrors ``_gravity_block``'s
+        "only pay for what's used" pattern. ``qdd`` must be one recording's (or
+        one ``predict`` call's) full ``(n, N_JOINTS)`` array, *not* pooled
+        across recordings -- see ``_lag_array``.
+        """
+        return {k: _lag_array(qdd, k) for k in self.LAG_SAMPLES
+               if f"qdd_lag{k}" in self.FEATURE_NAMES}
+
+    @staticmethod
+    def _lag_cols_for_joint(lag_block: dict, j: int):
+        """This joint's ``{"qdd_lag<k>": array}`` slice of ``_lag_block``'s
+        output, or ``None`` if there's nothing to slice (no lag columns in
+        ``FEATURE_NAMES``) -- matches the ``gravity``-arg convention so
+        ``_row_features`` can treat "not requested" and "empty" the same way.
+        """
+        if not lag_block:
+            return None
+        return {f"qdd_lag{k}": arr[:, j] for k, arr in lag_block.items()}
 
     # --- fit ------------------------------------------------------------------
 
@@ -292,12 +341,16 @@ class PerJointPositionModel(DistillModel):
                                  "with `--float-register 1 vel 2 acc`")
             qdd = np.gradient(rec.target_qd, rec.dt, axis=0)     # commanded accel
             grav = _gravity_block(rec.target_q) if needs_gravity else None
+            # Lagged per this recording alone, before any per-joint slicing or
+            # cross-recording pooling -- see _lag_array.
+            lag_block = self._lag_block(qdd)
             for j in range(N_JOINTS):
                 Xs, ys = per_joint[j]
                 Xs.append(self._row_features(j, rec.target_current[:, j], rec.target_q[:, j],
                                              rec.target_qd[:, j], qdd[:, j],
                                              rec.vel_cmd, rec.acc_cmd,
-                                             grav[:, j] if needs_gravity else None))
+                                             grav[:, j] if needs_gravity else None,
+                                             self._lag_cols_for_joint(lag_block, j)))
                 ys.append(rec.actual_q[:, j] - rec.target_q[:, j])
         return {j: (np.vstack(Xs), np.concatenate(ys)) for j, (Xs, ys) in per_joint.items()}
 
@@ -341,10 +394,12 @@ class PerJointPositionModel(DistillModel):
         acc = df[ACC_COL].to_numpy(dtype=float)
         needs_gravity = "gravity_torque" in self.FEATURE_NAMES
         grav = _gravity_block(q) if needs_gravity else None
+        lag_block = self._lag_block(qdd)
         out = np.zeros_like(q)
         for j in range(N_JOINTS):
             feats = self._row_features(j, ti[:, j], q[:, j], qd[:, j], qdd[:, j], vel, acc,
-                                       grav[:, j] if needs_gravity else None)
+                                       grav[:, j] if needs_gravity else None,
+                                       self._lag_cols_for_joint(lag_block, j))
             out[:, j] = q[:, j] + feats @ self.coefs[j]     # target_q + predicted error
         return {"actual_q": out}
 
@@ -380,12 +435,13 @@ class PerJointTreeModel(PerJointPositionModel):
     would waste most of its splits on the trivial part. Predicting the small,
     near-zero-mean residual instead means every split is doing useful work.
 
-    Uses the same 8 features as the parent (inherits ``FEATURE_NAMES``
-    unchanged, including ``gravity_torque``) -- an earlier version of this
-    class deliberately used the pre-gravity 7-feature set instead (a scope
-    decision, not an evidence-driven one), which meant the first linear-vs-
-    tree comparison wasn't apples-to-apples on the joints gravity helped
-    (wrist1/wrist2). Both models now see the same inputs, so any remaining
+    Uses the same 11 features as the parent (inherits ``FEATURE_NAMES``
+    unchanged, including ``gravity_torque`` and the ``qdd_lag*`` history
+    taps) -- an earlier version of this class deliberately used the
+    pre-gravity 7-feature set instead (a scope decision, not an
+    evidence-driven one), which meant the first linear-vs-tree comparison
+    wasn't apples-to-apples on the joints gravity helped (wrist1/wrist2).
+    Both models now see the same inputs, so any remaining
     difference between them is attributable to the regressor, not the
     features; see ``ModelReview.md`` §2/§6 for the before/after comparison.
     Reuses the parent's ``_row_features``/``_design``/``predicts``/``bounds``
@@ -402,8 +458,9 @@ class PerJointTreeModel(PerJointPositionModel):
     not error) rather than displaying something meaningless.
     """
 
-    # FEATURE_NAMES inherited from PerJointPositionModel (8 features, incl.
-    # gravity_torque) -- deliberately not overridden, see class docstring.
+    # FEATURE_NAMES inherited from PerJointPositionModel (11 features, incl.
+    # gravity_torque and the qdd_lag* taps) -- deliberately not overridden,
+    # see class docstring.
 
     def __init__(self):
         super().__init__()
@@ -438,10 +495,12 @@ class PerJointTreeModel(PerJointPositionModel):
         acc = df[ACC_COL].to_numpy(dtype=float)
         needs_gravity = "gravity_torque" in self.FEATURE_NAMES
         grav = _gravity_block(q) if needs_gravity else None
+        lag_block = self._lag_block(qdd)
         out = np.zeros_like(q)
         for j in range(N_JOINTS):
             feats = self._row_features(j, ti[:, j], q[:, j], qd[:, j], qdd[:, j], vel, acc,
-                                       grav[:, j] if needs_gravity else None)
+                                       grav[:, j] if needs_gravity else None,
+                                       self._lag_cols_for_joint(lag_block, j))
             out[:, j] = q[:, j] + self.models[j].predict(feats)
         return {"actual_q": out}
 
