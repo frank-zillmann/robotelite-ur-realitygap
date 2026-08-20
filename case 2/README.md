@@ -27,7 +27,6 @@ pip install -r requirements.txt
   The container is in `simulation environment/`; pick the arm when you start it, and
   pass the same one to `optimize.py`:
   ```bash
-  +
   docker compose up -d                     # UR10, the default
   ROBOT_TYPE=UR5 docker compose up -d      # a UR5e instead
   ```
@@ -52,13 +51,13 @@ python convert.py scripts/triangle.script --robot-ip 127.0.0.1
 # 3. optimize that path against the model (logs to runs/optimize/)
 python optimize.py --path scripts/triangle.path --model models/distill-ur5e.pkl --robot UR5e
 
-# 4. run both on the robot (each records to <path name>.csv)
-# --engine script on URSim, --engine ur_rtde on real hardware (see Known gaps)
-python send.py scripts/triangle.path --robot-ip 127.0.0.1 --engine script --loop 5
-python send.py scripts/triangle.retime.path --robot-ip 127.0.0.1 --engine script --loop 5
+# 4. run both on the robot (each records to <path name>.<engine>.csv)
+# --engine batch on URSim, --engine stream on real hardware (see Known gaps)
+python send.py scripts/triangle.path --robot-ip 127.0.0.1 --engine batch --loop 5
+python send.py scripts/triangle.retime.path --robot-ip 127.0.0.1 --engine batch --loop 5
 
 # 5. compare them: one plot, and the optimizer objective side by side
-python analysis.py --csv scripts/triangle.csv scripts/triangle.retime.csv \
+python analysis.py --csv scripts/triangle.batch.csv scripts/triangle.retime.batch.csv \
     --model models/distill-ur5e.pkl --robot UR5e
 ```
 
@@ -70,19 +69,18 @@ if not, it was missing something, which sends you back to step 1.
 
 | File | Role |
 |------|------|
-| `record.py` | passive RTDE logger: stream robot state to a CSV, never moves the robot |
-| `collect_data.py` | record a whole matrix of trajectories x speeds x reps, with a manifest |
-| `send.py` | send a URScript (or a `servoj` path) to the robot, run it, record it |
-| `convert.py` | run a script on the controller, keep the trajectory it commanded |
-| `optimize.py` | differentiate a score through the model down to the path's parameters |
-| `train_distillation_model.py` | `DistillModel` interface + `CNNModel`: predict the actual channels |
-| `common.py` | `segments` (split a recording into moves), `features`, `MoveDataset`/`loaders` |
-| `analysis.py` | `Recording` (shared CSV loader) + a plotly viewer and optimizer-objective table |
-| `utils.py` | constants, `Robot` (UR10e/UR5e kinematics + the controller's ceilings), URScript load/edit |
+| `record.py` | passive RTDE logger, never moves the robot |
+| `collect_data.py` | records a matrix of trajectories x speeds x reps |
+| `send.py` | sends a `.script` or `.path` to the robot and records it |
+| `convert.py` | runs a script, keeps the trajectory the controller commanded |
+| `optimize.py` | differentiates a score through the model to the path |
+| `train_distillation_model.py` | `DistillModel` + `CNNModel`: predict actual channels |
+| `common.py` | `segments`, `features`, `MoveDataset`/`loaders` |
+| `analysis.py` | `Recording` CSV loader, plotly viewer, objective table |
+| `utils.py` | constants, `Robot` kinematics/ceilings, URScript load/edit |
 
-`scripts/` holds the URScript motions (`_generated/` the speed variants
-`collect_data.py` writes), `models/` the trained models, `data/<arm>/` the
-recordings.
+`scripts/` the URScript motions, `models/` the trained models, `data/<arm>/`
+the recordings.
 
 ## How it flows
 
@@ -102,64 +100,39 @@ URScript ──► the controller ──► recorded target_q                (co
 
 **What runs now (all of it is yours to change):**
 
-- **`DistillModel`**: `CNNModel`, a causal dilated-convolution net over the last
-  ~1 s of the commanded trajectory, predicting the gap `actual_q - target_q` for all
-  six joints at once. `predict` returns `{"mean", "var", "var_aleatoric",
-  "var_epistemic"}`. It is a sequence model because the gap is dynamic — the
-  ring-down after a stop is invisible to any per-row model. `members=K` makes it a
-  deep ensemble, and the members' disagreement is what tells the optimizer where it
-  is guessing.
-- **`convert.py`**: runs the script twice and keeps the second pass, which starts
-  where the first ended — the cycle in its steady state, closing on itself so it can
-  be looped, and independent of where the robot happened to be.
-- **`optimize.py`**: learns one time interval per original edge, keeping every
-  recorded waypoint; an edge below `PAUSE_TOL` (not a distinct pose, just noise in
-  an otherwise-static stretch) is free to shrink towards zero instead of floored at
-  `MIN_DT`. Interpolated to the model's 8 ms grid, with a log barrier (`-log(1 -
-  value/limit)`, true to +infinity at the limit) for joint position, joint speed,
-  acceleration, and TCP speed; its weight decays over the first 80% of the run,
-  smooth and cautious at first, a sharp cutoff right at the limit by the time it
-  reaches its floor, then holds there so the last stretch is essentially free to
-  optimize cycle time and gap alone. The written path is always resampled onto
-  the same uniform 8 ms grid the objective was scored on -- a servoJ streamer can
-  only tick at one fixed rate anyway (see `send.py`'s `ur_rtde` engine).
-- **`utils.Robot`**: `Robot("UR5e")` swaps the DH table and the joint speed limits.
-  The distilled model is *not* interchangeable — it is trained on one arm's
-  recordings, so each arm has its own folder and its own pickle
-  (`models/distill-ur5e.pkl`, `models/distill-ur10e.pkl`). Keep `--data`, `--model`
-  and `--robot` pointing at the same arm.
+- **`DistillModel`**: `CNNModel`, a causal dilated-conv net over the last ~1 s of
+  the trajectory, predicting `actual_q - target_q` and its uncertainty for all six
+  joints. A sequence model because the gap is dynamic (ring-down after a stop).
+  `members=K` deep-ensembles it; disagreement tells the optimizer where it's guessing.
+- **`convert.py`**: runs the script twice, keeps the second pass (steady state,
+  closes on itself, independent of the robot's starting pose).
+- **`optimize.py`**: learns one time interval per recorded waypoint. An edge below
+  `PAUSE_TOL` (not a real pose, just noise) shrinks freely instead of floored at
+  `MIN_DT`. A log barrier (true to +infinity at each limit) keeps it inside joint
+  and TCP speed/accel/position limits, its weight decaying early in the run so the
+  tail is free to optimize cycle time and gap alone. Output is resampled onto the
+  model's uniform 8 ms grid (a servoJ streamer only ticks at one fixed rate anyway).
+- **`utils.Robot`**: swaps DH table and limits per arm. The model isn't
+  interchangeable between arms — keep `--data`/`--model`/`--robot` matched.
 
 ## Known gaps
 
 - `convert.py` needs the controller in Remote Control and *moves the robot*.
-- `send.py`'s `.path` streaming needs `--engine script` (URSim) or
-  `--engine ur_rtde` (real hardware) -- there's no single engine that works on
-  both. "script" embeds the whole path as one program, like a `.script` run;
-  fine on URSim, but a real controller silently drops any program over ~30 KB
-  of text. "ur_rtde" streams it live via the `ur_rtde` package instead
-  (verified working on real hardware); it does not work against the
-  PolyScope X URSim in `simulation environment/` (`RTDEControlInterface`
-  fails to connect -- that simulator image doesn't seem to implement the
-  real-time control handshake yet, though `RTDEReceiveInterface` alone does
-  work against it). A hand-rolled real-time protocol over raw sockets was
-  tried as a single cross-target approach and dropped: Python/OS scheduling
-  cannot reliably hit servoJ's timing, and it caused a fault on real hardware.
-- Everything runs on `utils.DT`, one 8.00 ms grid (125 Hz): what `record.py` asks
-  the stream for, what the model is trained on, and what every `.path` is written
-  at (`convert.py` records at it directly; `optimize.py` resamples onto it). 8 ms
-  divides both control cycles UR ships (2 ms e-Series, 8 ms CB3). `MoveDataset`
-  refuses a recording made at another rate.
-- `analysis.py` takes cycle time from the matching `.path`, not host-clock CSV
-  timestamps, and scores gap (not the barrier -- that's an optimization device, not
-  a property of a finished trajectory) over every recorded target row, so long
-  loops naturally dominate their startup transient without changing their mean cost.
-- A log barrier pushed to gradient-descent's usual numerical limits is still not a
-  hard guarantee. Check the emitted path independently before running it on
-  hardware; UR5e uses the 1.5 m/s and 191°/s limits here.
-- The joint acceleration ceilings are measured, not specified — UR publishes none —
-  and the UR5e reuses the UR10e's for want of anything better.
-- The tool-speed limit uses the Jacobian at the current trajectory, refreshed each
-  step from detached poses: the value is right, the gradient is the speed's alone.
+- `send.py`'s `.path` streaming: `--engine batch` (URSim) embeds the whole path
+  as one program, which a real controller silently drops past ~30 KB. `--engine
+  stream` (real hardware, via `ur_rtde`) fixes that but doesn't work against
+  PolyScope X URSim (`RTDEControlInterface` won't connect there yet). No engine
+  works on both. A hand-rolled real-time alternative was tried and dropped —
+  it caused a real fault on hardware.
+- Everything runs on `utils.DT`, one 8 ms grid (125 Hz) — what's recorded,
+  trained on, and written to every `.path` (`optimize.py` resamples onto it).
+- `analysis.py` scores gap, not the barrier (an optimization device, not a
+  property of a finished trajectory), over every recorded target row.
+- A log barrier pushed to gradient-descent's limits is not a hard guarantee —
+  check an emitted path independently before running it on hardware.
+- Joint acceleration ceilings are measured, not UR-specified; UR5e reuses UR10e's.
+- The tool-speed Jacobian is refreshed each step from detached poses: the value
+  is right, the gradient is the speed's alone.
 
 ## Tiers
 
