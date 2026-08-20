@@ -75,8 +75,8 @@ def gap_rmse(model, q):
     return torch.sqrt((gap.square() + EXPLOITATION_EXPLORATION_FACTOR * var).mean())
 
 
-def penalties(model, robot, q, weight):
-    """Gap RMSE, the summed barrier penalty, and the barrier terms it's made of."""
+def penalties(robot, q, weight):
+    """The summed barrier penalty, and the barrier terms it's made of."""
     qd = (q[2:] - q[:-2]) / (2 * DT)
     qdd = (q[2:] - 2 * q[1:-1] + q[:-2]) / DT ** 2
     jac = torch.as_tensor(robot.jacobians(q.detach().cpu().numpy())[1:-1], dtype=q.dtype)
@@ -86,11 +86,12 @@ def penalties(model, robot, q, weight):
         "joint_acceleration": barrier(qdd.abs(), robot.a_joint, weight),
         "tool_speed": barrier(tool, robot.v_tcp, weight),
     }
-    return gap_rmse(model, q), sum(costs.values()), costs
+    return sum(costs.values()), costs
 
 
 def loss(model, robot, q, cycle_time, cycle_time_per_gap_rmse, weight=BARRIER_WEIGHT_START):
-    gap, penalty, costs = penalties(model, robot, q, weight)
+    gap = gap_rmse(model, q)
+    penalty, costs = penalties(robot, q, weight)
     cycle_time = torch.as_tensor(cycle_time, dtype=q.dtype, device=q.device)
     total = cycle_time + cycle_time_per_gap_rmse * gap + penalty
     return total, gap, penalty, costs
@@ -105,8 +106,8 @@ def optimize(model, q_ref, dt_ref, robot, run=None, start_dt=DT):
     opt = torch.optim.Adam([raw_dt], lr=LR)
     log = SummaryWriter(run) if run else None
     with torch.no_grad():
-        baseline, _, _ = penalties(model, robot, resample(q0, base_dt), BARRIER_WEIGHT_START)
-        cycle_time_per_gap_rmse = float((base_dt.sum() + start_dt) / baseline.clamp_min(1e-8))
+        baseline_gap_rmse = gap_rmse(model, resample(q0, base_dt))
+        cycle_time_per_gap_rmse = float((base_dt.sum() + start_dt) / baseline_gap_rmse.clamp_min(1e-8))
     for step in range(STEPS + 1):
         # High early (stays well clear of every limit), decayed to 1/1000th by 80%
         # of the run so the tail is free to chase cycle time and gap alone. Never

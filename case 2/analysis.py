@@ -135,14 +135,14 @@ def stats(recs, paths, model, robot):
     to respect the limits), so it's evaluated at weight 0.
     """
     import torch
+    from optimize import gap_rmse
     from optimize import loss as loss_fn
-    from optimize import penalties
 
     q = [torch.as_tensor(rec.target_q, dtype=torch.float32) for rec in recs]
     times = [cycle_time(p) for p in paths]
     measured = [float(np.sqrt(np.mean((rec.actual_q - rec.target_q) ** 2))) for rec in recs]
     with torch.no_grad():
-        base_gap, _, _ = penalties(model, robot, q[0], weight=0)
+        base_gap = gap_rmse(model, q[0])
         scale = times[0] / float(base_gap.clamp_min(1e-8))
         rows = [loss_fn(model, robot, qi, cycle, scale, weight=0)
                 for qi, cycle in zip(q, times)]
