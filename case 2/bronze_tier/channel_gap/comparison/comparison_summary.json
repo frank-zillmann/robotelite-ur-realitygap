@@ -2,89 +2,90 @@
   "peak": [
     {
       "channel": "current",
-      "baseline_pct": 14.81342632143747,
-      "optimized_pct": 14.567912586216123,
-      "pct_change": -1.6573730472203367
+      "baseline_pct": 19.23012789748221,
+      "optimized_pct": 24.907815215689233,
+      "pct_change": 29.524958692294508
     },
     {
       "channel": "TCP speed (angular)",
-      "baseline_pct": 4.330825990167124,
-      "optimized_pct": 3.8199663552436807,
-      "pct_change": -11.795893810633796
+      "baseline_pct": 1.5124427820326807,
+      "optimized_pct": 3.8809986008094737,
+      "pct_change": 156.60465618365544
     },
     {
       "channel": "qd (joint velocity)",
-      "baseline_pct": 4.043272546165044,
-      "optimized_pct": 3.6876165300232397,
-      "pct_change": -8.796241462355441
+      "baseline_pct": 1.5118347540840986,
+      "optimized_pct": 3.8920592091305224,
+      "pct_change": 157.43945881760166
     },
     {
       "channel": "TCP speed (linear)",
-      "baseline_pct": 2.7972574777355255,
-      "optimized_pct": 4.591996312575108,
-      "pct_change": 64.16065911431522
+      "baseline_pct": 1.4560226747762617,
+      "optimized_pct": 3.2935018724981573,
+      "pct_change": 126.19852901701891
     },
     {
       "channel": "TCP position",
-      "baseline_pct": 0.015157189491405623,
-      "optimized_pct": 0.018931742516507224,
-      "pct_change": 24.902723735438126
+      "baseline_pct": 0.16214172865289514,
+      "optimized_pct": 0.086622502186752,
+      "pct_change": -46.57605854678587
     },
     {
       "channel": "TCP orientation",
-      "baseline_pct": 0.014209463796895945,
-      "optimized_pct": 0.015731369116595107,
-      "pct_change": 10.710504924412572
+      "baseline_pct": 0.09156209601297888,
+      "optimized_pct": 0.04663680822144834,
+      "pct_change": -49.06537721150726
     },
     {
       "channel": "q (joint position)",
-      "baseline_pct": 0.007415983416598538,
-      "optimized_pct": 0.00887551206773912,
-      "pct_change": 19.680851063850128
+      "baseline_pct": 0.050906211365821706,
+      "optimized_pct": 0.03585655760886381,
+      "pct_change": -29.56349206348951
     }
   ],
   "rms": [
     {
       "channel": "current",
-      "baseline_pct": 2.4255291252515696,
-      "optimized_pct": 2.7379745574285264,
-      "pct_change": 12.881537019043247
+      "baseline_pct": 2.6458684234081806,
+      "optimized_pct": 2.846683601486681,
+      "pct_change": 7.5897643398241055
     },
     {
       "channel": "TCP speed (angular)",
-      "baseline_pct": 0.8711063981998776,
-      "optimized_pct": 1.1184336936864163,
-      "pct_change": 28.39231763165042
-    },
-    {
-      "channel": "qd (joint velocity)",
-      "baseline_pct": 0.6114751346840371,
-      "optimized_pct": 0.7731783323211229,
-      "pct_change": 26.44477076253336
+      "baseline_pct": 0.19128619940824634,
+      "optimized_pct": 0.26787634895466844,
+      "pct_change": 40.03955841213723
     },
     {
       "channel": "TCP speed (linear)",
-      "baseline_pct": 0.5687905995591307,
-      "optimized_pct": 0.6643456900912632,
-      "pct_change": 16.799695811814967
+      "baseline_pct": 0.1874629991590403,
+      "optimized_pct": 0.25956167424246457,
+      "pct_change": 38.46021636635453
     },
     {
-      "channel": "TCP orientation",
-      "baseline_pct": 0.00496382276032059,
-      "optimized_pct": 0.005818243472305944,
-      "pct_change": 17.21295769896045
+      "channel": "qd (joint velocity)",
+      "baseline_pct": 0.13693006084003126,
+      "optimized_pct": 0.18811692235127914,
+      "pct_change": 37.38175620256753
     },
     {
       "channel": "TCP position",
-      "baseline_pct": 0.0028699878896249445,
-      "optimized_pct": 0.003873374593500667,
-      "pct_change": 34.961356718715884
+      "baseline_pct": 0.009722650833815709,
+      "optimized_pct": 0.011267131762992152,
+      "pct_change": 15.885389237723999
+    },
+    {
+      "channel": "TCP orientation",
+      "baseline_pct": 0.009323261811243001,
+      "optimized_pct": 0.010856008155671004,
+      "pct_change": 16.440022552832865
     },
     {
       "channel": "q (joint position)",
-      "baseline_pct": 0.0018165026096205082,
-      "optimized_pct": 0.0019157738962418613,
-      "pct_change": 5.464968015768071
+      "baseline_pct": 0.004336782512290688,
+      "optimized_pct": 0.005060026989083254,
+      "pct_change": 16.676982872506287
     }
-  ]
+  ],
+  "cycle_time": []
 }
