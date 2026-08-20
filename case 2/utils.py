@@ -55,7 +55,7 @@ class Robot:
         r.fk(q)                  # 4x4 base -> flange pose
         r.jacobian(q)            # 6x6 geometric Jacobian, [v; w] = J(q) @ qd
         r.tcp_speed(q, dt)       # tool speed (m/s) along a trajectory
-        r.q_joint, r.v_joint, r.a_joint, r.v_tcp
+        r.v_joint, r.a_joint, r.v_tcp
     """
 
     # The speed ceilings are checked by differencing q, which overshoots by about a
@@ -67,13 +67,13 @@ class Robot:
             a=[0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0],
             d=[0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655],
             alpha=[90, 0, 0, 90, -90, 0],
-            q_deg=[360] * 6, v_deg=[120, 120, 180, 180, 180, 180],
+            v_deg=[120, 120, 180, 180, 180, 180],
             a_joint=[25, 65, 60, 45, 35, 35], v_tcp=1.35),
         "UR5e": dict(
             a=[0.0, -0.425, -0.3922, 0.0, 0.0, 0.0],
             d=[0.1625, 0.0, 0.0, 0.1333, 0.0997, 0.0996],
             alpha=[90, 0, 0, 90, -90, 0],
-            q_deg=[363] * 6, v_deg=[191] * 6,
+            v_deg=[191] * 6,
             a_joint=[25, 65, 60, 45, 35, 35], v_tcp=1.5),
     }
 
@@ -84,7 +84,6 @@ class Robot:
         self.model = model
         self.a, self.d = np.array(p["a"]), np.array(p["d"])
         self.alpha = np.deg2rad(p["alpha"])
-        self.q_joint = np.deg2rad(p["q_deg"])
         self.v_joint = np.deg2rad(p["v_deg"])
         self.a_joint = np.array(p["a_joint"])
         self.v_tcp = p["v_tcp"]

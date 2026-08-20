@@ -62,7 +62,6 @@ def penalties(q, robot, weight):
     jac = torch.as_tensor(robot.jacobians(q.detach().cpu().numpy())[1:-1], dtype=q.dtype)
     tool = torch.linalg.vector_norm((jac @ qd[..., None])[..., 0], dim=1)
     return {
-        "position": barrier(q.abs(), robot.q_joint, weight),
         "joint_speed": barrier(qd.abs(), robot.v_joint, weight),
         "joint_acceleration": barrier(qdd.abs(), robot.a_joint, weight),
         "tool_speed": barrier(tool, robot.v_tcp, weight),
