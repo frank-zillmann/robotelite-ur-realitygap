@@ -46,24 +46,20 @@ pip install -r requirements.txt
 # 1. distill the gap model from one arm's recordings (logs to runs/distill/)
 python train_distillation_model.py --data data/ur5e --out models/distill-ur5e.pkl
 
-# 2. get the trajectory the controller commands: run the script, or lift it
-#    straight out of a recording you already have
+# 2. convert the .script to a .path using URSim
 python convert.py scripts/triangle.script --robot-ip 127.0.0.1
-python convert.py data/ur5e/heldout/T10_medium_r1.csv --out scripts/T10_medium.path
 
 # 3. optimize that path against the model (logs to runs/optimize/)
-python optimize.py --path scripts/triangle.path --model models/distill-ur5e.pkl --robot UR5e --mode retime
-# Or reduce it to a direct, piecewise-linear route between the same endpoints.
-python optimize.py --path scripts/triangle.path --model models/distill-ur5e.pkl --robot UR5e --mode reshape
+python optimize.py --path scripts/triangle.path --model models/distill-ur5e.pkl --robot UR5e
 
 # 4. run both on the robot (each records to <path name>.csv)
 # --engine script on URSim, --engine ur_rtde on real hardware (see Known gaps)
 python send.py scripts/triangle.path --robot-ip 127.0.0.1 --engine script --loop 5
 python send.py scripts/triangle.retime.path --robot-ip 127.0.0.1 --engine script --loop 5
 
-# 5. compare them: one plot, and the measured error / cycle time side by side
+# 5. compare them: one plot, and the optimizer objective side by side
 python analysis.py --csv scripts/triangle.csv scripts/triangle.retime.csv \
-    --model models/distill-ur5e.pkl
+    --model models/distill-ur5e.pkl --robot UR5e
 ```
 
 `tensorboard --logdir runs` shows both stages. Step 4 is the test that matters: if
@@ -81,7 +77,7 @@ if not, it was missing something, which sends you back to step 1.
 | `optimize.py` | differentiate a score through the model down to the path's parameters |
 | `train_distillation_model.py` | `DistillModel` interface + `CNNModel`: predict the actual channels |
 | `common.py` | `segments` (split a recording into moves), `features`, `MoveDataset`/`loaders` |
-| `analysis.py` | `Recording` (shared CSV loader) + a plotly viewer and the measured error/cycle-time table |
+| `analysis.py` | `Recording` (shared CSV loader) + a plotly viewer and optimizer-objective table |
 | `utils.py` | constants, `Robot` (UR10e/UR5e kinematics + the controller's ceilings), URScript load/edit |
 
 `scripts/` holds the URScript motions (`_generated/` the speed variants
@@ -93,7 +89,7 @@ recordings.
 ```
 URScript ──► the controller ──► recorded target_q                (convert.py)
                                        │
- retime: original q + new dt; reshape: direct linear waypoints ──► commanded q(t)
+                        original q, learned per-edge dt ──► commanded q(t)
                                        │
                    common.features (sin/cos q, qd, qdd, qddd)
                                        │
@@ -103,9 +99,6 @@ URScript ──► the controller ──► recorded target_q                (co
                                        │
                                  .backward()
 ```
-
-`retime` starts from the recorded timing. `reshape` uses
-`CONTROL_POINT_FACTOR` of the recorded poses, with its first and last pose pinned.
 
 **What runs now (all of it is yours to change):**
 
@@ -119,11 +112,13 @@ URScript ──► the controller ──► recorded target_q                (co
 - **`convert.py`**: runs the script twice and keeps the second pass, which starts
   where the first ended — the cycle in its steady state, closing on itself so it can
   be looped, and independent of where the robot happened to be.
-- **`optimize.py`**: `retime` learns one direct interval per original edge; only an
-  exact stationary edge may shrink towards zero. `reshape` learns direct interior
-  waypoints and intervals for a small linear path, retaining only the endpoints.
-  Both are interpolated to the model's 8 ms grid and use smooth barriers for joint
-  position, joint speed, acceleration, and TCP speed.
+- **`optimize.py`**: learns one time interval per original edge, keeping every
+  recorded waypoint; an edge below `PAUSE_TOL` (not a distinct pose, just noise in
+  an otherwise-static stretch) is free to shrink towards zero instead of floored at
+  `MIN_DT`. Interpolated to the model's 8 ms grid, with a log barrier (`-log(1 -
+  value/limit)`, true to +infinity at the limit) for joint position, joint speed,
+  acceleration, and TCP speed; its weight decays over the run, from smooth and
+  cautious to a sharp cutoff right at the limit.
 - **`utils.Robot`**: `Robot("UR5e")` swaps the DH table and the joint speed limits.
   The distilled model is *not* interchangeable — it is trained on one arm's
   recordings, so each arm has its own folder and its own pickle
@@ -151,14 +146,13 @@ URScript ──► the controller ──► recorded target_q                (co
   refuses a recording made at another rate. A path's `dt` column may still differ per
   row and is honoured from 2 ms to 50 ms, but below the controller's 2 ms
   cycle it cannot act on each setpoint separately.
-- `analysis.py` reports what a run actually took, not what its path asked for. On
-  URSim the two agree to within a few percent, at 8, 16 and 32 ms per setpoint.
+- `analysis.py` takes cycle time from the matching `.path`, not host-clock CSV
+  timestamps. It scores gap and barriers over every recorded target row, so long
+  loops naturally dominate their startup transient without changing their mean cost.
 - A smooth barrier is not a safety controller. Check the emitted path independently
   before running it on hardware; UR5e uses the 1.5 m/s and 191°/s limits here.
 - The joint acceleration ceilings are measured, not specified — UR publishes none —
   and the UR5e reuses the UR10e's for want of anything better.
-- `reshape` is intentionally low-dimensional, but it can still find a local optimum.
-  Adjust `CONTROL_POINT_FACTOR` in `optimize.py` for a simpler or more detailed route.
 - The tool-speed limit uses the Jacobian at the current trajectory, refreshed each
   step from detached poses: the value is right, the gradient is the speed's alone.
 

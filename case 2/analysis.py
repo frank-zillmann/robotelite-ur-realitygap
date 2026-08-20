@@ -11,10 +11,11 @@ Loads a CSV from ``record.py`` and plots up to three sources of one quantity:
 Each run gets one colour; within it the target is dashed, the measured actual solid,
 and the model pale and thick behind them.
 
-    python analysis.py --csv baseline.csv optimized.csv --model models/distill-ur5e.pkl
+    python analysis.py --csv baseline.csv optimized.csv --model models/distill-ur5e.pkl --robot UR5e
 
-Several runs can be given at once; their error and cycle time are printed for
-comparison.
+Several runs can be given at once; their optimizer objective is printed for
+comparison. Cycle time comes from the matching `.path`, while the learned gap and
+barriers are evaluated over all recorded target rows.
 
 Only the first ``--max-points`` rows are plotted, at the recording's full rate.
 
@@ -34,8 +35,9 @@ import os
 import numpy as np
 import pandas as pd
 
-from utils import (ACC_COL, JOINT_NAMES, N_JOINTS, SCL_COL, SCRIPT_COL, TIME_COL,
-                   VEL_COL)
+from send import load_path
+from utils import (ACC_COL, DT, JOINT_NAMES, N_JOINTS, SCL_COL, SCRIPT_COL,
+                   TIME_COL, VEL_COL)
 
 TCP_AXES = ("x", "y", "z", "rx", "ry", "rz")
 
@@ -110,66 +112,32 @@ PALETTE = ("#d62728", "#2ca02c", "#1f77b4", "#ff7f0e", "#9467bd", "#8c564b")
 _rgba = lambda c, a: f"rgba({int(c[1:3], 16)},{int(c[3:5], 16)},{int(c[5:7], 16)},{a})"
 
 
-def laps(q, tol: float = 1e-3) -> int:
-    """How many times the commanded path repeats itself.
-
-    ``send.py --loop N`` puts N repetitions in one file; dividing by this keeps the
-    cycle time comparable however many were run.
-
-    Counted as the times the path lands on the pose it *ends* at: a program that
-    finished did whole laps, so that pose is on the cycle, while the one it started
-    from need not be -- the first run of a batch opens with the robot travelling in
-    from wherever it was. Landing is not enough on its own, since a figure eight
-    begun at its crossing comes home twice a lap, so the last two stretches are
-    compared and the count halved if they are not copies of each other.
-    """
-    home = np.abs(q - q[-1]).max(axis=1) < tol
-    idx = np.flatnonzero(np.diff(home.astype(int)) > 0) + 1   # rows where it lands
-    if len(idx) < 2:
-        return max(1, len(idx))
-    m = int(np.median(np.diff(idx)))                          # rows in one stretch
-    tail = q[idx[-1] - 2 * m:idx[-1]]
-    doubled = (len(tail) == 2 * m and np.abs(tail[:m] - tail[m:]).mean()
-               > 0.08 * np.ptp(q, axis=0).max())
-    return max(1, len(idx) // 2 if doubled else len(idx))
+def cycle_time(csv: str) -> float:
+    """One commanded cycle, from the `.path` next to its recorded `.csv`."""
+    rows = np.asarray(load_path(csv.rsplit(".", 1)[0] + ".path"), float)
+    return float(rows[:, N_JOINTS].sum()) if rows.shape[1] > N_JOINTS else len(rows) * DT
 
 
-def stats(recs: list):
-    """Print what each run measured, scored the way optimize.py scores a path.
+def stats(recs, model, robot):
+    """Print the optimizer's objective for the complete recorded trajectories."""
+    import torch
+    from optimize import measures, objective
 
-    Measured, not predicted: ``actual_q`` against ``target_q``, so a baseline and an
-    optimized run can be compared directly. The window is the rows where the command
-    is moving, which trims the idle head and tail; the cycle time is that window
-    divided by ``laps``, and it is what the robot *took*, not what the path asked
-    for. The score weights error against time exactly as the optimizer does and is
-    relative to the first run, which therefore reads ``1 + ALPHA``.
+    q = [torch.as_tensor(rec.target_q, dtype=torch.float32) for rec in recs]
+    times = [cycle_time(rec.path) for rec in recs]
+    with torch.no_grad():
+        base_gap, _, _ = measures(model, robot, q[0])
+        scale = times[0] / float(base_gap.clamp_min(1e-8))
+        rows = [objective(model, robot, qi, cycle, scale)
+                for qi, cycle in zip(q, times)]
 
-    A move the robot makes to reach the start counts as motion like any other, so
-    compare runs that began from the same pose, or loop them enough that it washes
-    out.
-    """
-    from optimize import ALPHA
-    from utils import DT
-
-    rows = []
-    for rec in recs:
-        mv = np.flatnonzero(np.abs(np.gradient(rec.target_q, DT, axis=0)).max(1) > 0.01)
-        a, b = (mv[0], mv[-1] + 1) if len(mv) else (0, len(rec.t))
-        err = np.abs(rec.actual_q[a:b] - rec.target_q[a:b])
-        n = laps(rec.target_q)          # on the whole run: it starts at rest, on the cycle
-        rows.append((os.path.basename(rec.path), err.mean(), err.max(), (b - a) * DT / n, n))
-
-    w = max(len(r[0]) for r in rows)
-    print(f"  {'run':{w}s} {'error [mrad]':>12s} {'worst':>8s} {'cycle [s]':>10s} "
-          f"{'laps':>5s} {'score':>7s}")
-    for name, mean, worst, T, n in rows:
-        # A simulator tracks perfectly, so there is nothing to score against.
-        score = (f"{mean / rows[0][1] + ALPHA * T / rows[0][3]:7.3f}"
-                 if rows[0][1] > 0 else "      -")
-        print(f"  {name:{w}s} {mean * 1000:12.4f} {worst * 1000:8.3f} {T:10.3f} "
-              f"{n:5d} {score}")
-    if rows[0][1] == 0:
-        print("  (actual == target exactly: a simulator, so there is no error to score)")
+    names = [os.path.basename(rec.path) for rec in recs]
+    width = max(map(len, names))
+    print(f"  {'run':{width}s} {'gap [mrad]':>12s} {'cycle [s]':>10s} "
+          f"{'barrier':>9s} {'objective':>10s}")
+    for name, cycle, (total, gap, penalty, _) in zip(names, times, rows):
+        print(f"  {name:{width}s} {float(gap) * 1000:12.4f} {cycle:10.3f} "
+              f"{float(penalty):9.4f} {float(total):10.4f}")
 
 
 def view(recs: list, quantity: str = "angle q", joint: int = 1, model=None,
@@ -243,9 +211,10 @@ def main():
     ap.add_argument("--joint", type=int, default=1, choices=range(N_JOINTS),
                     help="component 0..5: a joint (base..wrist3), or a Cartesian "
                          "axis (x, y, z, rx, ry, rz) for the TCP quantities")
-    ap.add_argument("--model", default=None,
-                    help="distilled model pickle; adds its prediction and an "
-                         "uncertainty band for each run")
+    ap.add_argument("--model", required=True,
+                    help="distilled model pickle")
+    ap.add_argument("--robot", required=True, choices=("UR5e", "UR10e"),
+                    help="arm whose limits score the barriers")
     ap.add_argument("--sd-factor", type=float, default=1.0,
                     help="width of the uncertainty bands, in standard deviations")
     ap.add_argument("--max-points", type=int, default=10000,
@@ -253,12 +222,12 @@ def main():
                          "grows by ~0.2 MB per 1000 rows and trace")
     args = ap.parse_args()
 
+    from train_distillation_model import DistillModel      # pulls in torch
+    from utils import Robot
+
     recs = [Recording(p) for p in args.csv]
-    stats(recs)
-    model = None
-    if args.model:
-        from train_distillation_model import DistillModel      # pulls in torch
-        model = DistillModel.load(args.model)
+    model = DistillModel.load(args.model)
+    stats(recs, model, Robot(args.robot))
     show(view(recs, args.quantity, args.joint, model, args.sd_factor, args.max_points))
 
 
