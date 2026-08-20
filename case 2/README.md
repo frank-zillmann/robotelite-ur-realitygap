@@ -45,18 +45,21 @@ pip install -r requirements.txt
 # 1. distill the gap model from one arm's recordings (logs to runs/distill/)
 python train_distillation_model.py --data data/ur5e --out models/distill-ur5e.pkl
 
-# 2. run the script on the controller, keep the trajectory it commanded
-python convert.py --script scripts/triangle.script --robot-ip 127.0.0.1 --out scripts/triangle.path
+# 2. get the trajectory the controller commands: run the script, or lift it
+#    straight out of a recording you already have
+python convert.py scripts/triangle.script --robot-ip 127.0.0.1
+python convert.py data/ur5e/heldout/T10_medium_r1.csv --out scripts/T10_medium.path
 
 # 3. optimize that path against the model (logs to runs/optimize/)
 python optimize.py --path scripts/triangle.path --model models/distill-ur5e.pkl --robot UR5e
 
-# 4. run both on the robot and compare
-python send.py --robot-ip 127.0.0.1 --path scripts/triangle.path --loop 5 --out baseline.csv
-python send.py --robot-ip 127.0.0.1 --path scripts/triangle.optimized.path --loop 5 --out optimized.csv
+# 4. run both on the robot (each records to <path name>.csv)
+python send.py scripts/triangle.path --robot-ip 127.0.0.1 --loop 5
+python send.py scripts/triangle.optimized.path --robot-ip 127.0.0.1 --loop 5
 
 # 5. compare them: one plot, and the measured error / cycle time side by side
-python analysis.py --csv baseline.csv optimized.csv --model models/distill-ur5e.pkl
+python analysis.py --csv scripts/triangle.csv scripts/triangle.optimized.csv \
+    --model models/distill-ur5e.pkl
 ```
 
 `tensorboard --logdir runs` shows both stages. Step 4 is the test that matters: if
@@ -135,6 +138,8 @@ reported against it.
   refuses a recording made at another rate. A path's `dt` column may still differ per
   row and is honoured from at least 1 ms to 50 ms, but below the controller's 2 ms
   cycle it cannot act on each setpoint separately.
+- `analysis.py` reports what a run actually took, not what its path asked for. On
+  URSim the two agree to within a few percent, at 8, 16 and 32 ms per setpoint.
 - The limit penalty is soft, so the result can sit a percent or two above the
   controller's own tool-speed cap of 1.35 m/s — still far below the safety limit that
   stops the robot, and `optimize.py` prints the peak either way. Raise `LIMIT` to

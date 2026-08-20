@@ -4,18 +4,17 @@ Opens the RTDE stream, pushes the script to the secondary client interface
 (port 30002) so the controller runs it, logs every sample to a CSV, and stops
 when the program finishes.
 
-    python send.py --robot-ip 127.0.0.1 --script scripts/shoulder_swing.script
+    python send.py scripts/shoulder_swing.script --robot-ip 127.0.0.1
 
 --loop N repeats the motion N times then ends; without it the script runs once:
 
-    python send.py --script scripts/shoulder_swing.script --loop 10 --out run.csv
+    python send.py scripts/shoulder_swing.script --loop 10
 
-    python send.py --script scripts/shoulder_swing.optimized.script --loop 10
 
---path streams a servoj path (a CSV of joint setpoints) instead of a script, at
-a fixed time per row:
+A ``.path`` argument streams a servoj path (a CSV of joint setpoints) instead of
+running a script, one ``servoj`` per row:
 
-    python send.py --path scripts/shoulder_swing.path --dt 0.008 --out path_run.csv
+    python send.py scripts/shoulder_swing.path --dt 0.008
 
 Auto-stop: the wrapper flips a float register to 1 on the program's last line,
 and recording stops when that register reads 1, so the program must end for it
@@ -278,14 +277,11 @@ def main():
     ap = argparse.ArgumentParser(description="Send a URScript to a UR robot and record it.")
     ap.add_argument("--robot-ip", default="127.0.0.1",
                     help="UR controller IP (default 127.0.0.1, i.e. local URSim)")
-    ap.add_argument("--script", default="scripts/shoulder_swing.script",
-                    help="URScript file to run on the robot")
-    ap.add_argument("--path", default=None,
-                    help="servoj path CSV to stream instead of --script")
+    ap.add_argument("source", help="a .script to run, or a .path to stream")
     ap.add_argument("--dt", type=float, default=DT,
                     help="servoj time per row, when the path has no dt column")
-    ap.add_argument("--out", default="run.csv",
-                    help="output CSV path (default: run.csv in the current folder)")
+    ap.add_argument("--out", default=None,
+                    help="output CSV (default: the script or path name, with .csv)")
     ap.add_argument("--hz", type=float, default=125.0, help="sample rate (default 125)")
     ap.add_argument("--float-register", nargs="+", metavar="IDX NAME",
                     default=["1", "vel", "2", "acc"],
@@ -295,14 +291,15 @@ def main():
     ap.add_argument("--loop", type=int, default=None,
                     help="repeat N times then stop (default: run once)")
     args = ap.parse_args()
+    out = args.out or args.source.rsplit(".", 1)[0] + ".csv"
 
-    if args.path:                            # stream a servoj path
-        n, stop = record_path(args.robot_ip, args.path, args.out, args.dt,
+    if args.source.endswith(".path"):        # stream a servoj path
+        n, stop = record_path(args.robot_ip, args.source, out, args.dt,
                               args.hz, args.loop, args.port)
     else:                                    # run a URScript
-        n, stop = record_run(args.robot_ip, args.script, args.out, args.hz,
+        n, stop = record_run(args.robot_ip, args.source, out, args.hz,
                              args.float_register, args.loop, args.port)
-    print(f"\nwrote {n} samples to {args.out}" + (f"  ({stop})" if stop else ""))
+    print(f"\nwrote {n} samples to {out}" + (f"  ({stop})" if stop else ""))
 
 
 if __name__ == "__main__":

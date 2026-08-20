@@ -5,13 +5,16 @@ Loads a CSV from ``record.py`` and plots up to three sources of one quantity:
     target          what the controller commanded  (target_* columns)
     actual          what the robot measured        (actual_* columns)
     model           what the distilled model predicts for those commands
-                    (``--model``), with a band of ``--sd-factor`` standard
-                    deviations, aleatoric and with the ensemble's disagreement added
+                    (``--model``), pale, with a band of ``--sd-factor`` standard
+                    deviations
+
+Each run gets one colour; within it the target is dashed, the measured actual solid,
+and the model pale and thick behind them.
 
     python analysis.py --csv baseline.csv optimized.csv --model models/distill-ur5e.pkl
 
-Several runs can be given at once; each is traced as ``<file> - target`` and
-``<file> - actual``, and their error and cycle time are printed for comparison.
+Several runs can be given at once; their error and cycle time are printed for
+comparison.
 
 Only the first ``--max-points`` rows are plotted, at the recording's full rate.
 
@@ -102,34 +105,71 @@ class Recording:
 
 # --- viewer -------------------------------------------------------------------
 
-# Plotly's qualitative palette, taken in order as traces are added.
-PALETTE = ("#636efa", "#ef553b", "#00cc96", "#ab63fa", "#ffa15a", "#19d3f3",
-           "#ff6692", "#b6e880", "#ff97ff", "#fecb52")
+# One base colour per run; within a run the three sources are told apart by style.
+PALETTE = ("#d62728", "#2ca02c", "#1f77b4", "#ff7f0e", "#9467bd", "#8c564b")
 _rgba = lambda c, a: f"rgba({int(c[1:3], 16)},{int(c[3:5], 16)},{int(c[5:7], 16)},{a})"
 
 
-def stats(recs: list):
-    """Print the tracking error and cycle time of each run, scored like optimize.py.
+def laps(q, tol: float = 1e-3) -> int:
+    """How many times the commanded path repeats itself.
 
-    Measured, not predicted: ``actual_q`` against ``target_q`` over the moves, so a
-    baseline and an optimized run can be compared directly. The score uses the same
-    weighting the optimizer minimizes and is relative to the first run, which
-    therefore scores ``1 + ALPHA`` -- anything below that is an improvement on it.
+    ``send.py --loop N`` puts N repetitions in one file; dividing by this keeps the
+    cycle time comparable however many were run.
+
+    Counted as the times the path lands on the pose it *ends* at: a program that
+    finished did whole laps, so that pose is on the cycle, while the one it started
+    from need not be -- the first run of a batch opens with the robot travelling in
+    from wherever it was. Landing is not enough on its own, since a figure eight
+    begun at its crossing comes home twice a lap, so the last two stretches are
+    compared and the count halved if they are not copies of each other.
     """
-    from common import segments
+    home = np.abs(q - q[-1]).max(axis=1) < tol
+    idx = np.flatnonzero(np.diff(home.astype(int)) > 0) + 1   # rows where it lands
+    if len(idx) < 2:
+        return max(1, len(idx))
+    m = int(np.median(np.diff(idx)))                          # rows in one stretch
+    tail = q[idx[-1] - 2 * m:idx[-1]]
+    doubled = (len(tail) == 2 * m and np.abs(tail[:m] - tail[m:]).mean()
+               > 0.08 * np.ptp(q, axis=0).max())
+    return max(1, len(idx) // 2 if doubled else len(idx))
+
+
+def stats(recs: list):
+    """Print what each run measured, scored the way optimize.py scores a path.
+
+    Measured, not predicted: ``actual_q`` against ``target_q``, so a baseline and an
+    optimized run can be compared directly. The window is the rows where the command
+    is moving, which trims the idle head and tail; the cycle time is that window
+    divided by ``laps``, and it is what the robot *took*, not what the path asked
+    for. The score weights error against time exactly as the optimizer does and is
+    relative to the first run, which therefore reads ``1 + ALPHA``.
+
+    A move the robot makes to reach the start counts as motion like any other, so
+    compare runs that began from the same pose, or loop them enough that it washes
+    out.
+    """
     from optimize import ALPHA
     from utils import DT
 
     rows = []
     for rec in recs:
-        segs = segments(rec)
-        a, b = (segs[0].i0, segs[-1].i2) if segs else (0, len(rec.t))
+        mv = np.flatnonzero(np.abs(np.gradient(rec.target_q, DT, axis=0)).max(1) > 0.01)
+        a, b = (mv[0], mv[-1] + 1) if len(mv) else (0, len(rec.t))
         err = np.abs(rec.actual_q[a:b] - rec.target_q[a:b])
-        rows.append((os.path.basename(rec.path), err.mean(), err.max(), (b - a) * DT))
-    print(f"  {'run':30s} {'error [mrad]':>13s} {'worst':>8s} {'cycle [s]':>10s} {'score':>7s}")
-    for name, mean, worst, T in rows:
-        score = mean / rows[0][1] + ALPHA * T / rows[0][3]
-        print(f"  {name:30s} {mean * 1000:13.4f} {worst * 1000:8.3f} {T:10.3f} {score:7.3f}")
+        n = laps(rec.target_q)          # on the whole run: it starts at rest, on the cycle
+        rows.append((os.path.basename(rec.path), err.mean(), err.max(), (b - a) * DT / n, n))
+
+    w = max(len(r[0]) for r in rows)
+    print(f"  {'run':{w}s} {'error [mrad]':>12s} {'worst':>8s} {'cycle [s]':>10s} "
+          f"{'laps':>5s} {'score':>7s}")
+    for name, mean, worst, T, n in rows:
+        # A simulator tracks perfectly, so there is nothing to score against.
+        score = (f"{mean / rows[0][1] + ALPHA * T / rows[0][3]:7.3f}"
+                 if rows[0][1] > 0 else "      -")
+        print(f"  {name:{w}s} {mean * 1000:12.4f} {worst * 1000:8.3f} {T:10.3f} "
+              f"{n:5d} {score}")
+    if rows[0][1] == 0:
+        print("  (actual == target exactly: a simulator, so there is no error to score)")
 
 
 def view(recs: list, quantity: str = "angle q", joint: int = 1, model=None,
@@ -145,40 +185,53 @@ def view(recs: list, quantity: str = "angle q", joint: int = 1, model=None,
 
     t_base, a_base, unit, comps = QUANTITIES[quantity]
     keep = slice(None, max_points)
-    colours = iter(PALETTE * 4)
     fig = go.Figure()
-    for rec in recs:
+    for rec, colour in zip(recs, PALETTE * 4):
         run = os.path.basename(rec.path)
         t = rec.t[keep]
-        for tag, block in (("target", rec.channel(t_base)),
-                           ("actual", rec.channel(a_base))):
+        for tag, block, dash in (("target", rec.channel(t_base), "dash"),
+                                 ("actual", rec.channel(a_base), "solid")):
             if block is not None:
                 fig.add_scattergl(x=t, y=block[keep, joint], name=f"{run} - {tag}",
-                                  line=dict(color=next(colours), width=1.5))
+                                  line=dict(color=colour, dash=dash, width=1.5))
         if model is None or a_base not in model.predicts():
             continue
         # Predicting the shown rows only is exact, not an approximation: the model
         # is causal, so row t never depends on a row after it.
         p = model.predict(rec.df.iloc[keep])
-        mean, colour = p["mean"][a_base][:, joint], next(colours)
-        # Widest band first so the narrower one occludes it: the model's own noise
-        # inside, the ensemble's disagreement added on top.
-        for key, alpha, tag in (("var", 0.12, "+epistemic"),
-                                ("var_aleatoric", 0.22, "aleatoric")):
+        mean = p["mean"][a_base][:, joint]
+        # The bands stay out of the legend: they belong to the model line, which is
+        # drawn pale so the measured one reads through it.
+        for key, alpha in (("var", 0.10), ("var_aleatoric", 0.18)):
             if key in p:
                 half = sd_factor * np.sqrt(p[key][a_base][:, joint])
                 fig.add_scattergl(x=np.concatenate([t, t[::-1]]),
                                   y=np.concatenate([mean + half, (mean - half)[::-1]]),
                                   fill="toself", fillcolor=_rgba(colour, alpha),
-                                  line=dict(width=0), hoverinfo="skip",
-                                  name=f"{run} - {sd_factor:g}sd {tag}")
-        fig.add_scattergl(x=t, y=mean, name=f"{run} - model",
-                          line=dict(color=colour, width=1.5))
+                                  line=dict(width=0), hoverinfo="skip", showlegend=False)
+        fig.add_scattergl(x=t, y=mean, name=f"{run} - model ({sd_factor:g}sd band)",
+                          line=dict(color=_rgba(colour, 0.45), width=3))
 
     fig.update_layout(title=f"{quantity} - {comps[joint]}", xaxis_title="time [s]",
                       yaxis_title=f"{quantity} [{unit}]", hovermode="x unified",
                       template="plotly_white")
     return fig
+
+
+def show(fig):
+    """Open the figure, muting what the browser writes on its way up.
+
+    Launching it inherits our stderr, so GTK and locale chatter lands in the middle
+    of the table above. Python-level errors still raise normally.
+    """
+    with open(os.devnull, "w") as null:
+        saved = os.dup(2)
+        os.dup2(null.fileno(), 2)
+        try:
+            fig.show()
+        finally:
+            os.dup2(saved, 2)
+            os.close(saved)
 
 
 def main():
@@ -206,7 +259,7 @@ def main():
     if args.model:
         from train_distillation_model import DistillModel      # pulls in torch
         model = DistillModel.load(args.model)
-    view(recs, args.quantity, args.joint, model, args.sd_factor, args.max_points).show()
+    show(view(recs, args.quantity, args.joint, model, args.sd_factor, args.max_points))
 
 
 if __name__ == "__main__":

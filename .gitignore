@@ -2,6 +2,8 @@
 /case 2/models/
 /case 2/runs/
 /case 2/scripts/*.path
+/case 2/scripts/*.csv
+
 
 /.vscode/
 CLAUDE.md

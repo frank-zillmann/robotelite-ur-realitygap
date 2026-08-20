@@ -34,7 +34,9 @@ from send import load_path
 from train_distillation_model import DistillModel
 from utils import DT, N_JOINTS, Robot
 
-ALPHA = 1.0        # a second of cycle time costs as much as this much error, relatively
+ALPHA = 3.0        # a percent off the cycle time is worth this many percent more
+                   # tracking error. At 1 a well-tuned path is already optimal and
+                   # the optimizer rightly leaves it alone.
 K = 1.0            # standard deviations of the model's own uncertainty added to the error
 LIMIT = 100.0      # how hard the ceilings are held: soft, so a percent or two of
                    # overshoot is affordable. That stays far below the safety limit
@@ -206,7 +208,7 @@ def main():
     out = args.out or args.path.rsplit(".", 1)[0] + ".optimized.path"
     write_path(out, q, DT)
     print(f"wrote {out} ({len(q)} setpoints)\n"
-          f"  run it: python send.py --path {out} --loop 5 --out optimized.csv")
+          f"  run it: python send.py {out} --robot-ip <ip> --loop 5")
 
 
 if __name__ == "__main__":

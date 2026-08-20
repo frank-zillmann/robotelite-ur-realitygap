@@ -211,8 +211,10 @@ class CNNModel(DistillModel):
         ds = train.dataset.dataset # the MoveDataset behind the Subset
         self.stats = ds.stats
         run = f"runs/distill/{time.strftime('%Y%m%d-%H%M%S')}"
+        n_weights = sum(p.numel() for p in self.parameters())
         print(f"{len(train.dataset)} train / {len(val.dataset)} val moves, receptive "
               f"field {self.pad + 1} rows ({(self.pad + 1) * DT:.2f} s)\n"
+              f"{n_weights:,} trainable weights\n"
               f"logging to {run}, watch with: tensorboard --logdir runs")
         train_log = SummaryWriter(f"{run}/train")
         val_log = SummaryWriter(f"{run}/val") if len(val.dataset) else None

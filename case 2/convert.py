@@ -4,7 +4,8 @@ Only the controller knows exactly how it turns a script into motion: the speed
 profile, the Cartesian caps, the pauses, the blends. So rather than reimplement it,
 run the script and record ``target_q``.
 
-    python convert.py --script scripts/triangle.script --out scripts/triangle.path
+    python convert.py scripts/triangle.script --robot-ip 127.0.0.1
+    python convert.py data/ur5e/T01_fast_r1.csv        # or lift it from a recording
 
 Out comes a servoj path (``q0..q5`` plus a per-row ``dt``) that reproduces the
 script and closes on itself, so it can be streamed in a loop. The robot must be on
@@ -22,6 +23,22 @@ import send
 from analysis import Recording
 from common import segments
 from utils import DT, N_JOINTS
+
+
+def from_recording(csv: str):
+    """``(q, dt)``: the commanded trajectory of one cycle of an existing recording.
+
+    A recorded run already holds what the controller commanded, so a path can be
+    lifted straight out of it -- no robot, and the arm that made it need not be the
+    one in front of you. Same trimming as ``convert``: whole laps only.
+    """
+    rec = Recording(csv)
+    segs = segments(rec)
+    if len(segs) < 2:
+        raise SystemExit(f"{csv}: {len(segs)} moves, need at least 2")
+    q = rec.target_q[segs[0].i0:segs[-1].i2]
+    print(f"  {len(rec.t)} samples, {len(segs)} moves")
+    return q, DT
 
 
 def convert(script: str, robot_ip: str):
@@ -64,13 +81,15 @@ def write_path(path: str, q, dt: float):
 
 def main():
     ap = argparse.ArgumentParser(description="Record what a script commands, as a path.")
-    ap.add_argument("--script", required=True, help="URScript to run")
+    ap.add_argument("source", help="a .script to run on the robot, or a .csv to lift "
+                                   "the commanded trajectory out of")
     ap.add_argument("--robot-ip", default="127.0.0.1", help="controller address")
-    ap.add_argument("--out", default=None, help="default: <script>.path")
+    ap.add_argument("--out", default=None, help="default: <source>.path")
     args = ap.parse_args()
 
-    q, dt = convert(args.script, args.robot_ip)
-    out = args.out or args.script.rsplit(".", 1)[0] + ".path"
+    q, dt = (from_recording(args.source) if args.source.endswith(".csv")
+             else convert(args.source, args.robot_ip))
+    out = args.out or args.source.rsplit(".", 1)[0] + ".path"
     write_path(out, q, dt)
     print(f"wrote {out}: {len(q)} setpoints, {len(q) * dt:.2f} s at {dt * 1000:.2f} ms")
 
