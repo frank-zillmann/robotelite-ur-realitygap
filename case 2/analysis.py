@@ -218,7 +218,7 @@ def main():
                     help="the .path matching each --csv, one-to-one and in the same order")
     ap.add_argument("--quantity", choices=list(QUANTITIES), default="angle q",
                     help="which channel to plot")
-    ap.add_argument("--joint", type=int, default=0, choices=range(N_JOINTS),
+    ap.add_argument("--joint", type=int, required=True, choices=range(N_JOINTS),
                     help="component 0..5: a joint (base..wrist3), or a Cartesian "
                          "axis (x, y, z, rx, ry, rz) for the TCP quantities")
     ap.add_argument("--model", required=True,

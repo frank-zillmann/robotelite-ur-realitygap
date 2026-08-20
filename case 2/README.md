@@ -60,7 +60,7 @@ python send.py scripts/triangle.path --robot-ip 192.168.1.100 --engine stream --
 python send.py scripts/triangle.retime.path --robot-ip 192.168.1.100 --engine stream --loop 5
 
 # 5. compare them: one plot, and the optimizer objective side by side
-python analysis.py --csv scripts/triangle.stream.csv scripts/triangle.retime.stream.csv --path scripts/triangle.path scripts/triangle.retime.path --model models/distill-ur5e.pkl --robot UR5e
+python analysis.py --csv scripts/triangle.stream.csv scripts/triangle.retime.stream.csv --path scripts/triangle.path scripts/triangle.retime.path --model models/distill-ur5e.pkl --robot UR5e --joint 0
 ```
 
 `tensorboard --logdir runs` shows both stages. Step 4 is the test that matters: if
