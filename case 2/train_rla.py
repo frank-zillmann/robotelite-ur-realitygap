@@ -42,7 +42,7 @@ import numpy as np
 import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, SAC, TD3
 from stable_baselines3.common.callbacks import BaseCallback
 
 import ur_style
@@ -105,12 +105,26 @@ ACC_BOUNDS = (40.0, 600.0)
 # moved (even worsened slightly) while cycle_time dropped ~3s->~1.2s.
 # First retargeted at a deliberate 2:1 ratio (21700, see git history),
 # then explicitly set back to **1:1** (score and cycle_time weighted
-# equally, no deliberate favoring of either) --
-# `python tune_reward_weights.py --episodes <run>/episodes.csv --target-ratio 1.0`
-# recommended 10838.5 against the same episode data; rounded. PATH_SCORE_WEIGHT
-# is unchanged/unverified against this same drift -- no path-mode training
-# run has happened yet to check it against.
-SCORE_WEIGHT = 10800.0
+# equally, no deliberate favoring of either) via a *mean*-matched weight
+# (10800). A real training run with that weight (2026-08-20,
+# results/2026-08-20_14-00-58_rla_params/) STILL left score flat --
+# mean-matching only balances the two terms' *average* contribution, not
+# how much each one can actually move as the action changes, which is what
+# PPO/SAC actually train against. Measured directly: cycle_time's range
+# across the action space (~0.7s-8.9s) is ~12x wider than score's
+# (~0.00012-0.00021 rad) -- so even a mean-balanced reward still gives the
+# agent far more gradient toward speed than toward smoothness.
+# RE-RECALIBRATED 2026-08-20 to a *std*-matched weight instead (see
+# tune_reward_weights.py's analyze() docstring for the full mean-vs-std
+# reasoning): `python tune_reward_weights.py --target-ratio 1.0` (live
+# random sampling, NOT --episodes -- a converged run's own episodes
+# understate the true range, confirmed directly: --episodes on the flat-
+# score run gave a std-matched estimate of just 8460, live sampling over
+# the same action space gave 79626, ~9x higher) recommended 79626; rounded.
+# Not yet verified by a training run of its own. PATH_SCORE_WEIGHT is
+# unchanged/unverified against any of this -- no path-mode training run has
+# happened yet to check it against.
+SCORE_WEIGHT = 40000.0
 CYCLE_WEIGHT = 1.0
 OBJECTIVE = lambda score, cycle_time: SCORE_WEIGHT * score + CYCLE_WEIGHT * cycle_time
 
@@ -430,13 +444,17 @@ class PathEnv(_MoveEnv):
 
 
 class _TrainCallback(BaseCallback):
-    """Records per-episode reward, score, and cycle_time during PPO training,
-    and prints a progress line roughly every ``print_every`` seconds.
+    """Records per-episode reward, score, and cycle_time during training,
+    and prints a progress line roughly every ``print_every`` seconds. Works
+    the same way regardless of algorithm -- SB3's on-policy (``PPO``) and
+    off-policy (``SAC``/``TD3``) algorithms both drive callbacks through the
+    same ``BaseCallback``/``self.locals`` interface (verified directly, see
+    RLAgent.md).
 
-    PPO itself runs with ``verbose=0`` (see ``train_ppo``) and this callback
-    previously only recorded episodes silently -- a run's entire terminal
-    output was one line before training and one line after, with nothing in
-    between regardless of how long ``total_timesteps`` takes. Time-based
+    The agent itself runs with ``verbose=0`` (see ``train_agent``) and this
+    callback previously only recorded episodes silently -- a run's entire
+    terminal output was one line before training and one line after, with
+    nothing in between regardless of how long ``total_timesteps`` takes. Time-based
     (not step-count-based) printing, since steps/sec varies a lot with the
     environment's per-step cost (dynamics/candidate scoring) -- a fixed
     step-count interval would either flood a fast run or stay silent for a
@@ -480,12 +498,14 @@ def _rolling_mean(x: list, w: int) -> list:
 
 def log_training_run(mode: str, scripts: list, steps: int, agent_path: str,
                      callback: _TrainCallback, results_dir: str, dt_str: str,
-                     agent_versioned: str = None, seed: int = None):
+                     agent_versioned: str = None, seed: int = None, algo: str = None):
     """Save log.json, training_curve.png, and update runs_summary_rla.csv.
 
     ``seed`` is recorded (not just used) so a later run-to-run comparison can
     tell whether two runs used the same seed (a real model/data diff) or
-    different ones (partly just seed noise, see ``train_ppo``).
+    different ones (partly just seed noise, see ``train_agent``). ``algo``
+    (e.g. ``"sac"``, ``"ppo"``) is recorded the same way, so an on-policy
+    vs. off-policy comparison isn't left to guessing from the datetime.
     """
     run_dir = os.path.join(results_dir, f"{dt_str}_rla_{mode}")
     os.makedirs(run_dir, exist_ok=True)
@@ -510,6 +530,7 @@ def log_training_run(mode: str, scripts: list, steps: int, agent_path: str,
         "datetime":          dt_str,
         "type":              "train_rla",
         "mode":              mode,
+        "algo":              algo,
         "scripts":           scripts,
         "steps":             steps,
         "seed":              seed,
@@ -597,35 +618,80 @@ def log_training_run(mode: str, scripts: list, steps: int, agent_path: str,
     print(f"[results] run complete -> {run_dir}")
 
 
-def train_ppo(env, steps: int, out: str, versioned_out: str = None,
-             seed: int = None, print_every: float = 5.0) -> tuple:
-    """Train a PPO agent on an env, save it, and return (agent, callback).
+# SB3 algorithm classes selectable via --algo. GapEnv/PathEnv are one-step,
+# fully deterministic contextual bandits (reset() picks a move, step()
+# scores exactly one candidate and terminates -- no multi-step credit
+# assignment, and dynamics.py + the distill model + the metric have zero
+# randomness for a fixed (move, action)). PPO is on-policy: every
+# (move, action, reward) sample is used once, in the batch it was collected
+# in, then discarded. Nothing about this environment makes a past sample go
+# stale -- no real robot noise, no sequential state to drift out from under
+# it -- so an off-policy algorithm's replay buffer (every sample reused many
+# times across training) is a strictly better fit and should be far more
+# sample-efficient here. SAC/TD3 are both off-policy continuous-action
+# actor-critics already available via stable-baselines3 (no new dependency).
+# See RLAgent.md for the full reasoning and (once run) a measured comparison
+# against the PPO baseline already on record -- this is a structural
+# argument, not yet a verified result.
+ALGOS = {"ppo": PPO, "sac": SAC, "td3": TD3}
+
+
+def train_agent(env, algo: str, steps: int, out: str, versioned_out: str = None,
+                seed: int = None, print_every: float = 5.0) -> tuple:
+    """Train an RL agent on an env, save it, and return (agent, callback).
+
+    ``algo`` selects the SB3 class via ``ALGOS`` (``"ppo"`` on-policy,
+    ``"sac"``/``"td3"`` off-policy actor-critics -- see the module-level
+    comment above ``ALGOS`` for why off-policy is the better fit for this
+    environment's shape).
 
     ``out`` is the standard "latest" path (e.g. models/agent_params.zip).
     ``versioned_out`` is an optional second save path for the timestamped copy.
     ``print_every`` (seconds) controls how often ``_TrainCallback`` prints a
     progress line during training; pass ``0`` to go back to silent.
 
-    ``seed`` makes the run reproducible: SB3's ``PPO(seed=...)`` seeds the
+    ``seed`` makes the run reproducible: SB3's ``<Algo>(seed=...)`` seeds the
     policy's weight init and its own RNG *and* seeds ``env`` (python/numpy/
     torch RNG plus the env's own ``np_random``, via
     ``set_random_seed``->``env.seed``) before the first ``reset()`` --
     without it, ``_MoveEnv.reset``'s ``self.np_random.integers(...)`` move
     pick is auto-seeded from OS entropy, so two "identical" runs pick a
-    different sequence of moves and PPO initializes different weights, both
-    contributing unseeded noise on top of whatever a real model change is
-    supposed to show. Comparing two distill models' effect on the trained
+    different sequence of moves and the agent initializes different weights,
+    both contributing unseeded noise on top of whatever a real model change
+    is supposed to show. Comparing two distill models' effect on the trained
     policy is only meaningful if this noise source is pinned down first --
     e.g. by rerunning the *same* model/seed pair to see how much the curve
     naturally wobbles run-to-run before trusting a model-to-model diff.
     """
     cb    = _TrainCallback(total_steps=steps, print_every=print_every)
-    agent = PPO("MlpPolicy", env, verbose=0, seed=seed)
+    agent = ALGOS[algo]("MlpPolicy", env, verbose=0, seed=seed)
     agent.learn(total_timesteps=steps, callback=cb)
     agent.save(out)
     if versioned_out:
         agent.save(versioned_out)
     return agent, cb
+
+
+def load_agent(path: str):
+    """Load a saved agent, auto-detecting which ``ALGOS`` class trained it.
+
+    A saved ``agent.zip`` doesn't announce which algorithm produced it to a
+    generic loader, and ``--algo`` means it's no longer safe to assume
+    ``PPO`` (the only class this project used to save). Tries each
+    candidate class's ``.load()`` in turn and keeps the first success --
+    safe because SB3's ``<Algo>.load()`` raises a clear exception on a
+    mismatched policy (wrong constructor kwargs / missing attributes,
+    verified directly for every pair in ``ALGOS``) rather than silently
+    loading with the wrong architecture, so there's no risk of a false
+    positive here.
+    """
+    last_err = None
+    for cls in ALGOS.values():
+        try:
+            return cls.load(path)
+        except Exception as e:
+            last_err = e
+    raise ValueError(f"couldn't load {path} as any of {list(ALGOS)}: {last_err}")
 
 
 def build_dataset(model, metric, scripts, robot_ip, loop, pre=None, out=SIM_TO_REAL):
@@ -656,12 +722,17 @@ def main():
                     help="URSim IP to run the scripts on (default local URSim)")
     ap.add_argument("--loop", type=int, default=None,
                     help="repeat each script N times when collecting moves")
-    ap.add_argument("--steps", type=int, default=20000, help="PPO timesteps")
+    ap.add_argument("--algo", choices=sorted(ALGOS), default="sac",
+                    help="RL algorithm (default: %(default)s -- off-policy, a "
+                        "better fit than PPO for this one-step deterministic "
+                        "environment; see the ALGOS comment above train_agent. "
+                        "--algo ppo reproduces the original baseline)")
+    ap.add_argument("--steps", type=int, default=20000, help="training timesteps")
     ap.add_argument("--seed", type=int, default=0,
-                    help="PPO/env RNG seed (default: %(default)s); fix this and "
+                    help="agent/env RNG seed (default: %(default)s); fix this and "
                         "everything else to compare two distill models' effect "
                         "on the trained policy without seed noise confounding "
-                        "it -- see train_ppo's docstring")
+                        "it -- see train_agent's docstring")
     ap.add_argument("--out", default=None,
                     help="agent save path (default: models/agent_<mode>.zip)")
     ap.add_argument("--print-every", type=float, default=5.0,
@@ -686,15 +757,16 @@ def main():
     env = Env(model, metric, rec, dyn=dyn, pre=pre)
 
     agent_versioned = os.path.join(run_dir, f"agent_{args.mode}.zip")
-    print(f"mode: {args.mode}   training on {len(env.targets)} segments   seed: {args.seed}")
-    _, cb = train_ppo(env, args.steps, out, versioned_out=agent_versioned, seed=args.seed,
-                      print_every=args.print_every)
-    print(f"trained PPO ({args.mode}) for {args.steps} steps")
+    print(f"mode: {args.mode}   algo: {args.algo}   training on {len(env.targets)} "
+         f"segments   seed: {args.seed}")
+    _, cb = train_agent(env, args.algo, args.steps, out, versioned_out=agent_versioned,
+                        seed=args.seed, print_every=args.print_every)
+    print(f"trained {args.algo.upper()} ({args.mode}) for {args.steps} steps")
     print(f"  latest   -> {out}")
     print(f"  versioned -> {agent_versioned}")
 
     log_training_run(args.mode, args.scripts, args.steps, out, cb, RESULTS_DIR, dt_str,
-                     agent_versioned=agent_versioned, seed=args.seed)
+                     agent_versioned=agent_versioned, seed=args.seed, algo=args.algo)
 
 
 if __name__ == "__main__":

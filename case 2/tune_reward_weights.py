@@ -31,6 +31,23 @@ Two ways to get (score, cycle_time) samples:
           python tune_reward_weights.py \\
               --episodes results/2026-08-20_12-31-40_rla_params/episodes.csv
 
+Recommends two weights, not one -- see ``analyze()``'s docstring for why a
+mean-matched weight (balances average contribution) isn't the same as a
+std-matched one (balances how much each term can actually move as the
+action changes, i.e. the gradient the agent trains against). A real
+training run with a mean-matched `SCORE_WEIGHT=10800` still left score flat
+(2026-08-20) -- checking why found score has a much narrower dynamic range
+than cycle_time across the action space, but **measuring that range from a
+converged policy's own `--episodes` data understates it**: the policy has
+already narrowed its own exploration, so its episodes look less spread out
+than the action space actually allows. Confirmed directly on this project's
+data: `--episodes` from the flat-score run gave a std-matched estimate of
+just 8,460; live/random sampling (unbiased, n=3000) over the same action
+space gave 79,626 -- ~9x higher. **Use live sampling (no `--episodes`) for
+the std-matched number**; `--episodes` is still fine for the mean-matched
+check (was a completed run's average actually balanced) since that's what
+it was originally built for.
+
 Outputs -> results/<timestamp>_reward_tuning/ (or --out):
     samples.csv              score, cycle_time, cost (at the current weight)
     weight_sensitivity.png   score term's share of total cost vs candidate weight
@@ -86,29 +103,53 @@ def sample_live(model, scripts: list, robot_ip: str, loop, mode: str,
 
 
 def analyze(df: pd.DataFrame, score_weight: float, cycle_weight: float,
-           target_ratio: float, out_dir: str, weight_label: str) -> float:
-    """Print the current weight's balance, recommend one for ``target_ratio``,
-    and save the two diagnostic plots. Returns the recommended weight.
+           target_ratio: float, out_dir: str, weight_label: str) -> dict:
+    """Print the current weight's balance, recommend one two ways, and save
+    the two diagnostic plots. Returns ``{"mean": ..., "std": ...}``.
+
+    Two different recommendations, because they answer different questions:
+
+    - **mean-matched** (``target_ratio * cycle_weight * mean_cycle / mean_score``):
+      puts the two terms' *average* contribution to cost at the target ratio.
+      This is what earlier versions of this tool computed.
+    - **std-matched** (``target_ratio * cycle_weight * std(cycle_time) / std(score)``):
+      puts the two terms' *spread* (how much each one can move as the action
+      changes) at the target ratio. A reward can be mean-balanced while one
+      term still has a much wider range across the action space than the
+      other -- and since PPO/SAC learn from how reward *changes* with the
+      action, not its average value, a mean-balanced-but-std-skewed reward
+      still mostly teaches the agent to chase whichever term has more room
+      to move. Confirmed this is exactly what happened on this project's
+      data (2026-08-20): a mean-matched `SCORE_WEIGHT=10800` (ratio 1.18:1)
+      still trained a policy whose score stayed flat while cycle_time did
+      all the improving, because cycle_time's range across the action space
+      (~12x) dwarfs score's (~1.5x) even though their *means* were balanced.
+      std-matched is the one that actually targets the gradient the agent
+      trains against.
     """
     mean_score = float(df["score"].mean())
     mean_cycle = float(df["cycle_time"].mean())
+    std_score  = float(df["score"].std())
+    std_cycle  = float(df["cycle_time"].std())
 
     current_score_term = score_weight * mean_score
     current_cycle_term = cycle_weight * mean_cycle
     current_ratio = current_score_term / current_cycle_term if current_cycle_term else float("nan")
-    recommended = target_ratio * cycle_weight * mean_cycle / mean_score if mean_score else float("nan")
+    recommended_mean = target_ratio * cycle_weight * mean_cycle / mean_score if mean_score else float("nan")
+    recommended_std  = target_ratio * cycle_weight * std_cycle / std_score if std_score else float("nan")
 
     print(f"samples: {len(df)}")
-    print(f"mean score:      {mean_score:.6g}")
-    print(f"mean cycle_time: {mean_cycle:.6g} s")
-    print(f"current {weight_label}={score_weight:.6g}  ->  weighted (score:cycle) "
+    print(f"mean score:      {mean_score:.6g}   (std {std_score:.6g})")
+    print(f"mean cycle_time: {mean_cycle:.6g} s (std {std_cycle:.6g})")
+    print(f"current {weight_label}={score_weight:.6g}  ->  mean-weighted (score:cycle) "
          f"= {current_ratio:.3g}:1")
-    print(f"target ratio {target_ratio:.3g}:1  ->  recommended {weight_label} "
-         f"= {recommended:.6g}")
+    print(f"target ratio {target_ratio:.3g}:1:")
+    print(f"  mean-matched {weight_label} (average contribution balance)      = {recommended_mean:.6g}")
+    print(f"  std-matched  {weight_label} (gradient/range balance -- use this) = {recommended_std:.6g}")
 
     # ---- weight_sensitivity.png ----------------------------------------------
-    span_lo = min(recommended, score_weight) / 50
-    span_hi = max(recommended, score_weight) * 50
+    span_lo = min(recommended_mean, recommended_std, score_weight) / 50
+    span_hi = max(recommended_mean, recommended_std, score_weight) * 50
     candidates = np.logspace(np.log10(max(span_lo, 1e-9)), np.log10(span_hi), 300)
     score_share = (candidates * mean_score) / (candidates * mean_score + cycle_weight * mean_cycle)
 
@@ -120,8 +161,10 @@ def analyze(df: pd.DataFrame, score_weight: float, cycle_weight: float,
               label=f"target ratio {target_ratio:.2g}:1 ({target_share:.0%})")
     ax.axvline(score_weight, color=ur_style.NAVY, linestyle=":", linewidth=1.8,
               label=f"current {weight_label}={score_weight:.4g}")
-    ax.axvline(recommended, color=ur_style.DARK_BLUE, linestyle=":", linewidth=1.8,
-              label=f"recommended {weight_label}={recommended:.4g}")
+    ax.axvline(recommended_mean, color=ur_style.DARK_BLUE, linestyle=":", linewidth=1.8,
+              label=f"mean-matched {weight_label}={recommended_mean:.4g}")
+    ax.axvline(recommended_std, color=ur_style.LIGHT_BLUE, linestyle=":", linewidth=1.8,
+              label=f"std-matched {weight_label}={recommended_std:.4g}")
     ax.set_xscale("log")
     ax.set_xlabel(f"candidate {weight_label} (log scale)")
     ax.set_ylabel("score term's share of mean total weighted cost")
@@ -140,7 +183,10 @@ def analyze(df: pd.DataFrame, score_weight: float, cycle_weight: float,
               label="samples", zorder=2)
     x = np.linspace(df["cycle_time"].min() * 0.9, df["cycle_time"].max() * 1.1, 200)
     for w, color, tag in [(score_weight, ur_style.NAVY, f"current {weight_label}={score_weight:.4g}"),
-                          (recommended, ur_style.BLUE, f"recommended {weight_label}={recommended:.4g}")]:
+                          (recommended_mean, ur_style.DARK_BLUE,
+                           f"mean-matched {weight_label}={recommended_mean:.4g}"),
+                          (recommended_std, ur_style.LIGHT_BLUE,
+                           f"std-matched {weight_label}={recommended_std:.4g}")]:
         # Iso-cost line through the mean point: w*score + cycle_weight*cycle = const.
         # Points below/left of a line cost less under that weight than the mean
         # sample does -- shows how "good" shifts as the weight changes.
@@ -159,7 +205,7 @@ def analyze(df: pd.DataFrame, score_weight: float, cycle_weight: float,
     plt.close(fig)
     print(f"[results] plot -> {p2}")
 
-    return recommended
+    return {"mean": recommended_mean, "std": recommended_std}
 
 
 def main():
@@ -181,9 +227,11 @@ def main():
                         "if given)")
     ap.add_argument("--n-samples", type=int, default=500,
                     help="random actions to sample (live-sampling mode, default: %(default)s)")
-    ap.add_argument("--target-ratio", type=float, default=2.0,
-                    help="target weighted (score term : cycle_time term) ratio "
-                        "(default: %(default)s -- score counts twice cycle_time)")
+    ap.add_argument("--target-ratio", type=float, default=1.0,
+                    help="target (score term : cycle_time term) ratio, applied to "
+                        "both the mean-matched and std-matched recommendations "
+                        "(default: %(default)s -- balanced, matching train_rla.py's "
+                        "current choice)")
     ap.add_argument("--out", default=None,
                     help="output dir (default: results/<timestamp>_reward_tuning)")
     args = ap.parse_args()
@@ -199,6 +247,14 @@ def main():
     if args.episodes:
         df = pd.read_csv(args.episodes)[["score", "cycle_time"]]
         print(f"loaded {len(df)} episodes from {args.episodes}")
+        print("[warn] --episodes reflects the *trained policy's own* action "
+             "distribution, not the full action space -- fine for the mean-matched "
+             "check (was this run's average actually balanced), but a converged "
+             "policy visits a much narrower range of actions than random sampling "
+             "does, so its std-matched number likely UNDERSTATES the true gradient "
+             "mismatch (confirmed 2026-08-20: episodes.csv gave a ~10x lower "
+             "std-matched estimate than live/random sampling on the same project). "
+             "Prefer live sampling (no --episodes) for the std-matched recommendation.")
     else:
         model = DistillModel.load(args.model)
         sim_csv = os.path.join(out_dir, "sim_to_real.csv")
@@ -212,7 +268,9 @@ def main():
     print(f"[results] samples -> {samples_path}")
 
     recommended = analyze(df, score_weight, cycle_weight, args.target_ratio, out_dir, weight_label)
-    print(f"\nTo apply: set {weight_label} = {recommended:.6g} in train_rla.py")
+    print(f"\nTo apply: set {weight_label} = {recommended['std']:.6g} in train_rla.py "
+         f"(std-matched -- targets the gradient the agent trains against; "
+         f"the mean-matched alternative is {recommended['mean']:.6g})")
 
 
 if __name__ == "__main__":

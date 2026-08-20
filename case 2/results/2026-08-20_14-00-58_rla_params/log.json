@@ -1,0 +1,21 @@
+{
+  "datetime": "2026-08-20_14-00-58",
+  "type": "train_rla",
+  "mode": "params",
+  "algo": "sac",
+  "scripts": [
+    "scripts/shoulder_swing.script",
+    "scripts/vertical_swing.script",
+    "scripts/horizontal_swing.script"
+  ],
+  "steps": 20000,
+  "seed": 0,
+  "agent_path_latest": "models/agent_params.zip",
+  "agent_path": "C:\\Users\\aacom\\Desktop\\SDU Summer School\\robotelite-ur-realitygap\\case 2\\results\\2026-08-20_14-00-58_rla_params\\agent_params.zip",
+  "summary": {
+    "n_episodes": 20000,
+    "best_score": 6.32427356433728e-05,
+    "final_score_mean": 0.00014549886484510952,
+    "best_cycle_time": 0.5849999999999875
+  }
+}

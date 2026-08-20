@@ -27,13 +27,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from stable_baselines3 import PPO
 
 import ur_style
 from metrics import PositionGapMetric
 from preprocess import default_preprocess
 from train_distillation_model import DistillModel
-from train_rla import GapEnv, PathEnv, build_dataset, speed_profile
+from train_rla import GapEnv, PathEnv, build_dataset, load_agent, speed_profile
 from utils import get_param, load_script, set_param
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
@@ -103,8 +102,8 @@ def _compare(base, opt):
 
 
 def search_agent(env: GapEnv, moves, path: str) -> tuple[float, float]:
-    """Ask a trained PPO agent for vel/acc (deg/s), averaged over the moves."""
-    agent = PPO.load(path)
+    """Ask a trained agent for vel/acc (deg/s), averaged over the moves."""
+    agent = load_agent(path)
     params = [env._unmap(agent.predict(env._obs(m), deterministic=True)[0]) for m in moves]
     return tuple(np.mean(params, axis=0))
 
@@ -153,7 +152,7 @@ def run_params(args, model, metric, rec, pre, run_dir: str) -> dict:
 
 def agent_paths(env: PathEnv, moves, path: str):
     """Per move, the agent's (accel_frac, decel_frac, servoj dt)."""
-    agent = PPO.load(path)
+    agent = load_agent(path)
     return [env.unpack(agent.predict(env._obs(m), deterministic=True)[0]) for m in moves]
 
 
@@ -250,7 +249,7 @@ def main():
     ap.add_argument("--loop", type=int, default=None,
                     help="repeat the script N times when collecting its moves")
     ap.add_argument("--agent", default=None,
-                    help="trained PPO agent (default: models/agent_<mode>.zip)")
+                    help="trained agent, any train_rla.py --algo (default: models/agent_<mode>.zip)")
     args = ap.parse_args()
     args.agent = args.agent or f"models/agent_{args.mode}.zip"
 

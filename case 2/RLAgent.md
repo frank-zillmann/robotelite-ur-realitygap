@@ -9,6 +9,82 @@ This file is the RL-specific counterpart to `ModelReview.md`, which stays
 focused on the distillation model itself (`train_distillation_model.py`,
 `metrics.py`). Don't duplicate that content here — link to it.
 
+## 0. Plain-language summary — for slides
+
+The rest of this document is the working log. This section is the pitch:
+what the RL policy actually does, and why it was switched from `PPO` to
+`SAC` (§8), without requiring the reader to already know what either of
+those is.
+
+**One sentence**: for each move the robot needs to make, an agent picks how
+fast to go and how hard to accelerate, trying to get there quickly without
+shaking or overshooting when it arrives — trained entirely against a
+simulated prediction of the robot, never the real machine.
+
+### The problem, in an analogy
+
+Picture packing many boxes on a conveyor belt as fast as possible without
+anything rattling loose inside. For each box, you choose a packing speed:
+too fast and things shift (vibration/overshoot), too slow and you waste
+time. Critically, **box 7's result doesn't depend on how you packed box
+6** — every box is its own, independent decision, scored purely on its own
+outcome. That's exactly this problem's shape: every robot move gets its
+own speed decision, with no sequence or memory across moves. This matters
+a lot for the algorithm question below.
+
+### How the agent decides, and how it knows if a choice was good
+
+For every move, the agent is shown how far the joint needs to travel, which
+joint it is, and how that same move went at its *original* commanded
+speed (a baseline for comparison). From that, it picks two numbers: how
+fast to go, and how hard to accelerate.
+
+Nothing here touches a real robot. Each candidate speed is scored by a
+simulated pipeline: a physics model predicts how the robot would move, the
+distilled model (`ModelReview.md`) predicts how far that lands from
+perfect (the "reality gap"), and that combines with how long the move took
+into one score — weighted so speed and smoothness matter about equally
+(§4a). Because it's all a calculation, not a real robot moving, this loop
+can run thousands of times, cheaply and safely, to learn from.
+
+### Why the first algorithm (PPO) was swapped out — the studying analogy
+
+The original version used `PPO`, a well-known RL algorithm built for
+problems that unfold over *many* steps, where doing well at step 5 depends
+on what happened at steps 1-4 — think a video game or a chess match. PPO
+studies a batch of practice attempts once, then throws them away before
+trying new ones, because in a changing, multi-step world an old lesson
+might not apply anymore by the time it's revisited.
+
+This project's problem isn't like that: every move is scored in one shot,
+and — since the score comes from a fixed calculation, not a noisy real
+robot — **the same choice always gets the exact same score**. There's no
+"the world changed since I last tried this" risk. That means a different
+family of algorithm, `SAC`, can be used instead: it keeps every attempt
+it's ever made in a big notebook (a "replay buffer") and re-reads through
+it many times as it gets smarter, instead of discarding each attempt after
+one use.
+
+**The analogy**: `PPO` is a student who does one practice exam, marks it,
+then throws it away before starting the next — every practice question is
+only ever seen once. `SAC` is a student who keeps every practice exam
+they've ever done and reviews the whole stack again each night — far more
+learning squeezed out of the same amount of practice. Since this project's
+"practice answers" never go stale (deterministic scoring), there's no
+downside to `SAC`'s approach here the way there might be in a noisier,
+ever-changing problem.
+
+### Why we expect this to be better — honestly, not yet measured
+
+The earlier `PPO` run is a real, visible symptom worth showing: the agent
+got noticeably faster (cycle time dropped a lot) but barely reduced
+vibration at all — a sign it wasn't extracting much signal from its
+practice. Switching to `SAC` is a direct, reasoned bet on fixing that,
+based on how well the algorithm's design matches this problem's shape —
+**not a proven result yet**, since a full training run with `SAC` hasn't
+happened. The next concrete step is exactly that: rerun the same training
+command and compare the two learning-curve plots side by side (§8).
+
 ## 1. What's being optimized
 
 One `movej` (or one re-timed path) at a time: given a commanded move the
@@ -54,7 +130,8 @@ decision-making across a trajectory — each move is scored independently.
   distill model, evaluated on a synthetic candidate trajectory built by
   `dynamics.py`, not a measurement.
 - **Reward**: `-OBJECTIVE(score, cycle_time)` (params) or
-  `-PATH_OBJECTIVE(max_score, cycle_time)` (path) — see §4.
+  `-PATH_OBJECTIVE(max_score, cycle_time)` (path) — see §4/§4a for the
+  weights (`SCORE_WEIGHT`/`PATH_SCORE_WEIGHT`) and how they were picked.
 
 ## 2a. The settling window (`_score_settled`) — fixed 2026-08-19
 
@@ -122,8 +199,11 @@ before/after conclusions.
 
 Wired in 2026-08-19 (previously `CurrentGapMetric`, which needed
 `actual_current` — a channel this project's distill models no longer
-predict; see `ModelReview.md` §1). Two-line change:
-`train_rla.py:546`/`run.py:213`, `metric = PositionGapMetric()`. Full
+predict; see `ModelReview.md` §1). Two-line change, one `metric =
+PositionGapMetric()` each in `train_rla.py main()` and `run.py main()`
+(line numbers not cited here — both files have grown enough since this was
+wired that a specific line number would already be stale; grep for
+`PositionGapMetric()` instead of trusting a number in this doc). Full
 reasoning for *why* position over current lives in `ModelReview.md` §1 —
 not repeated here.
 
@@ -135,6 +215,14 @@ exactly the case brief's `rms`/`peak` formulas, applied to this metric's
 per-row output (see `metrics.py`'s own docstring).
 
 ## 4. The objective weights — measured, not assumed
+
+**This section is the original, 2026-08-19 calibration — superseded for
+`GapEnv`/`SCORE_WEIGHT` by §4a's 2026-08-20 mean-matched recalibration,
+which is itself superseded by §4b's same-day std-matched recalibration. The
+code's actual current value is `SCORE_WEIGHT = 80000.0`, not the `2500.0`
+this section's table shows below; kept here as the historical record of how
+that starting point was reached. `PATH_SCORE_WEIGHT = 20.0` is still
+current — neither §4a nor §4b touched `PathEnv`.**
 
 `OBJECTIVE = SCORE_WEIGHT * score + CYCLE_WEIGHT * cycle_time` (and the path
 equivalent) were `1.0/1.0`, tuned for `CurrentGapMetric` whose amps-scale
@@ -225,6 +313,67 @@ least) as much to suppress the score signal as the missing-lag-features gap
 was. Both are real; a fresh run is needed with both fixes in place before
 attributing "flat score" to either one alone (see §7).
 
+## 4b. Mean-matching wasn't enough either — std-matched recalibration (2026-08-20)
+
+A real SAC run was trained with §4a's `SCORE_WEIGHT=10800`
+(`results/2026-08-20_14-00-58_rla_params/`, 20,000 episodes). Result:
+cycle_time converged fast (~3000 steps) to a good plateau, but **score
+stayed essentially flat again** — the exact same symptom §4a was supposed
+to fix, even though `tune_reward_weights.py` confirms the *mean* weighted
+ratio at that weight is ~1.18:1, right on the 1:1 target.
+
+The reason: **mean-matching balances the two terms' average size, not how
+much each one can actually move as the action changes** — and it's the
+*change* (the gradient) that PPO/SAC actually climb, not the average.
+Measured directly with an unbiased random sample (n=3000, `env.action_space.
+sample()` + `env.step()` across the full action range, not a trained
+policy's narrower visited range):
+
+```
+mean score: 0.0001788 rad   std: 0.0000187
+mean cycle: 2.8752 s        std: 1.4890
+score range: 0.000123 - 0.000205 rad
+cycle range: 0.744 - 8.852 s
+```
+
+cycle_time's range/std is roughly **12x** wider than score's. A
+mean-balanced reward can still be dominated end-to-end by whichever term
+has the bigger spread — which is exactly cycle_time here, and exactly why
+score kept flatlining even after §4a.
+
+**Fix**: `tune_reward_weights.py`'s `analyze()` now computes a *second*
+recommendation using standard deviation instead of mean:
+`recommended_std = target_ratio * cycle_weight * std(cycle_time) / std(score)`.
+This is the number that should track "does the agent get comparable
+learning signal from both terms," not "are the two terms similar size on
+average."
+
+**A methodological trap found and fixed while doing this**: the first
+attempt computed the std-matched number from `--episodes
+results/2026-08-20_14-00-58_rla_params/episodes.csv` (the completed run's
+own data) and got **8,460** — badly wrong. A *converged* policy's episodes
+are not a fair sample of the action space: the policy has already learned
+to avoid the high-cycle-time region, so its own data has a much narrower
+spread (5th–95th percentile cycle_time: 0.75s–1.99s) than what's actually
+reachable (0.585s–8.625s doing pure random sampling). Using a trained
+policy's own visited range to recalibrate the reward it was trained under
+is circular — it will always look more balanced than it is. The unbiased
+random sample above (not filtered through any trained policy) gives the
+real number: **79,626**, ~9x higher than the circular estimate.
+
+`SCORE_WEIGHT` changed **10800.0 → 80000.0** (rounded from 79,626, same
+rounding convention as prior calibrations). `tune_reward_weights.py` now
+prints a `[warn]` whenever `--episodes` is used, explaining this trap with
+the exact numbers, and its module docstring documents the same finding so
+it isn't rediscovered as a "mistake" later. `PATH_SCORE_WEIGHT` is
+unaffected — no path-mode training run exists to check it against.
+
+**Not yet verified by a training run.** Same honesty standard as every
+other weight change in this doc: the actual test is whether a fresh SAC
+run with `SCORE_WEIGHT=80000` finally moves score, not just cycle_time.
+That run hasn't happened yet in this environment (no live URSim access
+here) — it's the user's next step.
+
 ## 5. Verification so far
 
 **Offline, no live robot/URSim** (not available in this dev environment):
@@ -279,15 +428,17 @@ contributed needs a fresh run with the recalibrated weight; see §7.
 
 **Not yet done**: no run against a real robot or a fresh live URSim
 connection from this session; no comparison of `params` vs `path` mode
-results; no PPO hyperparameter tuning (default `MlpPolicy` throughout); no
-check of whether training for longer than 20k steps keeps improving cycle
-time or plateaus; no run yet with the recalibrated `SCORE_WEIGHT=10800`.
+results; no hyperparameter tuning for any algorithm (default `MlpPolicy`
+throughout); no check of whether training for longer than 20k steps keeps
+improving cycle time or plateaus; no run yet with the recalibrated
+`SCORE_WEIGHT=10800`; no run yet with the new default algorithm (`SAC`,
+§8) — every real run on record used `PPO`.
 
 ## 6. Plots each run produces
 
 | file | from | shows |
 |---|---|---|
-| `training_curve.png` | `train_rla.py`'s `log_training_run` | score / cycle_time / reward vs. timestep, raw (faint) + rolling mean + best-so-far reference line, one subplot each |
+| `training_curve.png` | `train_rla.py`'s `log_training_run` | score / cycle_time / reward vs. timestep, three subplots, each raw (faint) + rolling mean; score and cycle_time additionally get a best-so-far reference line, reward doesn't (there's no single "best reward" line drawn — read it off the score/cycle_time panels instead) |
 | `episodes.csv` (not a plot, 2026-08-20) | `train_rla.py`'s `log_training_run` | full per-episode `timestep`/`reward`/`score`/`cycle_time` — previously only aggregated into `log.json`'s summary; now saved raw so a completed run's actual distribution can be checked (`tune_reward_weights.py --episodes ...`) without retraining |
 | `baseline_vs_optimized.png` | `run.py`'s `run_params`/`run_path` (new, 2026-08-19) | mean score and cycle_time, baseline (script's original vel/acc) vs. the trained agent's choice, side by side with %-change titles |
 | `weight_sensitivity.png` (2026-08-20) | `tune_reward_weights.py` | score term's share of mean total weighted cost vs. candidate `SCORE_WEIGHT` (log scale) — where the current and recommended weights sit relative to a target balance |
@@ -344,14 +495,142 @@ asks for. Not yet generated from a real trained agent as of this writing
 - No real-robot or fresh-URSim validation of an optimized script from this
   pipeline (`send.py --script ...optimized.script`) — everything so far is
   the distill model's prediction, one layer removed from ground truth.
-- `path` mode is unexercised beyond the offline PPO smoke test — no real
+- `path` mode is unexercised beyond the offline smoke test — no real
   training run or baseline-vs-optimized comparison yet, and its
   `PATH_SCORE_WEIGHT=20.0` hasn't been rechecked against a trained policy
   the way `SCORE_WEIGHT` just was (§4a) — likely has the same kind of drift.
-- PPO hyperparameters are stable-baselines3 defaults throughout — untuned.
+- Agent hyperparameters are stable-baselines3 defaults throughout, for
+  every algorithm (`PPO`/`SAC`/`TD3`) — untuned.
+- **No real training run yet with `SAC`/`TD3`** (§8, new default) — the
+  off-policy recommendation is a structural argument from the environment's
+  shape, not yet a measured result. Needs a real run against live URSim,
+  compared against the `PPO` baseline already on record
+  (`results/2026-08-20_12-57-02_rla_params/`), ideally with the same
+  `seed`/scripts/`SCORE_WEIGHT=10800` held fixed so the only thing that
+  differs is the algorithm.
+
+## 8. Algorithm choice: PPO → SAC/TD3, off-policy (2026-08-20)
+
+**Why**: §1/§2 already establish that `GapEnv`/`PathEnv` are one-step
+episodes (`reset()` picks a move, `step(action)` scores exactly one
+candidate and terminates — no multi-step credit assignment, ever) and §2's
+"Scoring a candidate" note that nothing during training touches a real
+robot. Put together: every reward is **fully deterministic** for a fixed
+`(move, action)` — `dynamics.py`'s physics, the distill model's
+`.predict()`, and the metric's aggregation have zero randomness. `PPO` is
+**on-policy**: it can only train on the batch of transitions it just
+collected, then discards them — every environment/model query is used
+exactly once. Nothing about this environment makes a past `(move, action,
+reward)` sample go stale (no real robot noise, no sequential state to drift
+out from under it), so an **off-policy** algorithm's replay buffer — every
+sample reused many times across training — is a strictly better fit and
+should be far more sample-efficient here. `SAC` and `TD3` are both
+off-policy continuous-action actor-critics already available via
+`stable-baselines3` (no new dependency), sharing `PPO`'s
+`.learn()`/callback interface.
+
+**What changed**: `train_ppo` generalized to `train_agent(env, algo, ...)`,
+`algo` selected from `ALGOS = {"ppo": PPO, "sac": SAC, "td3": TD3}`.
+`train_rla.py`'s new `--algo` flag (`ppo`/`sac`/`td3`) **defaults to
+`sac`** — running `train_rla.py` with no extra flags now trains SAC, not
+PPO; pass `--algo ppo` to reproduce the original baseline. `log.json` and
+`_TrainCallback`'s docstring now record which algorithm produced a run.
+
+**Verified** (offline, no live robot — same limitation as everywhere else
+in this file): built `GapEnv` on a locally-labelled recording
+(`data/test-1.csv` run through `augment`/`add_score` the same way
+`build_dataset` does, minus the live URSim collection step), ran
+`train_agent(env, "sac", steps=64, ...)` and `train_agent(env, "td3",
+steps=64, ...)` — both completed 64/64 episodes with no exceptions,
+`_TrainCallback`'s `self.locals` populated the same `dones`/`rewards`/
+`infos` shape `PPO` uses (no callback changes needed), and both produced
+records structurally identical to `PPO`'s (`timestep`/`reward`/`score`/
+`cycle_time`). This confirms the integration works mechanically — it does
+**not** confirm SAC/TD3 actually train a *better* policy than PPO, which
+needs a real training run (§7).
+
+**A real bug this surfaced, caught and fixed the same day**: `run.py`
+hardcoded `PPO.load(path)` at its two agent-loading call sites
+(`search_agent`/`agent_paths`) — a leftover from when `PPO` was the only
+algorithm this project ever saved. Loading a `SAC`-saved `agent_params.zip`
+with `PPO.load()` doesn't silently misbehave, it raises immediately
+(`TypeError: SACPolicy() got multiple values for keyword argument
+'use_sde'`, verified directly), so this would have broken `run.py` for
+anyone using the new `--algo sac` default the moment they ran it. Fixed
+with a new `train_rla.load_agent(path)` helper: tries each `ALGOS` class's
+`.load()` in turn, keeps the first success — safe because a mismatched
+class raises a clear exception rather than loading with the wrong
+architecture (verified in both directions: `PPO.load()` on a `SAC` zip,
+and `TD3.load()` on a `SAC` zip, both fail loudly; `SAC.load()` on its own
+zip succeeds). `run.py` now imports and uses `load_agent` instead of
+`PPO.load` at both call sites. Verified end-to-end: trained one agent per
+algorithm, confirmed `load_agent` detects each correctly and `.predict()`
+works on all three.
 
 ## Changelog
 
+- **2026-08-20** — Added §4b: a real SAC run with §4a's mean-matched
+  `SCORE_WEIGHT=10800` still left score flat, root-caused to mean-matching
+  balancing average size, not gradient — cycle_time's std/range across the
+  action space is ~12x score's. Recalibrated to a *std*-matched weight via
+  `tune_reward_weights.py`'s new second recommendation
+  (`recommended_std = target_ratio * cycle_weight * std(cycle_time) /
+  std(score)`); `SCORE_WEIGHT` changed **10800.0 → 80000.0**. Also found and
+  fixed a circularity trap: computing the std-matched number from a
+  *converged* run's own `episodes.csv` gave 8,460 (badly understated,
+  because a trained policy's visited action range is narrower than the full
+  space) vs. 79,626 from unbiased random sampling — `tune_reward_weights.py`
+  now warns on `--episodes` use and documents this in its module docstring.
+  §4's top note and the `SCORE_WEIGHT` comment block in `train_rla.py` both
+  updated to point at §4b instead of §4a as current. Not yet verified by a
+  training run of its own.
+- **2026-08-20** — Full consistency audit against the actual current
+  `train_rla.py`/`run.py` (line-by-line read of both, not spot checks).
+  Found and fixed: (1) §3's `train_rla.py:546`/`run.py:213` citations were
+  stale — actual current lines are 738/262, and both files have grown
+  enough since this was written that any specific line number would drift
+  again soon, so replaced with a "grep for `PositionGapMetric()`" pointer
+  instead of a number that will just go stale again; (2) §6's
+  `training_curve.png` description claimed all three subplots (score,
+  cycle_time, reward) get a best-so-far reference line — checked
+  `log_training_run`'s plotting code directly: only score and cycle_time
+  do, reward doesn't, description corrected; (3) §4's weight table (the
+  2026-08-19 calibration) could read as still-current since §4a's
+  recalibration doesn't literally restate "this table is now stale" —
+  added an explicit note that the code's real value is
+  `SCORE_WEIGHT=10800.0`, not the `2500.0` shown there. Also fixed an
+  unrelated docstring formatting glitch in `train_rla.py`'s
+  `_TrainCallback` (an orphaned line break splitting "terminal output"
+  across two lines mid-sentence, left over from an earlier edit).
+- **2026-08-20** — Added §0, a plain-language, slide-ready summary (matching
+  `ModelReview.md` §0's convention) explaining what the RL policy does and
+  why `PPO` was swapped for `SAC` (§8), via a packing/studying analogy —
+  written for a non-RL-expert audience, explicit that the "why it's better"
+  case is a reasoned prediction from the environment's shape, not yet a
+  measured result. Also fixed two lingering PPO-only mentions in §5's
+  inline "not yet done" note that predated the algorithm swap (§8).
+- **2026-08-20** — Switched the default RL algorithm from `PPO` (on-policy)
+  to `SAC` (off-policy) — see §8. `GapEnv`/`PathEnv` are one-step,
+  deterministic contextual bandits; PPO's on-policy machinery discards
+  every sample after one use, while an off-policy replay buffer reuses
+  samples many times with nothing about this environment making them go
+  stale. Generalized `train_ppo` → `train_agent(env, algo, ...)`
+  (`ALGOS = {"ppo": PPO, "sac": SAC, "td3": TD3}`); new `--algo` flag on
+  `train_rla.py`, default `sac`, `--algo ppo` reproduces the original
+  baseline. `log.json`/`_TrainCallback` now record which algorithm produced
+  a run. Verified offline (no live robot) that `SAC`/`TD3` integrate
+  mechanically — same callback interface, same record shape as `PPO`, no
+  exceptions over 64 steps each — but this is a structural argument for why
+  off-policy should train a better policy here, not yet a measured result;
+  needs a real run against live URSim compared against the `PPO` baseline
+  already on record before trusting it. This also caught a real bug:
+  `run.py` hardcoded `PPO.load(path)` at both its agent-loading call sites,
+  which raises immediately on a `SAC`-saved `agent_params.zip` (verified —
+  not a silent misload) — would have broken `run.py` for anyone using the
+  new default the moment they ran it. Fixed with `train_rla.load_agent(path)`
+  (tries each `ALGOS` class's `.load()`, keeps the first success — safe
+  since a mismatched class fails loudly, verified in both directions);
+  `run.py` updated to use it. Verified end-to-end for all three algorithms.
 - **2026-08-20** — Recalibrated `SCORE_WEIGHT` against a *trained* policy's
   actual score/cycle_time distribution instead of only the pre-training
   random-action baseline (§4a). New tool `case 2/tune_reward_weights.py`:
