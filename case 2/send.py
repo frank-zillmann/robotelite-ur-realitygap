@@ -33,6 +33,7 @@ import csv
 import os
 import re
 import socket
+import time
 
 from record import build_recipe, open_stream, parse_registers, record_stream
 from utils import DT, load_script
@@ -338,6 +339,13 @@ def record_path(host, path, out, dt=0.008, hz=125.0, loop=None, port=SCRIPT_PORT
     print(f"  path is {len(rows)} rows -- sending as {len(chunks)} chunks of <= {chunk_size}")
     total_n, header, body, stop = 0, None, [], None
     for ci, chunk in enumerate(chunks):
+        if ci > 0:
+            # Brief settle between one chunk's program ending and the next
+            # being sent: back-to-back with no gap intermittently failed on
+            # real hardware (chunk 3/5 "never started" after chunks 1-2 ran
+            # fine) -- the controller likely needs a moment to be ready for a
+            # new program right after the previous one's done-flag fires.
+            time.sleep(0.3)
         tmp = f"{out}.chunk.csv"
         print(f"  chunk {ci + 1}/{len(chunks)} ({len(chunk)} rows)")
         n, stop = run_and_record(host, wrap_path(chunk, dt, None), tmp, hz, recipe,
