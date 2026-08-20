@@ -1,128 +1,158 @@
 {
+  "current": [
+    {
+      "component": "base",
+      "unit": "A",
+      "max_gap_display": 2.1960949999999997,
+      "rms_gap_display": 0.2562588823624152,
+      "pct_max_of_full_scale": 11.770588084274406,
+      "pct_rms_of_full_scale": 1.3734914688228521,
+      "source_file": "short_moves_v1.8_a3",
+      "row_index": 0
+    },
+    {
+      "component": "shoulder",
+      "unit": "A",
+      "max_gap_display": 1.997715,
+      "rms_gap_display": 0.3511872973230735,
+      "pct_max_of_full_scale": 10.707314744934191,
+      "pct_rms_of_full_scale": 1.8822869763008903,
+      "source_file": "T02_fast_r1",
+      "row_index": 2
+    },
+    {
+      "component": "elbow",
+      "unit": "A",
+      "max_gap_display": 1.6044529999999997,
+      "rms_gap_display": 0.3018210336109899,
+      "pct_max_of_full_scale": 8.599516579919504,
+      "pct_rms_of_full_scale": 1.6176946178580176,
+      "source_file": "reach_extend_v1_a3",
+      "row_index": 0
+    },
+    {
+      "component": "wrist1",
+      "unit": "A",
+      "max_gap_display": 0.41111899999999996,
+      "rms_gap_display": 0.10933553794373789,
+      "pct_max_of_full_scale": 2.2035077729418857,
+      "pct_rms_of_full_scale": 0.5860145303861144,
+      "source_file": "reach_extend_v0.3_a3",
+      "row_index": 1
+    },
+    {
+      "component": "wrist2",
+      "unit": "A",
+      "max_gap_display": 0.376694,
+      "rms_gap_display": 0.128973927561347,
+      "pct_max_of_full_scale": 2.0189973146961604,
+      "pct_rms_of_full_scale": 0.6912719964007304,
+      "source_file": "short_moves_v1.4_a3",
+      "row_index": 20
+    },
+    {
+      "component": "wrist3",
+      "unit": "A",
+      "max_gap_display": 0.319214,
+      "rms_gap_display": 0.09285594163141761,
+      "pct_max_of_full_scale": 1.71091710728979,
+      "pct_rms_of_full_scale": 0.49768750446626586,
+      "source_file": "workspace_sweep_v0.3_a1.5",
+      "row_index": 7776
+    }
+  ],
   "TCP speed (linear)": [
     {
       "component": "x",
       "unit": "m/s",
-      "max_gap_display": 0.35613500000000003,
-      "rms_gap_display": 0.00681394653241214,
-      "pct_max_of_full_scale": 12.076053007340205,
-      "pct_rms_of_full_scale": 0.23105165039827869,
-      "source_file": "test-6",
-      "row_index": 884
+      "max_gap_display": 0.043538,
+      "rms_gap_display": 0.0012648635588780781,
+      "pct_max_of_full_scale": 1.6993549258381337,
+      "pct_rms_of_full_scale": 0.049369564961473066,
+      "source_file": "T02_fast_r1",
+      "row_index": 2
     },
     {
       "component": "y",
       "unit": "m/s",
-      "max_gap_display": 0.631491,
-      "rms_gap_display": 0.010405996818862095,
-      "pct_max_of_full_scale": 21.413000097317795,
-      "pct_rms_of_full_scale": 0.35285318538978816,
-      "source_file": "test-6",
-      "row_index": 178265
+      "max_gap_display": 0.05053400000000002,
+      "rms_gap_display": 0.0014721265858742467,
+      "pct_max_of_full_scale": 1.9724195374685167,
+      "pct_rms_of_full_scale": 0.0574593588396958,
+      "source_file": "short_moves_v1.4_a3",
+      "row_index": 21
     },
     {
       "component": "z",
       "unit": "m/s",
-      "max_gap_display": 0.659913,
-      "rms_gap_display": 0.034850050718518925,
-      "pct_max_of_full_scale": 22.37675142356942,
-      "pct_rms_of_full_scale": 1.1817177749598582,
-      "source_file": "test-6",
-      "row_index": 178258
-    }
-  ],
-  "TCP speed (angular)": [
-    {
-      "component": "rx",
-      "unit": "deg/s",
-      "max_gap_display": 57.571773282996844,
-      "rms_gap_display": 1.5678927587457179,
-      "pct_max_of_full_scale": 12.623178492216486,
-      "pct_rms_of_full_scale": 0.3437759343109585,
-      "source_file": "test-6",
-      "row_index": 178258
-    },
-    {
-      "component": "ry",
-      "unit": "deg/s",
-      "max_gap_display": 23.229886254225068,
-      "rms_gap_display": 1.1854303488074476,
-      "pct_max_of_full_scale": 5.093381423211657,
-      "pct_rms_of_full_scale": 0.2599172828936689,
-      "source_file": "test-6",
-      "row_index": 178258
-    },
-    {
-      "component": "rz",
-      "unit": "deg/s",
-      "max_gap_display": 7.882524162291812,
-      "rms_gap_display": 0.29773596439045735,
-      "pct_max_of_full_scale": 1.7283210815951313,
-      "pct_rms_of_full_scale": 0.0652815435018561,
-      "source_file": "test-6",
-      "row_index": 178266
+      "max_gap_display": 0.032218000000000004,
+      "rms_gap_display": 0.0015948623028377892,
+      "pct_max_of_full_scale": 1.2575179613361431,
+      "pct_rms_of_full_scale": 0.06224992214527417,
+      "source_file": "T04_fast_r1",
+      "row_index": 2778
     }
   ],
   "qd (joint velocity)": [
     {
       "component": "base",
       "unit": "deg/s",
-      "max_gap_display": 8.12872412685953,
-      "rms_gap_display": 0.2904356375836712,
-      "pct_max_of_full_scale": 2.532244516798991,
-      "pct_rms_of_full_scale": 0.09047595161018307,
-      "source_file": "test-6",
-      "row_index": 178266
+      "max_gap_display": 3.8142373379654027,
+      "rms_gap_display": 0.11442830347941296,
+      "pct_max_of_full_scale": 1.8381953980363606,
+      "pct_rms_of_full_scale": 0.05514643222835361,
+      "source_file": "short_moves_v1.4_a3",
+      "row_index": 21
     },
     {
       "component": "shoulder",
       "unit": "deg/s",
-      "max_gap_display": 34.966983983259496,
-      "rms_gap_display": 1.443378085385585,
-      "pct_max_of_full_scale": 10.892847644814301,
-      "pct_rms_of_full_scale": 0.449638367023479,
-      "source_file": "test-6",
-      "row_index": 178264
+      "max_gap_display": 2.4237833607419215,
+      "rms_gap_display": 0.12016652723556412,
+      "pct_max_of_full_scale": 1.1680939136130173,
+      "pct_rms_of_full_scale": 0.05791185439977163,
+      "source_file": "T02_fast_r1",
+      "row_index": 2
     },
     {
       "component": "elbow",
       "unit": "deg/s",
-      "max_gap_display": 30.985385673336385,
-      "rms_gap_display": 0.6051514516929805,
-      "pct_max_of_full_scale": 9.652507791837376,
-      "pct_rms_of_full_scale": 0.18851561714575335,
-      "source_file": "test-6",
-      "row_index": 178258
+      "max_gap_display": 1.3915998928137436,
+      "rms_gap_display": 0.08194819363134719,
+      "pct_max_of_full_scale": 0.6706537355230827,
+      "pct_rms_of_full_scale": 0.03949329290842923,
+      "source_file": "T02_fast_r1",
+      "row_index": 2
     },
     {
       "component": "wrist1",
       "unit": "deg/s",
-      "max_gap_display": 7.9670927328531205,
-      "rms_gap_display": 0.36057011457375293,
-      "pct_max_of_full_scale": 2.4818934155895285,
-      "pct_rms_of_full_scale": 0.1123241090854587,
-      "source_file": "test-6",
-      "row_index": 69014
+      "max_gap_display": 1.177657452111895,
+      "rms_gap_display": 0.3124703065880187,
+      "pct_max_of_full_scale": 0.5675484552018055,
+      "pct_rms_of_full_scale": 0.150588814669696,
+      "source_file": "reach_extend_v0.6_a3",
+      "row_index": 2919
     },
     {
       "component": "wrist2",
       "unit": "deg/s",
-      "max_gap_display": 2.633657801098346,
-      "rms_gap_display": 0.1358587176463839,
-      "pct_max_of_full_scale": 0.8204320163750859,
-      "pct_rms_of_full_scale": 0.042322446604213936,
-      "source_file": "test-7",
-      "row_index": 5012
+      "max_gap_display": 1.595057205864699,
+      "rms_gap_display": 0.3887874993111254,
+      "pct_max_of_full_scale": 0.7687059182817482,
+      "pct_rms_of_full_scale": 0.18736835931373758,
+      "source_file": "workspace_sweep_v1.8_a3",
+      "row_index": 1789
     },
     {
       "component": "wrist3",
       "unit": "deg/s",
-      "max_gap_display": 0.5912351487954962,
-      "rms_gap_display": 0.03846333688984614,
-      "pct_max_of_full_scale": 0.18418043721390803,
-      "pct_rms_of_full_scale": 0.011982024782373129,
-      "source_file": "test-6",
-      "row_index": 59250
+      "max_gap_display": 1.190434410943311,
+      "rms_gap_display": 0.2407113112172822,
+      "pct_max_of_full_scale": 0.5737060549638949,
+      "pct_rms_of_full_scale": 0.11600600207299419,
+      "source_file": "short_moves_v1_a3",
+      "row_index": 632
     }
   ]
 }

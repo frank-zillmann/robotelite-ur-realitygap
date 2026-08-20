@@ -50,12 +50,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+import ur_style
 from analysis import Recording
 from common import segments
 from utils import JOINT_NAMES, N_JOINTS
 
+ur_style.apply()
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA_GLOB = os.path.join(HERE, "data", "test-*.csv")
+DATA_GLOB = os.path.join(HERE, "data", "*.csv")
 OUT_DIR = os.path.join(HERE, "bronze_tier")
 
 # A joint's move is "meaningful" above this travel (rad); below it, the joint
@@ -143,7 +146,7 @@ def plot_param_sweep_trajectories(rec, segs_sorted: list, param: str,
     idx = np.unique(np.linspace(0, len(segs_sorted) - 1,
                                 min(n_show, len(segs_sorted))).round().astype(int))
     vals = [getattr(s, param) for s in segs_sorted]
-    cmap, norm = plt.get_cmap("viridis"), plt.Normalize(min(vals), max(vals))
+    cmap, norm = ur_style.sequential_cmap(), plt.Normalize(min(vals), max(vals))
 
     fig, ax = plt.subplots(figsize=(8, 5))
     for i in idx:
@@ -180,11 +183,11 @@ def plot_move_detail(rec, seg, out_path: str, title: str):
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
 
-    ax1.axvspan(t_stop, t[-1] if len(t) else t_stop, color="tab:red", alpha=0.08,
+    ax1.axvspan(t_stop, t[-1] if len(t) else t_stop, color=ur_style.NAVY, alpha=0.08,
                label="settle window")
     ax1.plot(t, target, label="target", lw=2)
     ax1.plot(t, actual, label="actual", lw=1.2)
-    ax1.axvline(t_stop, color="grey", ls="--", lw=0.8, label="nominal stop")
+    ax1.axvline(t_stop, color=ur_style.GRAY, ls="--", lw=0.8, label="nominal stop")
     ax1.set_xlabel("time since move start (s)")
     ax1.set_ylabel(f"{JOINT_NAMES[seg.joint]} position (rad)")
     ax1.set_title("full move")
@@ -193,8 +196,8 @@ def plot_move_detail(rec, seg, out_path: str, title: str):
 
     t_settle = t[t >= t_stop]
     dev_mrad = (actual[t >= t_stop] - seg.dest) * 1e3
-    ax2.axhline(0, color="grey", lw=0.8)
-    ax2.plot(t_settle, dev_mrad, color="tab:red", lw=1.4)
+    ax2.axhline(0, color=ur_style.GRAY, lw=0.8)
+    ax2.plot(t_settle, dev_mrad, color=ur_style.NAVY, lw=1.4)
     ax2.set_xlabel("time since move start (s)")
     ax2.set_ylabel("actual - dest (mrad)")
     ax2.set_title("settle window, zoomed")
@@ -258,7 +261,7 @@ def plot_heatmap(df_combo: pd.DataFrame, metric: str, out_path: str, title: str,
                           columns=pd.IntervalIndex.from_breaks(vel_edges))
 
     fig, ax = plt.subplots(figsize=(7.5, 6))
-    im = ax.imshow(pivot.values, origin="lower", aspect="auto", cmap="magma")
+    im = ax.imshow(pivot.values, origin="lower", aspect="auto", cmap=ur_style.sequential_cmap())
     ax.set_xticks(range(len(pivot.columns)))
     ax.set_xticklabels([f"{iv.mid:.0f}" for iv in pivot.columns], rotation=45, fontsize=7)
     ax.set_yticks(range(len(pivot.index)))
@@ -317,7 +320,7 @@ def plot_per_joint_overshoot(df: pd.DataFrame, out_path: str):
     sub = df[df["dist_rad"] > MOVED_EPS_RAD]
     means = sub.groupby("joint_name")["peak_overshoot_mrad"].mean().reindex(JOINT_NAMES)
     fig, ax = plt.subplots(figsize=(7, 4))
-    bars = ax.bar(means.index, means.values, color="darkorange", edgecolor="black")
+    bars = ax.bar(means.index, means.values, color=ur_style.BLUE, edgecolor=ur_style.NAVY)
     for bar, v in zip(bars, means.values):
         if not np.isnan(v):
             ax.text(bar.get_x() + bar.get_width() / 2, v, f"{v:.2f}",
@@ -361,7 +364,7 @@ def plot_metric_by_joint(df: pd.DataFrame, deg_col: str, pct_col: str, out_path:
     pct = sub.groupby("joint_name")[pct_col].mean().reindex(deg.index)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    bars = ax.bar(deg.index, deg.values, color="darkorange", edgecolor="black")
+    bars = ax.bar(deg.index, deg.values, color=ur_style.BLUE, edgecolor=ur_style.NAVY)
     for bar, d, p in zip(bars, deg.values, pct.values):
         ax.text(bar.get_x() + bar.get_width() / 2, d, f"{d:.2f}°\n({p:.2f}%)",
                 ha="center", va="bottom", fontsize=9)
@@ -385,7 +388,7 @@ def plot_duration_by_joint(df: pd.DataFrame, out_path: str):
     dur = sub.groupby("joint_name")["duration_s"].mean().reindex(JOINT_NAMES).dropna()
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    bars = ax.bar(dur.index, dur.values, color="steelblue", edgecolor="black")
+    bars = ax.bar(dur.index, dur.values, color=ur_style.BLUE, edgecolor=ur_style.NAVY)
     for bar, d in zip(bars, dur.values):
         ax.text(bar.get_x() + bar.get_width() / 2, d, f"{d:.2f}s",
                 ha="center", va="bottom", fontsize=9)
@@ -425,7 +428,7 @@ def plot_heatmap_labeled(df_combo: pd.DataFrame, deg_col: str, pct_col: str, out
     pct = pct.reindex(index=acc_index, columns=vel_cols)
 
     fig, ax = plt.subplots(figsize=(8.5, 6.5))
-    im = ax.imshow(deg.values, origin="lower", aspect="auto", cmap="magma")
+    im = ax.imshow(deg.values, origin="lower", aspect="auto", cmap=ur_style.sequential_cmap())
     vmin, vmax = np.nanmin(deg.values), np.nanmax(deg.values)
     for i in range(deg.shape[0]):
         for j in range(deg.shape[1]):

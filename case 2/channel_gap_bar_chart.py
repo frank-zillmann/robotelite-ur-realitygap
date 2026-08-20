@@ -11,6 +11,15 @@ Three related outputs, all under ``bronze_tier/channel_gap/``:
                          with the worst full-run peak %FS -- the other two
                          folders say *which channel*; this says *where in
                          it*
+  worst_files/           full per-channel breakdown (same chart as full_run/,
+                         same %FS denominators) for the N individual
+                         recordings with the worst full-run peak %FS on their
+                         own worst channel -- full_run/ pools every file
+                         together, which dilutes RMS (and can bury which
+                         *file* is actually the problem) once you have many
+                         calm recordings alongside a few bad ones; this
+                         folder answers "which recordings actually show the
+                         gap" instead of only the all-files-pooled average.
 
 Each channel's bar height is the gap as a percentage of that channel's own
 full-scale range (pooled target+actual, over the *whole run*, computed once
@@ -37,12 +46,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+import ur_style
 from analysis import Recording
 from common import segments
 from utils import JOINT_NAMES
 
+ur_style.apply()
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA_GLOB = os.path.join(HERE, "data", "test-*.csv")
+DATA_GLOB = os.path.join(HERE, "data", "*.csv")
 OUT_DIR = os.path.join(HERE, "bronze_tier", "channel_gap")
 
 RAD2DEG = 180.0 / np.pi
@@ -252,6 +264,31 @@ def component_breakdown_rows(recs: dict, target_base: str, actual_base: str, col
     return rows
 
 
+def rank_worst_files(recs: dict, fs_ranges: dict) -> list[tuple[str, float, list[dict]]]:
+    """Per-file channel-gap rows, ranked worst-first by each file's own worst
+    peak %FS across channels.
+
+    ``fs_ranges`` (the full-run, all-files %FS denominators from
+    ``collect_channel_rows``) is passed through to every per-file call so
+    each file's percentage is on the *same* scale as the pooled chart and as
+    every other file -- computing it per-file instead would use that file's
+    own (much narrower) target/actual range as the denominator, making the
+    percentages incomparable across files.
+
+    Ranked by peak, not RMS: ``channel_gap_stats`` computes peak as the
+    single worst sample across whatever's pooled into one call, so a
+    per-file peak is already an honest "how bad does this file get," not
+    diluted the way pooling every file's RMS together is.
+    """
+    ranked = []
+    for name, rec in recs.items():
+        rows = collect_channel_rows({name: rec}, fs_ranges=fs_ranges)
+        worst_pct = max((r["pct_max_of_full_scale"] for r in rows
+                         if np.isfinite(r["pct_max_of_full_scale"])), default=0.0)
+        ranked.append((name, worst_pct, rows))
+    return sorted(ranked, key=lambda t: t[1], reverse=True)
+
+
 # --- plotting ----------------------------------------------------------------
 
 def _grouped_bar(ax, labels: list[str], peak_pct: list[float], rms_pct: list[float]):
@@ -265,8 +302,8 @@ def _grouped_bar(ax, labels: list[str], peak_pct: list[float], rms_pct: list[flo
     """
     x = np.arange(len(labels))
     w = 0.34
-    bars_peak = ax.bar(x - w / 2, peak_pct, width=w, color="#2a78d6", label="peak")
-    bars_rms = ax.bar(x + w / 2, rms_pct, width=w, color="#eb6834", label="RMS")
+    bars_peak = ax.bar(x - w / 2, peak_pct, width=w, color=ur_style.BLUE, label="peak")
+    bars_rms = ax.bar(x + w / 2, rms_pct, width=w, color=ur_style.MID_BLUE, label="RMS")
     ax.set_yscale("log")
     all_pct = [v for v in peak_pct + rms_pct if v > 0]
     floor = min(all_pct) * 0.5 if all_pct else 1e-3
@@ -274,10 +311,7 @@ def _grouped_bar(ax, labels: list[str], peak_pct: list[float], rms_pct: list[flo
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.legend(frameon=False, loc="upper right")
-    ax.grid(alpha=0.3, axis="y", color="#e1e0d9", which="major")
-    ax.set_axisbelow(True)
-    for spine in ("top", "right"):
-        ax.spines[spine].set_visible(False)
+    ax.grid(alpha=0.3, axis="y", which="major")
     return bars_peak, bars_rms
 
 
@@ -296,11 +330,11 @@ def plot_channel_gap_bar(rows: list[dict], out_path: str, title: str):
     for bar, r in zip(bars_peak, rows):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
                 f"{r['max_gap_display']:.3g} {r['unit']}\n({r['pct_max_of_full_scale']:.2f}%)",
-                ha="center", va="bottom", fontsize=7.3, color="#0b0b0b")
+                ha="center", va="bottom", fontsize=7.3, color=ur_style.NAVY)
     for bar, r in zip(bars_rms, rows):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
                 f"{r['rms_gap_display']:.3g} {r['unit']}\n({r['pct_rms_of_full_scale']:.2f}%)",
-                ha="center", va="bottom", fontsize=7.3, color="#0b0b0b")
+                ha="center", va="bottom", fontsize=7.3, color=ur_style.NAVY)
 
     ax.set_xticklabels(names, rotation=15)
     ax.set_ylabel("reality gap (% of channel's full-scale range, log scale)")
@@ -350,6 +384,9 @@ def main():
                     "and worst-3-by-component drill-down.")
     ap.add_argument("--data-glob", default=DATA_GLOB, help="glob of recorded CSVs")
     ap.add_argument("--out", default=OUT_DIR, help="output directory (subfolders created under it)")
+    ap.add_argument("--n-worst-files", type=int, default=3,
+                    help="how many individual recordings to break out in worst_files/ "
+                        "(default: %(default)s)")
     args = ap.parse_args()
 
     paths = sorted(glob.glob(args.data_glob))
@@ -379,6 +416,28 @@ def main():
     with open(os.path.join(settle_dir, "channel_gap_summary.json"), "w") as f:
         json.dump(sorted(settle_rows, key=lambda r: r["pct_max_of_full_scale"], reverse=True), f, indent=2)
     print(f"[results] log  -> {settle_dir}/channel_gap_summary.json")
+
+    # --- worst N individual files (own worst-channel peak %FS) -------------
+    # full_run/ pools every recording together, which both dilutes RMS and
+    # can hide which *file* actually has the gap once many calm recordings
+    # sit alongside a few bad ones -- this breaks out the worst files on
+    # their own, at the same %FS scale as every other chart (fs_ranges).
+    files_dir = os.path.join(args.out, "worst_files")
+    os.makedirs(files_dir, exist_ok=True)
+    files_ranked = rank_worst_files(recs, fs_ranges)[:args.n_worst_files]
+
+    worst_files_summary = {}
+    for name, worst_pct, rows in files_ranked:
+        out_path = os.path.join(files_dir, f"{_slug(name)}_channel_gap_bar_chart.png")
+        plot_channel_gap_bar(rows, out_path,
+                            f"{name}: peak & RMS reality gap by channel "
+                            f"(worst file, {worst_pct:.2f}% peak)")
+        worst_files_summary[name] = sorted(rows, key=lambda r: r["pct_max_of_full_scale"], reverse=True)
+    with open(os.path.join(files_dir, "worst_files_summary.json"), "w") as f:
+        json.dump(worst_files_summary, f, indent=2)
+    print(f"[results] log  -> {files_dir}/worst_files_summary.json")
+    print(f"[results] worst {args.n_worst_files} files (own worst-channel peak %FS): "
+         f"{[(n, round(p, 2)) for n, p, _ in files_ranked]}")
 
     # --- worst 3 channels (full-run peak %FS), broken down by component ----
     comp_dir = os.path.join(args.out, "worst_channels_by_component")

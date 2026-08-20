@@ -3,7 +3,7 @@
 Load a CSV from ``record.py``, print per-joint numbers (range of motion, current
 gap, position lag), and plot one joint's target vs actual current.
 
-    python analysis.py --csv data/test-4.csv --joint 1
+    python analysis.py --csv data/T01_fast_r1.csv --joint 1
 
 ``--joint`` selects the joint (0=base ... 5=wrist3).
 
@@ -83,8 +83,9 @@ class Recording:
         ax_c.set_title(f"{name} joint")
         ax_c.legend(loc="best")
 
-        ax_g.plot(self.t, gap, color="tab:red", lw=1)
-        ax_g.axhline(0, color="grey", lw=0.8)
+        import ur_style
+        ax_g.plot(self.t, gap, color=ur_style.NAVY, lw=1)
+        ax_g.axhline(0, color=ur_style.GRAY, lw=0.8)
         ax_g.set_ylabel("actual - target (A)")
         ax_g.set_xlabel("time (s)")
 
@@ -113,6 +114,7 @@ def log_analysis(rec, joint: int, stats: list, csv_path: str,
                  results_dir: str, dt_str: str):
     """Save log.json and plots to results/<datetime>_analysis_<csv_base>/."""
     import matplotlib.pyplot as plt
+    import ur_style
 
     base    = os.path.splitext(os.path.basename(csv_path))[0]
     run_dir = os.path.join(results_dir, f"{dt_str}_analysis_{base}")
@@ -145,11 +147,11 @@ def log_analysis(rec, joint: int, stats: list, csv_path: str,
 
     fig2, axes = plt.subplots(1, 3, figsize=(14, 4))
     for ax, vals, title, ylabel, color in [
-        (axes[0], gap_rms, "Current gap RMS",     "A",    "steelblue"),
-        (axes[1], gap_max, "Current gap max |A|", "A",    "darkorange"),
-        (axes[2], pos_err, "Position error RMS",  "mrad", "purple"),
+        (axes[0], gap_rms, "Current gap RMS",     "A",    ur_style.BLUE),
+        (axes[1], gap_max, "Current gap max |A|", "A",    ur_style.MID_BLUE),
+        (axes[2], pos_err, "Position error RMS",  "mrad", ur_style.LIGHT_BLUE),
     ]:
-        bars = ax.bar(names, vals, color=color, edgecolor="black")
+        bars = ax.bar(names, vals, color=color, edgecolor=ur_style.NAVY)
         for bar, v in zip(bars, vals):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
                     f"{v:.3f}", ha="center", va="bottom", fontsize=7)
@@ -168,8 +170,11 @@ def log_analysis(rec, joint: int, stats: list, csv_path: str,
 
 
 def main():
+    import ur_style
+    ur_style.apply()
+
     ap = argparse.ArgumentParser(description="Per-joint stats and a plot for a recorded run.")
-    ap.add_argument("--csv", default="data/test-4.csv", help="recorded run CSV")
+    ap.add_argument("--csv", default="data/T01_fast_r1.csv", help="recorded run CSV")
     ap.add_argument("--joint", type=int, default=1,
                     help="joint index 0..5 to plot (default 1 = shoulder)")
     ap.add_argument("--no-plot", action="store_true", help="save results but do not show plots")
