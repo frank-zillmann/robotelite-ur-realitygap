@@ -1,1 +1,17 @@
-[]
+[
+  {
+    "index": 1,
+    "file": "triangleOptimized2",
+    "cycle_time": 0.7274360000000001
+  },
+  {
+    "index": 2,
+    "file": "triangleOptimized2",
+    "cycle_time": 1.1016749999999997
+  },
+  {
+    "index": 3,
+    "file": "triangleOptimized2",
+    "cycle_time": 0.7370830000000002
+  }
+]

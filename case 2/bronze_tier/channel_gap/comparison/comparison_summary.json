@@ -2,90 +2,197 @@
   "peak": [
     {
       "channel": "current",
-      "baseline_pct": 19.23012789748221,
-      "optimized_pct": 24.907815215689233,
-      "pct_change": 29.524958692294508
-    },
-    {
-      "channel": "TCP speed (angular)",
-      "baseline_pct": 1.5124427820326807,
-      "optimized_pct": 3.8809986008094737,
-      "pct_change": 156.60465618365544
+      "baseline_pct": 16.642203912631935,
+      "optimized_pct": 17.949181405272796,
+      "pct_change": 7.853391891495969
     },
     {
       "channel": "qd (joint velocity)",
-      "baseline_pct": 1.5118347540840986,
-      "optimized_pct": 3.8920592091305224,
-      "pct_change": 157.43945881760166
+      "baseline_pct": 1.794933374140863,
+      "optimized_pct": 1.5700038293669265,
+      "pct_change": -12.531358991617061
+    },
+    {
+      "channel": "TCP speed (angular)",
+      "baseline_pct": 1.7930271815719003,
+      "optimized_pct": 1.568230945472553,
+      "pct_change": -12.537246418220743
     },
     {
       "channel": "TCP speed (linear)",
-      "baseline_pct": 1.4560226747762617,
-      "optimized_pct": 3.2935018724981573,
-      "pct_change": 126.19852901701891
+      "baseline_pct": 1.7292810810127353,
+      "optimized_pct": 1.526232935315416,
+      "pct_change": -11.741766444261694
     },
     {
       "channel": "TCP position",
-      "baseline_pct": 0.16214172865289514,
-      "optimized_pct": 0.086622502186752,
-      "pct_change": -46.57605854678587
-    },
-    {
-      "channel": "TCP orientation",
-      "baseline_pct": 0.09156209601297888,
-      "optimized_pct": 0.04663680822144834,
-      "pct_change": -49.06537721150726
+      "baseline_pct": 0.0679738207559167,
+      "optimized_pct": 0.05398918182234253,
+      "pct_change": -20.573566084788443
     },
     {
       "channel": "q (joint position)",
-      "baseline_pct": 0.050906211365821706,
-      "optimized_pct": 0.03585655760886381,
-      "pct_change": -29.56349206348951
+      "baseline_pct": 0.038920842212009844,
+      "optimized_pct": 0.032658492167517136,
+      "pct_change": -16.089965397923294
+    },
+    {
+      "channel": "TCP orientation",
+      "baseline_pct": 0.03600766425755611,
+      "optimized_pct": 0.033526726384421286,
+      "pct_change": -6.890027232505662
     }
   ],
   "rms": [
     {
       "channel": "current",
-      "baseline_pct": 2.6458684234081806,
-      "optimized_pct": 2.846683601486681,
-      "pct_change": 7.5897643398241055
+      "baseline_pct": 2.625660553896633,
+      "optimized_pct": 2.693518799538114,
+      "pct_change": 2.584425680645411
     },
     {
       "channel": "TCP speed (angular)",
-      "baseline_pct": 0.19128619940824634,
-      "optimized_pct": 0.26787634895466844,
-      "pct_change": 40.03955841213723
+      "baseline_pct": 0.12739931568005486,
+      "optimized_pct": 0.12350423822922471,
+      "pct_change": -3.0573770589255576
     },
     {
       "channel": "TCP speed (linear)",
-      "baseline_pct": 0.1874629991590403,
-      "optimized_pct": 0.25956167424246457,
-      "pct_change": 38.46021636635453
+      "baseline_pct": 0.12181734629034484,
+      "optimized_pct": 0.11917988281520014,
+      "pct_change": -2.1650968071972665
     },
     {
       "channel": "qd (joint velocity)",
-      "baseline_pct": 0.13693006084003126,
-      "optimized_pct": 0.18811692235127914,
-      "pct_change": 37.38175620256753
+      "baseline_pct": 0.09098469151270408,
+      "optimized_pct": 0.08844949610555401,
+      "pct_change": -2.786397760986068
     },
     {
       "channel": "TCP position",
-      "baseline_pct": 0.009722650833815709,
-      "optimized_pct": 0.011267131762992152,
-      "pct_change": 15.885389237723999
+      "baseline_pct": 0.012120674612346971,
+      "optimized_pct": 0.01157764750568653,
+      "pct_change": -4.480172300865788
     },
     {
       "channel": "TCP orientation",
-      "baseline_pct": 0.009323261811243001,
-      "optimized_pct": 0.010856008155671004,
-      "pct_change": 16.440022552832865
+      "baseline_pct": 0.011742329762247681,
+      "optimized_pct": 0.011200217767514831,
+      "pct_change": -4.6167328435603405
     },
     {
       "channel": "q (joint position)",
-      "baseline_pct": 0.004336782512290688,
-      "optimized_pct": 0.005060026989083254,
-      "pct_change": 16.676982872506287
+      "baseline_pct": 0.005463601649399068,
+      "optimized_pct": 0.005265413116652517,
+      "pct_change": -3.6274337966851857
     }
   ],
-  "cycle_time": []
+  "peak_settle": [
+    {
+      "channel": "current",
+      "baseline_pct": 14.566613731759265,
+      "optimized_pct": 16.119313222403004,
+      "pct_change": 10.659302973472986
+    },
+    {
+      "channel": "qd (joint velocity)",
+      "baseline_pct": 0.5713664396625764,
+      "optimized_pct": 1.1543747405292726,
+      "pct_change": 102.0375472544371
+    },
+    {
+      "channel": "TCP speed (angular)",
+      "baseline_pct": 0.5710475768078203,
+      "optimized_pct": 1.1538783846141742,
+      "pct_change": 102.06344120474209
+    },
+    {
+      "channel": "TCP speed (linear)",
+      "baseline_pct": 0.5562486565314698,
+      "optimized_pct": 1.1057536278918818,
+      "pct_change": 98.78764917598029
+    },
+    {
+      "channel": "TCP position",
+      "baseline_pct": 0.01551023590814925,
+      "optimized_pct": 0.01491694819581287,
+      "pct_change": -3.8251366120399166
+    },
+    {
+      "channel": "TCP orientation",
+      "baseline_pct": 0.011596700399807897,
+      "optimized_pct": 0.010000584677500908,
+      "pct_change": -13.763533309297438
+    },
+    {
+      "channel": "q (joint position)",
+      "baseline_pct": 0.009494530712614812,
+      "optimized_pct": 0.008720154094213662,
+      "pct_change": -8.156028368756365
+    }
+  ],
+  "rms_settle": [
+    {
+      "channel": "current",
+      "baseline_pct": 2.878999293264041,
+      "optimized_pct": 2.9180237087977785,
+      "pct_change": 1.3554854155415228
+    },
+    {
+      "channel": "TCP speed (angular)",
+      "baseline_pct": 0.048887728541773694,
+      "optimized_pct": 0.06184811600217869,
+      "pct_change": 26.51051265212818
+    },
+    {
+      "channel": "TCP speed (linear)",
+      "baseline_pct": 0.04847045015877478,
+      "optimized_pct": 0.06115709191382612,
+      "pct_change": 26.173971385645633
+    },
+    {
+      "channel": "qd (joint velocity)",
+      "baseline_pct": 0.039173191770058534,
+      "optimized_pct": 0.0462367705743639,
+      "pct_change": 18.03166524128961
+    },
+    {
+      "channel": "TCP orientation",
+      "baseline_pct": 0.0032693611873702054,
+      "optimized_pct": 0.003397459668125363,
+      "pct_change": 3.9181501649316655
+    },
+    {
+      "channel": "TCP position",
+      "baseline_pct": 0.0032376123903689225,
+      "optimized_pct": 0.003373205697574527,
+      "pct_change": 4.188064871785156
+    },
+    {
+      "channel": "q (joint position)",
+      "baseline_pct": 0.0016792564667363382,
+      "optimized_pct": 0.0017284115778172272,
+      "pct_change": 2.927194985077101
+    }
+  ],
+  "cycle_time": [
+    {
+      "move": "move 1",
+      "baseline_s": 0.747104,
+      "optimized_s": 0.7274360000000001,
+      "pct_change": -2.6325652118045024
+    },
+    {
+      "move": "move 2",
+      "baseline_s": 1.070195,
+      "optimized_s": 1.1016749999999997,
+      "pct_change": 2.9415200033638476
+    },
+    {
+      "move": "move 3",
+      "baseline_s": 0.7449769999999996,
+      "optimized_s": 0.7370830000000002,
+      "pct_change": -1.0596300288464484
+    }
+  ]
 }

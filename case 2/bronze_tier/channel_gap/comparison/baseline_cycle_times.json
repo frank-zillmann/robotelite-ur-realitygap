@@ -1,1 +1,17 @@
-[]
+[
+  {
+    "index": 1,
+    "file": "triangle",
+    "cycle_time": 0.747104
+  },
+  {
+    "index": 2,
+    "file": "triangle",
+    "cycle_time": 1.070195
+  },
+  {
+    "index": 3,
+    "file": "triangle",
+    "cycle_time": 0.7449769999999996
+  }
+]

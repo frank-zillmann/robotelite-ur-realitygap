@@ -4,17 +4,21 @@ Takes two sets of recorded CSVs -- baseline and optimized, each anything
 ``channel_gap_bar_chart.py --data-glob`` itself would accept: individual
 file paths, a directory (globbed for ``*.csv``), or a glob pattern -- computes
 each run's own peak/RMS-per-channel gap (reusing
-``channel_gap_bar_chart.py``'s ``load_recordings``/``collect_channel_rows``
-directly, not a reimplementation), and produces two grouped-bar charts: one
-for peak %FS, one for RMS %FS, each with a baseline bar and an optimized bar
-side by side per channel.
+``channel_gap_bar_chart.py``'s ``load_recordings``/``collect_channel_rows``/
+``settle_masks`` directly, not a reimplementation), and produces, for both the
+**full run** and the **settling window only** (each move's post-motion
+ringing window, ``common.segments``' ``i1:i2`` -- same scope
+``channel_gap_bar_chart.py``'s own ``settling_window/`` output uses), two
+grouped-bar charts: one for peak %FS, one for RMS %FS, each with a baseline
+bar and an optimized bar side by side per channel.
 
-Both runs' percentages share the *baseline's* full-scale range per channel
-(computed once, reused for optimized) -- the same "shared denominator" fix
-``channel_gap_bar_chart.py`` uses to keep its own full-run/settling-window
-numbers comparable. Without it, an optimized trajectory that happens to
-cover a different range of motion would shift %FS for reasons having
-nothing to do with the gap actually shrinking.
+Both runs' percentages share the *baseline's full-run* full-scale range per
+channel (computed once, reused for optimized *and* for both scopes) -- the
+same "shared denominator" fix ``channel_gap_bar_chart.py`` uses to keep its
+own full-run/settling-window numbers comparable. Without it, an optimized
+trajectory that happens to cover a different range of motion (or the
+settling window's inherently narrower range) would shift %FS for reasons
+having nothing to do with the gap actually shrinking.
 
 A third chart compares **cycle time** (move duration, ``i1 - i0`` per
 ``common.segments`` -- the motion itself, not the post-move settle window,
@@ -23,21 +27,30 @@ comparable to ``run.py``'s "predicted cycle time" output) move by move.
 Baseline and optimized are expected to be the *same* script(s) run at
 different speed settings (e.g. ``foo.script`` vs ``foo.optimized.script``),
 so their segments pair up 1:1 in recording order; a segment-count mismatch
-is reported as a warning and only the first N of each are paired.
+is reported as a warning and only the first N of each are paired. Cycle time
+has no settling-window variant -- it's defined as the motion itself, which is
+the settling window's complement, not something to further restrict.
 
     python compare_channel_gap.py --baseline data/*.csv --optimized data_optimized/*.csv
     python compare_channel_gap.py --baseline data --optimized data_optimized
 
 Outputs -> bronze_tier/channel_gap/comparison/ (or --out):
-    peak_gap_comparison.png            grouped bars, baseline vs optimized peak %FS
-    rms_gap_comparison.png             same, RMS %FS
+    full_run/peak_gap_comparison.png          grouped bars, baseline vs optimized
+    full_run/rms_gap_comparison.png           peak/RMS %FS, whole recordings
+    full_run/baseline_channel_gap_summary.json  each run's own full per-channel
+    full_run/optimized_channel_gap_summary.json breakdown, same shape
+                                               channel_gap_bar_chart.py writes
+    settling_window/peak_gap_comparison.png   same, but rows restricted to each
+    settling_window/rms_gap_comparison.png    move's post-motion settle window
+    settling_window/baseline_channel_gap_summary.json
+    settling_window/optimized_channel_gap_summary.json
     cycle_time_comparison.png          grouped bars, baseline vs optimized cycle
                                        time (s), move by move + total in the title
-    comparison_summary.json            per-channel and per-move baseline/optimized
-                                       values and % change, for a table slide
-    baseline_channel_gap_summary.json  each run's own full per-channel
-    optimized_channel_gap_summary.json breakdown, same shape
-                                       channel_gap_bar_chart.py writes
+    baseline_cycle_times.json          per-move cycle time, each run
+    optimized_cycle_times.json
+    comparison_summary.json            per-channel (full-run + settle-window) and
+                                       per-move baseline/optimized values and
+                                       % change, for a table slide
 """
 from __future__ import annotations
 
@@ -52,7 +65,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import ur_style
-from channel_gap_bar_chart import collect_channel_rows, load_recordings
+from channel_gap_bar_chart import collect_channel_rows, load_recordings, settle_masks
 from common import segments
 
 ur_style.apply()
@@ -92,6 +105,22 @@ def _rows_by_channel(csvs: list[str], fs_ranges: dict | None = None) -> tuple[di
     recs = load_recordings(csvs)
     rows = collect_channel_rows(recs, fs_ranges=fs_ranges)
     return {r["name"]: r for r in rows}, rows, recs
+
+
+def _settle_rows_by_channel(recs: dict, fs_ranges: dict) -> tuple[dict, list[dict]]:
+    """Settle-window-only per-channel gap rows for already-loaded ``recs``.
+
+    Takes ``recs`` (not CSV paths) so it reuses each run's already-loaded
+    ``Recording`` objects instead of re-reading every CSV a second time.
+    ``fs_ranges`` is required (not optional, unlike ``_rows_by_channel``) --
+    it must be the *full-run* denominator, same as
+    ``channel_gap_bar_chart.py``'s own settling-window output reuses, so a
+    settle-window %FS is never computed against the settle window's own
+    (narrower, not comparable) range.
+    """
+    masks = settle_masks(recs)
+    rows = collect_channel_rows(recs, masks=masks, fs_ranges=fs_ranges)
+    return {r["name"]: r for r in rows}, rows
 
 
 def _segment_cycle_times(recs: dict) -> list[dict]:
@@ -286,9 +315,37 @@ def plot_cycle_time_comparison(baseline_segs: list[dict], optimized_segs: list[d
            for i in range(n)]
 
 
+def _write_scope_comparison(baseline: dict, optimized: dict, baseline_rows: list[dict],
+                            optimized_rows: list[dict], out_dir: str, scope_title: str,
+                            baseline_label: str, optimized_label: str) -> tuple[list[dict], list[dict]]:
+    """Summaries + peak/RMS grouped-bar charts for one scope (full run, or
+    settle window only) -- the block ``main`` runs once per scope, out of
+    ``full_run/`` and ``settling_window/`` respectively, so the two scopes
+    stay structurally identical and only differ in which rows were pooled.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "baseline_channel_gap_summary.json"), "w") as f:
+        json.dump(sorted(baseline_rows, key=lambda r: r["pct_max_of_full_scale"], reverse=True), f, indent=2)
+    with open(os.path.join(out_dir, "optimized_channel_gap_summary.json"), "w") as f:
+        json.dump(sorted(optimized_rows, key=lambda r: r["pct_max_of_full_scale"], reverse=True), f, indent=2)
+
+    peak_rows = plot_metric_comparison(
+        baseline, optimized, "pct_max_of_full_scale", "max_gap_display",
+        os.path.join(out_dir, "peak_gap_comparison.png"),
+        f"Peak reality gap by channel ({scope_title}): baseline vs optimized",
+        baseline_label, optimized_label)
+    rms_rows = plot_metric_comparison(
+        baseline, optimized, "pct_rms_of_full_scale", "rms_gap_display",
+        os.path.join(out_dir, "rms_gap_comparison.png"),
+        f"RMS reality gap by channel ({scope_title}): baseline vs optimized",
+        baseline_label, optimized_label)
+    return peak_rows, rms_rows
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Compare baseline vs. optimized recordings (peak + RMS reality gap %FS per channel).")
+        description="Compare baseline vs. optimized recordings (peak + RMS reality gap %FS "
+                    "per channel, full run and settle window only).")
     ap.add_argument("--baseline", nargs="+", required=True,
                     help="baseline recordings: CSV file(s), a directory of CSVs, or a glob pattern")
     ap.add_argument("--optimized", nargs="+", required=True,
@@ -308,26 +365,23 @@ def main():
     print(f"[baseline] {len(baseline_csvs)} file(s)")
     baseline, baseline_rows, baseline_recs = _rows_by_channel(baseline_csvs)
     # Optimized reuses baseline's full-scale range per channel so both runs'
-    # percentages are on the same scale -- see module docstring.
+    # -- and both scopes' -- percentages are on the same scale, see module
+    # docstring.
     fs_ranges = {r["name"]: r["full_scale_range_raw"] for r in baseline_rows}
     print(f"[optimized] {len(optimized_csvs)} file(s)")
     optimized, optimized_rows, optimized_recs = _rows_by_channel(optimized_csvs, fs_ranges=fs_ranges)
 
     os.makedirs(args.out, exist_ok=True)
-    with open(os.path.join(args.out, "baseline_channel_gap_summary.json"), "w") as f:
-        json.dump(sorted(baseline_rows, key=lambda r: r["pct_max_of_full_scale"], reverse=True), f, indent=2)
-    with open(os.path.join(args.out, "optimized_channel_gap_summary.json"), "w") as f:
-        json.dump(sorted(optimized_rows, key=lambda r: r["pct_max_of_full_scale"], reverse=True), f, indent=2)
-
-    peak_rows = plot_metric_comparison(
-        baseline, optimized, "pct_max_of_full_scale", "max_gap_display",
-        os.path.join(args.out, "peak_gap_comparison.png"),
-        "Peak reality gap by channel: baseline vs optimized",
+    peak_rows, rms_rows = _write_scope_comparison(
+        baseline, optimized, baseline_rows, optimized_rows,
+        os.path.join(args.out, "full_run"), "whole run",
         args.baseline_label, args.optimized_label)
-    rms_rows = plot_metric_comparison(
-        baseline, optimized, "pct_rms_of_full_scale", "rms_gap_display",
-        os.path.join(args.out, "rms_gap_comparison.png"),
-        "RMS reality gap by channel: baseline vs optimized",
+
+    baseline_settle, baseline_settle_rows = _settle_rows_by_channel(baseline_recs, fs_ranges)
+    optimized_settle, optimized_settle_rows = _settle_rows_by_channel(optimized_recs, fs_ranges)
+    peak_settle_rows, rms_settle_rows = _write_scope_comparison(
+        baseline_settle, optimized_settle, baseline_settle_rows, optimized_settle_rows,
+        os.path.join(args.out, "settling_window"), "settle window only",
         args.baseline_label, args.optimized_label)
 
     baseline_segs = _segment_cycle_times(baseline_recs)
@@ -340,7 +394,9 @@ def main():
         baseline_segs, optimized_segs, os.path.join(args.out, "cycle_time_comparison.png"),
         args.baseline_label, args.optimized_label)
 
-    summary = {"peak": peak_rows, "rms": rms_rows, "cycle_time": cycle_rows}
+    summary = {"peak": peak_rows, "rms": rms_rows,
+              "peak_settle": peak_settle_rows, "rms_settle": rms_settle_rows,
+              "cycle_time": cycle_rows}
     summary_path = os.path.join(args.out, "comparison_summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
