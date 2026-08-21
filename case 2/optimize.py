@@ -26,6 +26,10 @@ MIN_DT = 0.002
 EXPLOITATION_EXPLORATION_FACTOR = 1.0
 BARRIER_WEIGHT_START = 10.0
 BARRIER_WEIGHT_END = 0.01
+# cycle_time_per_gap_rmse is calibrated so a 1% cycle-time improvement and a 1% gap
+# improvement cost the loss equally at the start. GAP_WEIGHT scales that from there:
+# >1 favors closing the gap, <1 favors cutting cycle time, 1 leaves the 50/50 start.
+GAP_WEIGHT = 1.0
 # A waypoint-to-waypoint step smaller than this isn't a distinct pose worth its own
 # minimum dwell time -- it's below the model's own tracking-error scale (a few mrad),
 # so it is free to shrink towards zero instead of floored at MIN_DT.
@@ -107,7 +111,8 @@ def optimize(model, q_ref, dt_ref, robot, run=None, start_dt=DT):
     log = SummaryWriter(run) if run else None
     with torch.no_grad():
         baseline_gap_rmse = gap_rmse(model, resample(q0, base_dt))
-        cycle_time_per_gap_rmse = float((base_dt.sum() + start_dt) / baseline_gap_rmse.clamp_min(1e-8))
+        cycle_time_per_gap_rmse = GAP_WEIGHT * float(
+            (base_dt.sum() + start_dt) / baseline_gap_rmse.clamp_min(1e-8))
     for step in range(STEPS + 1):
         # High early (stays well clear of every limit), decayed to 1/1000th by 80%
         # of the run so the tail is free to chase cycle time and gap alone. Never
