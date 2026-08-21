@@ -7,7 +7,6 @@ variable-time path into that grid.
 from __future__ import annotations
 
 import argparse
-import math
 import time
 
 import numpy as np
@@ -24,8 +23,8 @@ STEPS = 2000
 LR = 0.01
 MIN_DT = 0.002
 EXPLOITATION_EXPLORATION_FACTOR = 1.0
-BARRIER_WEIGHT_START = 10.0
-BARRIER_WEIGHT_END = 0.01
+BARRIER_WEIGHT_START = 1.0
+BARRIER_WEIGHT_END = 0.001
 # cycle_time_per_gap_rmse is calibrated so a 1% cycle-time improvement and a 1% gap
 # improvement cost the loss equally at the start. GAP_WEIGHT scales that from there:
 # >1 favors closing the gap, <1 favors cutting cycle time, 1 leaves the 50/50 start.
@@ -51,26 +50,19 @@ def resample(q, dt):
     return q[i - 1].lerp(q[i], f)
 
 
-BARRIER_EDGE = 1e-6   # distance from the limit, as a fraction of it, where the log caps off
-
-
 def barrier(value, limit, weight):
-    """log(limit / slack), slack = limit - value: 0 at rest, +inf at the limit.
-    (The plain ``-log(slack)`` a reader might reach for first isn't anchored at
-    0 -- it carries a per-quantity ``-log(limit)`` offset that, scaled by the
-    decaying ``weight``, would quietly bias which training step looks "best".)
+    """w*(1/(1-ratio) - 1), ratio = value/limit: 0 at rest, +inf at the limit.
 
-    Past ``edge`` short of the limit, swaps in that point's own tangent line
-    (same value and slope) instead of the raw log -- ``max`` always keeps
-    whichever is valid, so the barrier stays finite with a live, restoring
-    gradient even on a step that overshoots the limit.
+    Past ratio = 0.9999, swaps in that point's own tangent line (worked out
+    analytically once, not per call; matches both value and slope there)
+    instead of the raw formula -- ``max`` always keeps whichever is valid, so
+    it stays finite with a live, restoring gradient even past the limit.
     """
-    limit = torch.as_tensor(limit, dtype=value.dtype, device=value.device)
-    edge = BARRIER_EDGE * limit
-    slack = limit - value
-    log_part = torch.log(limit) - torch.log(slack.clamp_min(edge))
-    tangent = -math.log(BARRIER_EDGE) + (edge - slack) / edge
-    return (weight * torch.maximum(log_part, tangent)).mean()
+    ratio = value / torch.as_tensor(limit, dtype=value.dtype, device=value.device)
+    edge, gap = 0.9999, 1e-4   # ratio where the tangent takes over, and 1 - edge
+    exact = 1 / (1 - ratio.clamp(max=edge)) - 1
+    tangent = (1 / gap - 1) + (ratio - edge) / gap ** 2
+    return (weight * torch.maximum(exact, tangent)).mean()
 
 
 def gap_rmse(model, q):
@@ -85,12 +77,12 @@ def penalties(robot, q, weight):
     qdd = (q[2:] - 2 * q[1:-1] + q[:-2]) / DT ** 2
     jac = torch.as_tensor(robot.jacobians(q.detach().cpu().numpy())[1:-1], dtype=q.dtype)
     tool = torch.linalg.vector_norm((jac @ qd[..., None])[..., 0], dim=1)
-    costs = {
+    penalties = {
         "joint_speed": barrier(qd.abs(), robot.v_joint, weight),
         "joint_acceleration": barrier(qdd.abs(), robot.a_joint, weight),
         "tool_speed": barrier(tool, robot.v_tcp, weight),
     }
-    return sum(costs.values()), costs
+    return sum(penalties.values()), penalties
 
 
 def loss(model, robot, q, cycle_time, cycle_time_per_gap_rmse, weight=BARRIER_WEIGHT_START):
@@ -121,13 +113,13 @@ def optimize(model, q_ref, dt_ref, robot, run=None, start_dt=DT):
         weight = BARRIER_WEIGHT_START + step / (0.8 * STEPS) * (BARRIER_WEIGHT_END - BARRIER_WEIGHT_START) if step < 0.8 * STEPS else BARRIER_WEIGHT_END
         dt = F.softplus(raw_dt) + min_dt
         path = resample(q0, dt)
-        total_loss, gap, penalty, costs = loss(
+        total_loss, gap, penalty, penalties = loss(
             model, robot, path, dt.sum() + start_dt, cycle_time_per_gap_rmse, weight)
         task_loss = total_loss - penalty       # the true loss alone, without the barrier
         if log:
-            values = {"loss/loss": task_loss, "loss/total_loss": total_loss, "loss/gap_rmse": gap,
+            values = {"loss/loss_without_penealties": task_loss, "loss/total_loss": total_loss, "loss/gap_rmse": gap,
                       "loss/cycle_time": dt.sum(), "loss/penalties": penalty,
-                      **{f"penalty/{k}": v for k, v in costs.items()}}
+                      **{f"penalty/{k}": v for k, v in penalties.items()}}
             for key, value in values.items():
                 log.add_scalar(key, float(value.detach()), step)
         if step < STEPS:
